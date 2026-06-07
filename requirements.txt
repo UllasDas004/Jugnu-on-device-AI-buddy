@@ -1,0 +1,7 @@
+ollama
+onnxruntime
+google-generativeai
+numpy
+transformers
+pywin32
+pywebview

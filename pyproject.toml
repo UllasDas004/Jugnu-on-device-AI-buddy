@@ -1,0 +1,31 @@
+[project]
+name = "jugnu"
+version = "0.1.0"
+description = "A native Windows AI coding buddy — detects when you're stuck and proactively helps"
+requires-python = ">=3.11"
+
+dependencies = [
+    "ollama",
+    "onnxruntime",
+    "google-generativeai",
+    "numpy",
+    "transformers",
+    "pywin32",
+    "pywebview",
+]
+
+[dependency-groups]
+dev = [
+    "black",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["inference"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["inference"]
+pythonVersion = "3.11"
+

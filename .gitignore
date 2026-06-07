@@ -1,0 +1,60 @@
+# Python Virtual Environments & Build
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+htmlcov/
+.tox/
+dist/
+build/
+eggs/
+.eggs/
+
+# C++ Build Artifacts
+build/
+out/
+bin/
+obj/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+*.cmake
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.suo
+*.user
+
+# Database & Models
+jugnu.db
+jugnu.db-shm
+jugnu.db-wal
+jugnu.db-journal
+models/
+*.onnx
+*.gguf
+*.bin
+
+# OS & Temporary
+.DS_Store
+Thumbs.db
+.tmp/
+*.tmp
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Credentials
+.env
+.env.local
+secrets.json
+
+# Personal Notes (Do not push to GitHub)
+docs/interview_internals.md
+docs/resume_plan.md
