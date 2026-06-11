@@ -63,11 +63,13 @@ def show_nudge():
     done = threading.Event()
 
     class Api:
+        def __init__(self):
+            self.window = None
         def yes(self):
             result['value'] = True
-            win.destroy()
+            if self.window: self.window.destroy()
         def no(self):
-            win.destroy()
+            if self.window: self.window.destroy()
         
     api = Api()
     win = webview.create_window(
@@ -75,7 +77,9 @@ def show_nudge():
         width = 360, height = 160, on_top = True,
         frameless = True, transparent = True
     )
-    win.events.closed += lambda: done.set()
+    if win:
+        api.window = win
+        win.events.closed += lambda: done.set()
 
     done.wait()
     return result["value"]
@@ -134,14 +138,16 @@ def show_context_dialog(summary):
     done = threading.Event()
 
     class Api:
+        def __init__(self):
+            self.window = None
         def confirm(self):
             result["value"] = "yes"
-            win.destroy()
+            if self.window: self.window.destroy()
         def describe(self):
             result["value"] = "custom"
-            win.destroy()
+            if self.window: self.window.destroy()
         def cancel(self):
-            win.destroy()
+            if self.window: self.window.destroy()
 
     api = Api()
     win = webview.create_window(
@@ -149,7 +155,9 @@ def show_context_dialog(summary):
         js_api=api, width=400, height=240,
         on_top=True, frameless=True, transparent=True
     )
-    win.events.closed += lambda: done.set()
+    if win:
+        api.window = win
+        win.events.closed += lambda: done.set()
     done.wait()
     return result["value"]
 
@@ -210,18 +218,22 @@ def show_text_input():
     done = threading.Event()
 
     class Api:
+        def __init__(self):
+            self.window = None
         def submit(self, text):
             result["value"] = text
-            win.destroy()
+            if self.window: self.window.destroy()
         def cancel(self):
-            win.destroy()
+            if self.window: self.window.destroy()
     
     api = Api()
     win = webview.create_window(
         "Jugnu — Tell me more", html=INPUT_HTML, js_api=api,
         width=400, height=220, on_top=True, frameless=True, transparent=True
     )
-    win.events.closed += lambda: done.set()
+    if win:
+        api.window = win
+        win.events.closed += lambda: done.set()
     done.wait()
     return result["value"]
 
@@ -266,8 +278,10 @@ def show_insight(text):
     done = threading.Event()
 
     class Api:
+        def __init__(self):
+            self.window = None
         def close(self):
-            win.destroy()
+            if self.window: self.window.destroy()
 
     api = Api()
     win = webview.create_window(
@@ -275,7 +289,9 @@ def show_insight(text):
         js_api=api, width=460, height=310,
         on_top=True, frameless=True, transparent=True
     )
-    win.events.closed += lambda: done.set()
+    if win:
+        api.window = win
+        win.events.closed += lambda: done.set()
     done.wait()
 
 # ── Main Orchestrator ─────────────────────────────────────────────────

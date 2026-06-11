@@ -326,3 +326,84 @@ DWORD ownPid = GetCurrentProcessId();
 - **Symptom**: `ModuleNotFoundError: No module named 'win32file'` even after `pywin32` was successfully installed.
 - **Root Cause**: Running `python inference/ipc_client.py` in PowerShell executes the global Python binary by default. The global Python has no knowledge of the isolated `.venv` directory created by `uv`.
 - **The Code Fix**: Enforcing the use of `uv run python inference/ipc_client.py`. The `uv run` command intercepts the execution, modifies the `PATH` and `PYTHONPATH` environment variables dynamically, and points to the isolated C-Extension DLLs seamlessly.
+
+---
+
+## Group H: Phase 1.5 Live-Fire Traps (Discovered in Production)
+
+### Trap H-1: JSON Backslash Corruption — Windows Paths in IPC Payloads
+**Symptom:** Python's `json.loads()` crashes with `JSONDecodeError: Invalid escape`. The C++ `FILE_SAVED` event arrives with a payload like `{"file": "D:\inference\ai_engine.py"}`, and Python sees `\i` as an unknown JSON escape sequence.
+
+**Root Cause:** Windows file paths use backslashes as separators (e.g. `D:\coding\jugnu`). However, the JSON specification mandates that a literal backslash **must** be encoded as a double-backslash `\\`. When C++ builds a raw JSON string by concatenating `watchPath + "\\" + filename`, the resulting single backslash is invalid JSON.
+
+**The Non-Obvious Part:** This bug is invisible in local C++ unit tests because you're running on Windows and the C-style string `"\\"` represents a single backslash character in memory. The corruption only manifests at the Python `json.loads()` boundary because JSON is a language-agnostic text protocol with its own escape rules, distinct from C++ string literals.
+
+**Fix:** In-place find-and-replace before serializing the path into the JSON payload:
+```cpp
+// In file_watcher.cpp, after building absolutePath:
+std::string escapePath = absolutePath;  // e.g. D:\coding\jugnu\inference\ai_engine.py
+size_t pos = 0;
+while((pos = escapePath.find("\\", pos)) != std::string::npos)
+{
+    escapePath.replace(pos, 1, "\\\\");  // Replace single \ with \\\\
+    pos += 2;  // CRITICAL: jump PAST the two chars just inserted, or we loop forever
+}
+std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + escapePath + "\"}";
+```
+The `pos += 2` increment is the most dangerous line. If you write `pos += 1` instead, the loop finds the `\\` it just inserted, replaces it again with `\\\\`, and enters an infinite loop that consumes all RAM.
+
+---
+
+### Trap H-2: `ReadDirectoryChangesW` Returns Relative, Not Absolute Paths
+**Symptom:** Python receives `{"file": "inference\\ai_engine.py"}` instead of the full path. `open(payload["file"])` raises `FileNotFoundError` because Python's CWD is different.
+
+**Root Cause:** `ReadDirectoryChangesW` is designed as a *watcher*, not a path resolver. The `FILE_NOTIFY_INFORMATION.FileName` field only contains the path **relative** to the directory handle `hDir`. It never knows what absolute path was originally passed to `CreateFileA`.
+
+**Fix:** Manually prepend `watchPath` before serializing:
+```cpp
+// FileName from the struct: "inference\ai_engine.py" (relative)
+// watchPath stored on Start():  "D:\coding\Placements\projects\jugnu"
+std::string absolutePath = watchPath + "\\" + filename;  // Absolute
+// Then escape and serialize...
+```
+This is why `watchPath` is stored as a class-level static variable — so the background `WatcherThread` can access it when building the payload.
+
+---
+
+### Trap H-3: PyWebView COM Thread Violation Errors (Non-Fatal)
+**Symptom:** On every notification trigger, the terminal floods with `System.InvalidCastException: Unable to cast COM object... CoreWebView2Controller members can only be accessed from the UI thread.`
+
+**Root Cause:** This is a fundamental Windows COM threading model violation. COM (Component Object Model) is the underlying technology that WebView2 (and therefore pywebview) is built on. COM objects registered on the **Main UI Thread** (STA — Single-Threaded Apartment) cannot be called from a **background thread** (MTA — Multi-Threaded Apartment) without marshalling.
+
+Our architecture deliberately offloads the notification UI to a `daemon=True` background thread to prevent deadlocking the Named Pipe reader. When that background thread calls `win.destroy()` on a window whose COM object was created on the Main Thread, Windows throws these exceptions.
+
+**Why It Doesn't Crash:** `pywebview`'s internal C# layer wraps every COM call in a `try/catch`. When the exception fires, it logs it to stderr and then calls `Invoke()` to re-dispatch the destroy call back onto the correct UI thread. So the window closes correctly — the errors are informational spam, not fatal.
+
+**Phase 4 Permanent Fix:** When we migrate to native C++ WebView2, all UI rendering will happen on the single C++ main thread. There will be no cross-thread COM violations because there's no Python daemon thread boundary.
+
+---
+
+### Trap H-4: `NoneType` Squiggle on `win.destroy()` — Python Type Narrowing
+**Symptom:** Pylance (the VS Code Python type checker) draws red squiggles under `win.destroy()` and `win.events.closed` saying `Object of type NoneType has no attribute destroy`. The code runs fine, but the IDE constantly shows errors.
+
+**Root Cause:** The type signature of `webview.create_window()` is `Window | None`. The function returns `None` if window creation fails (e.g. WebView2 not installed on the system). Pylance correctly interprets this: before checking for `None`, calling `.destroy()` on a potential `None` object is a type error.
+
+**The Wrong Fix:** Adding a `type: ignore` comment. This hides the problem instead of solving it.
+
+**The Correct Fix (Object-Oriented Injection Pattern):**
+Instead of relying on a Python closure to capture `win` (which Pylance rightly flags), we inject the window reference into the API object **after** creation:
+```python
+class Api:
+    def __init__(self):
+        self.window: webview.Window | None = None  # Type-safe: explicitly allows None
+    def yes(self):
+        if self.window:          # Type guard: Pylance now knows self.window is Window
+            self.window.destroy()
+
+api = Api()
+win = webview.create_window("Jugnu", html=NUDGE_HTML, js_api=api, ...)
+if win:                   # Narrows type from 'Window | None' to 'Window'
+    api.window = win      # Inject the confirmed-non-None Window into our Api
+    win.events.closed += lambda: done.set()
+```
+This pattern is called **Dependency Injection**. The Api object doesn't know or care where its window comes from — we set it from outside. Pylance is now fully satisfied because the `if win:` guard narrows the type from `Window | None` to just `Window` before assignment.

@@ -70,6 +70,10 @@ namespace Jugnu
                         std::wstring wFilename(fni->FileName, fni->FileNameLength/sizeof(WCHAR));
                         std::string filename(wFilename.begin(), wFilename.end());
 
+                        std::string absolutePath = watchPath + "\\" + filename;
+
+                        std::cout << "\033[1;35m[GhostWriter]\033[0m Detected change in: \033[4m" << absolutePath << "\033[0m\n";
+
                         // Ignore temporary files, metadata, and environment folders
                         if( filename.find(".git") == std::string::npos &&
                             filename.find(".venv") == std::string::npos &&
@@ -83,9 +87,18 @@ namespace Jugnu
                         )
                         {
                             std::cout << "\033[1;35m[GhostWriter]\033[0m User saved: \033[3m" << filename << "\033[0m. Sending to Python...\n";
-                            
+
+                            std::string escapePath = absolutePath;
+                            size_t pos = 0;
+                            while((pos = escapePath.find("\\", pos)) != std::string::npos)
+                            {
+                                escapePath.replace(pos, 1, "\\\\");
+                                pos += 2;
+                            }
+                            std::cout << "\033[1;35m[GhostWriter]\033[0m User saved: \033[3m" << filename << "\033[0m. Sending to Python...\n";
+    
                             // Send the file change event to Python!
-                            std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + filename + "\"}";
+                            std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + escapePath + "\"}";
                             Jugnu::IPCServer::SendMessageToPython(payload);
                         }
                     }

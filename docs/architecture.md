@@ -544,3 +544,84 @@ Tier 2: core_persona (permanent facts, never evicted)
 - **Hybrid UI Bridge**: Integrated `pywebview` as an interim frontend host before full C++ WebView2 migration. Allowed reusing HTML/CSS/JS assets without native compilation overhead during rapid prototyping.
 - **Thread-Safe IPC Rendering**: Separated the Named Pipe polling loop (main thread) from the `pywebview` notification trigger logic (daemon thread). Used `threading.Event().wait()` to block UI loops without stalling IPC telemetry.
 - **GhostWriter Aggressive Filtering**: Modified the Win32 `ReadDirectoryChangesW` hooking mechanism to surgically ignore metadata, `.venv`, `uv.lock`, and build artifacts, preventing exponential feedback loops when dependencies are updated.
+
+---
+
+## Module Deep-Dive: `file_watcher.cpp` — The GhostWriter
+
+This module watches a directory for file saves and streams the absolute path to Python over the Named Pipe.
+
+### How `ReadDirectoryChangesW` Works Internally
+
+The function is a **blocking kernel syscall**. The thread calls it and is immediately put to sleep by the Windows Scheduler (0% CPU). When any file inside the watched directory is modified, the kernel wakes the thread and fills a buffer with an array of `FILE_NOTIFY_INFORMATION` structs packed together.
+
+```cpp
+// The BLOCKING call — thread sleeps here until the kernel wakes it
+ReadDirectoryChangesW(
+    hDir,              // Handle to the open directory
+    buffer,            // Output buffer to fill with notifications
+    sizeof(buffer),    // Buffer size — must be large enough or events are LOST
+    TRUE,              // Watch recursively into all subdirectories
+    FILE_NOTIFY_CHANGE_LAST_WRITE, // Only trigger on saves, not creates/deletes
+    &bytesReturned,    // How many bytes were written to the buffer
+    NULL, NULL         // No async overlapped I/O — synchronous mode
+);
+```
+
+### Walking the Linked-List-by-Offset
+
+Windows packs multiple events into one buffer as a contiguous linked list. Each `FILE_NOTIFY_INFORMATION` struct has a `NextEntryOffset` field which is the **byte distance** to the next struct. If it's 0, we're at the end.
+
+```cpp
+FILE_NOTIFY_INFORMATION* fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
+do {
+    // Process current fni...
+    
+    // Walk to next: raw byte pointer arithmetic
+    fni = fni->NextEntryOffset
+        ? reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
+              reinterpret_cast<char*>(fni) + fni->NextEntryOffset)
+        : nullptr;
+} while(fni);
+```
+This is a classic **intrusive linked list** — the 'next pointer' is not an actual pointer but a byte offset, because the kernel allocates everything in one flat buffer.
+
+### Wide String (UTF-16) to UTF-8 Conversion
+
+Windows natively stores filenames as UTF-16 (wide strings, `wchar_t`). `FILE_NOTIFY_INFORMATION.FileName` is a `WCHAR[]` array. We must convert it:
+
+```cpp
+std::wstring wFilename(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
+std::string filename(wFilename.begin(), wFilename.end());
+```
+The division by `sizeof(WCHAR)` (which is 2 bytes) converts the byte count to a character count. The range constructor `std::string(wFilename.begin(), wFilename.end())` does a naive cast — this is fine for ASCII paths but would corrupt non-ASCII unicode in filenames. A production fix would use `WideCharToMultiByte(CP_UTF8, ...)` like the `clipboard_manager.cpp` does.
+
+### The JSON Backslash Escape Loop
+
+This was a real production bug we hit. Windows paths use `\` separators. JSON requires `\\`. Without escaping, Python's `json.loads()` throws `JSONDecodeError`.
+
+```cpp
+std::string escapePath = absolutePath;  // D:\coding\jugnu\inference\ai_engine.py
+size_t pos = 0;
+while((pos = escapePath.find("\\", pos)) != std::string::npos)
+{
+    escapePath.replace(pos, 1, "\\\\");  // \ becomes \\
+    pos += 2;  // CRITICAL: skip past the 2 chars just inserted, not 1!
+}
+```
+The `pos += 2` is the key insight: after replacing 1 char (`\`) with 2 chars (`\\`), if we only advance by 1, the loop finds its own `\\` and re-escapes it into `\\\\` forever — an infinite loop eating all RAM.
+
+### The `FILE_FLAG_BACKUP_SEMANTICS` Mystery
+
+To open a **directory** handle using `CreateFileA` (normally used for files), you must pass `FILE_FLAG_BACKUP_SEMANTICS`. This is a poorly documented Windows quirk. The flag was originally added to let backup software open directories with full access. Without it, `CreateFileA` returns `INVALID_HANDLE_VALUE` with error code `5 (Access Denied)` when given a directory path — even as Administrator.
+
+```cpp
+HANDLE hDir = CreateFileA(
+    watchPath.c_str(),
+    FILE_LIST_DIRECTORY,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    NULL, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS,  // The magic flag that enables directory handles
+    NULL
+);
+```
