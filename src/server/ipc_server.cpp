@@ -1,5 +1,6 @@
 #include "ipc_server.h"
-#include<iostream>
+#include <iostream>
+#include <windows.h>
 
 namespace Jugnu
 {
@@ -93,11 +94,11 @@ namespace Jugnu
                 std::cout<<"\033[1;33m[IPCServer]\033[0m \033[1;32mPython connected successfully! IPC bridge active.\033[0m\n";
                 isClientConnected = true;
 
-                // TRAP FIX: Do NOT call ReadFile() here on a synchronous pipe handle! 
-                // It will lock the handle and cause a permanent deadlock when the main thread calls WriteFile().
-                // Instead, we just sleep and let WriteFile detect if Python disconnects.
+                // Python is a read-only consumer of events. We just monitor pipe health here.
                 while(isRunning && isClientConnected)
                 {
+                    // Check pipe health: if Python disconnects, WriteFile will fail and
+                    // set isClientConnected = false, which will break this loop naturally.
                     Sleep(100);
                 }
 

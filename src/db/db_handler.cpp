@@ -1,6 +1,16 @@
 #include "db_handler.h"
 #include<iostream>
 
+// --- ADD THIS BLOCK ---
+// We manually declare the C-function so we don't need to include sqlite-vec.h
+// which breaks standard SQLite functions by redefining them as macros.
+extern "C" {
+    int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg, const void *pApi);
+}
+// ----------------------
+
+
+
 namespace Jugnu
 {
     sqlite3* DBHandler::db = nullptr;
@@ -10,6 +20,9 @@ namespace Jugnu
         // TRAP FIX: SQLite Thread Corruption.
         // We must force SQLite to be thread-safe before opening it.
         sqlite3_config(SQLITE_CONFIG_SERIALIZED);
+
+        // TRAP FIX: Register sqlite-vec natively before openning!
+        sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);
 
         // Open the database with the FULLMUTEX flag ti serialize concurrent access
         int rc = sqlite3_open_v2(
@@ -54,6 +67,30 @@ namespace Jugnu
             );
         )";
         if(!ExecuteSQL(create_app_paths_sql)) return false;
+
+        // Create the standard metadata table for memories
+        std::string create_episodic_sql = R"(
+            CREATE TABLE IF NOT EXISTS episodic_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                window_title TEXT NOT NULL,
+                text_content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        )";
+        if(!ExecuteSQL(create_episodic_sql)) return false;
+
+        // Create the Virtual Table for the vectors (384 dimensions for e5-small)
+        // Why Virtual?
+        // This is an in-memory index.
+        // It is extremely fast and uses 100x less RAM than keeping the vectors in the regular table.
+        // 384 is the dimension of the e5-small-v2 embedding model.
+        std::string create_vec_sql = R"(
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodic USING vec0(
+                embedding float[384]
+            );
+        )";
+        if(!ExecuteSQL(create_vec_sql)) return false;
 
         return true;
     }

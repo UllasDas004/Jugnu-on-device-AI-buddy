@@ -1,13 +1,50 @@
-import webview
+import threading
 import win32file
 import pywintypes
+import os
+import sys
 import time
 import json
-import threading
-import webview
 import notification
 from state_manager import StateManager
 from ai_engine import AIEngine
+from embedder import Embedder
+from sentence_transformers import SentenceTransformer
+import ollama
+
+# Fix CUDA warmup crash on RTX 4050 / Turing+ with Ollama's Flash Attention PDL kernel
+os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "0")
+def ensure_models_downloaded():
+    print("[INIT] Checking AI Models... Please wait.")
+
+    # 1. Check e5-small (Downloads to HuggingFace cache if missing)
+    try:
+        print("[INIT] Loading intfloat/e5-small-v2...")
+        # This will automatically pull it if it doesn't exist locally
+        model = SentenceTransformer('intfloat/e5-small-v2')
+        print("[INIT] e5-small is ready!")
+    
+    except Exception as e:
+        print(f"[FATAL] Failed to load e5-small: {e}")
+        sys.exit(1)
+
+    # 2. Check Gemma model via Ollama
+    model_name = "gemma4:e2b"
+    try:
+        ollama.show(model_name)
+        print(f"[INIT] {model_name} is ready!")
+    except ollama.ResponseError:
+        print(f"[INIT] Model {model_name} not found locally. Pulling from Ollama... This might take a few minutes depending on your internet.")
+
+    try:
+        # This blocks and downloads the multi-gigabyte model
+        ollama.pull(model_name)
+        print(f"[INIT] Successfully downloaded {model_name}!")
+    except Exception as pull_err:
+        print(f"[FATAL] Failed to pull Ollama model: {pull_err}")
+        print("Make sure the Ollama background service is running!")
+        sys.exit(1)
+
 
 PIPE_NAME = r"\\.\pipe\jugnu_ipc"
 
@@ -44,7 +81,7 @@ def connect_to_pipe():
                 print("Pipe is busy. Retrying...")
                 time.sleep(1)
 
-def pipe_listener_main(state, engine):
+def pipe_listener_main(state, engine, embedder):
     handle = connect_to_pipe()
     buffer = ""
 
@@ -81,24 +118,45 @@ def pipe_listener_main(state, engine):
                                         if any(c in app.lower() for c in CODING_APPS):
                                             state.set_last_coding_app(app)
                                 elif event_type == 'CLIPBOARD':
-                                    state.update_clipboard(payload.get('text'))
+                                    text = payload.get('text', '')
+                                    state.update_clipboard(text)
+                                    # Save to semantic memory if it's substantial text
+                                    if text and len(text.strip()) > 20:
+                                        threading.Thread(
+                                            target = embedder.save_memory,
+                                            args = (state.current_app or 'unknown',
+                                            state.active_code_file or '',
+                                            text),
+                                            daemon=True
+                                        ).start()
+
                                 elif event_type == "FILE_SAVED":
-                                    state.update_file(payload.get('file'))
+                                    filepath = payload.get('file')
+                                    state.update_file(filepath)
+                                    # Read the file and save to semantic memory
+                                    if filepath and os.path.exists(filepath):
+                                        try:
+                                            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                                code_text = f.read()
+                                                threading.Thread(
+                                                    target = embedder.save_memory,
+                                                    args = (state.current_app or 'unknown', filepath, code_text[:4000]),
+                                                    daemon=True
+                                                ).start()
+                                        except Exception as e:
+                                            print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
                                     current = payload.get('current_app', '').lower()
                                     if any(v in current for v in VETO_APPS):
                                         print("\033[90m[System] Veto app detected. Skipping.\033[0m", flush=True)
                                     elif state.was_recently_coding():
                                         print("\n\033[1;33m[System] User may be stuck! Launching notification flow...\033[0m", flush=True)
-
-                                        threading.Thread(
-                                            target=notification.trigger_flow,
-                                            args=(state, engine),
-                                            daemon=True
-                                        ).start()
+                                        # Must run in a background thread to prevent deadlocking the IPC pipe!
+                                        # Note: You may see COM Thread Violation errors in the console when the window closes.
+                                        # This is a known, non-fatal PyWebView quirk (Trap H-3). Do not remove the thread!
+                                        threading.Thread(target=notification.trigger_flow, args=(state, engine), daemon=True).start()
                                     else:
                                         print("\033[90m[System] No recent coding context. Skipping.\033[0m", flush=True)
-
                             except json.JSONDecodeError:
                                 print(f"\033[1;31m[Error] Failed to decode JSON:\033[0m {msg}", flush=True)
                     
@@ -115,9 +173,12 @@ def pipe_listener_main(state, engine):
                 break
 
 if __name__ == "__main__":
+    ensure_models_downloaded()
     state = StateManager()
     engine = AIEngine()
+    embedder = Embedder()
 
-    webview.create_window("Jugnu Background Service", hidden = True)
-    webview.start(pipe_listener_main, (state, engine), debug = False)
+    # Python is now a pure headless AI backend.
+    # The listener loop runs synchronously on the main thread.
+    pipe_listener_main(state, engine, embedder)
 

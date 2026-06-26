@@ -33,39 +33,39 @@ graph TD
 
     subgraph "Python Inference & UI Server (uv venv)"
         Pipe -->|Listener| StateManager[State Aggregator]
-        StateManager -->|Embeddings| SQLiteVec[(sqlite-vec DB)]
+        StateManager -->|Embeddings| Embedder[embedder.py]
+        Embedder -->|vec_episodic| SQLiteVec[(sqlite-vec DB)]
         StateManager -->|Context| AIEngine[Local Ollama / Gemma]
-        StateManager -->|Trigger| PyWebView[Glassmorphic UI]
+        StateManager -->|Trigger| TerminalUI[PowerShell jugnu_interact.py]
     end
 ```
 
 ---
 
-## 🚀 What It Does Right Now (Phase 1 Completed)
-Jugnu has successfully completed **Phase 1: Hybrid Core Integration**.
-- **The C++ GhostWriter**: Deep Win32 hooks are actively tracking Window switching (filtering out OS noise), determining user idleness (`GetLastInputInfo`), and monitoring File Saves.
-- **IPC Telemetry**: A zero-latency Named Pipe streams JSON payloads from the C++ Kernel into the isolated Python `uv` environment.
-- **Thread-Safe Reactive UI**: When the user gets "stuck", Python safely spawns a beautiful, frameless `pywebview` Notification Card directly onto the Windows desktop using daemon threads, allowing the user to interact without deadlocking the IPC telemetry loop.
+## 🚀 What It Does Right Now (Phase 1.5 Completed)
+Jugnu has successfully completed **Phase 1.5: Hybrid Core Integration & Terminal UI**.
+- **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
+- **IPC Telemetry**: A Named Pipe streams JSON payloads from the C++ Kernel into the isolated Python `uv` environment.
+- **Semantic RAG Database**: The new `embedder.py` converts code snippets and clipboard text into 384-dimensional vectors using `e5-small-v2`, storing them in `sqlite-vec`.
+- **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a custom `_warmup()` routine to bypass CUDA initialization crashes on RTX 4050/Mobile GPUs.
+- **Terminal Interaction UI**: When stuck, Jugnu spawns a lightweight, native PowerShell popup window (`jugnu_interact.py`) to query the user for context and deliver insights without blocking the background daemon.
 
 ---
 
 ## 📅 Development Roadmap (Future Plans)
 
-### Phase 2 — The Brain (Current Focus)
-- [ ] Install `sqlite-vec` to unify Markov Chain persistence with semantic Vector Embeddings.
-- [ ] Integrate `sentence-transformers` running the `multilingual-e5` model to embed code files and clipboard history.
-- [ ] Fully wire the C++ `clipboard_manager.cpp` into the IPC pipeline.
+### Phase 2 — The Brain & RAG Fixes (Current Focus)
+- [ ] Fix the `sqlite-vec` UNIQUE constraint bug in `embedder.py` so memory chunks successfully persist into the `vec_episodic` virtual table.
+- [ ] Fully wire the RAG search pipeline: connect `embedder.semantic_search()` directly into `state_manager.py`'s AI context window.
 - [ ] Upgrade the OS App Prefetching logic (`memory_manager.cpp`) from dummy 4KB reads to full OS Memory Mapping.
 
-### Phase 3 — Screen Awareness & Deep Work
-- [ ] UI Automation Tier 0 (accessibility text reading)
-- [ ] WGC + Windows OCR Tier 1 (triggered capture on unreadable apps)
-- [ ] CPU Governor: Dynamically throttle CPU priority of "distractor" apps (Discord/Spotify) when Deep Work IDEs are focused.
+### Phase 3 — Persistence Polish
+- [ ] Validate the C++ `FlushWorker` background thread to ensure Markov Chains and EMA scores are committed to SQLite every 30 minutes without draining laptop battery.
+- [ ] Create a DB reset tool for clean interview demos.
 
-### Phase 4 — Product Polish
-- [ ] Migrate `pywebview` interim UI fully into embedded C++ WebView2 to eliminate the Python process requirement.
-- [ ] Windows Installer, System Tray icon, and Auto-Start routines.
-- [ ] Multi-user placement prep tracking dashboards.
+### Phase 4 — Screen Awareness (Far Future)
+- [ ] UI Automation Tier 0 (accessibility text reading)
+- [ ] CPU Governor: Dynamically throttle CPU priority of "distractor" apps (Discord/Spotify) when Deep Work IDEs are focused.
 
 ---
 
@@ -82,7 +82,7 @@ Jugnu has successfully completed **Phase 1: Hybrid Core Integration**.
 
 ## 🧩 Tech Stack
 - **C++20**: Win32 API, `ReadDirectoryChangesW`, `GetLastInputInfo`
-- **Python 3**: `uv` package management, `pywebview`, `pywin32`
+- **Python 3**: `uv` package management, `pywin32`, PowerShell Terminal UI
 - **AI/ML**: `ollama` (Gemma4:e2b), `sentence-transformers` (multilingual-e5)
 - **Database**: `sqlite3` bundled with `sqlite-vec` extension for unified memory
 

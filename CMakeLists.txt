@@ -15,6 +15,7 @@ set(
     src/monitor/win_monitor.cpp
     src/server/ipc_server.cpp
     src/db/sqlite3.c
+    src/db/sqlite-vec.c
     src/db/db_handler.cpp
     src/monitor/memory_manager.cpp
     src/monitor/file_watcher.cpp
@@ -29,7 +30,7 @@ target_include_directories(Jugnu PRIVATE src)
 # Link libraries (Win32 APIs and vcpkg libs)
 target_link_libraries(Jugnu PRIVATE
     # nlohmann_json::nlohmann_json
-    User32  # Required for Win API calls like MessageBox, SetWinEventHook and windows APIs
+    User32      # Required for Win API calls like MessageBox, SetWinEventHook and windows APIs
     Advapi32    # For process information
     Psapi       # For reading process names (GetModuleBaseName)
 )

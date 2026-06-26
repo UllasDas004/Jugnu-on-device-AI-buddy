@@ -11,14 +11,15 @@ The memory system is a three-tier architecture:
 │  "User codes in Python and C++"                                 │
 │  "User is in 3rd year Computer Science"                         │
 ├─────────────────────────────────────────────────────────────────┤
-│  TIER 1: episodic_log (Rolling — 5,000-row EMA cap)             │
+│  TIER 1: episodic_memories (Rolling — 5,000-row EMA cap)        │
 │  "User read: Virtual Memory — Galvin Ch9 [Mon 3PM]"             │
 │  "User coded: twoSum in Python [Mon 4PM]"                       │
 │  "User researched: sliding window technique [Mon 5PM]"          │
+│  + vec_episodic (VIRTUAL TABLE — 384-dim float vectors)         │
 ├─────────────────────────────────────────────────────────────────┤
 │  TIER 0: In-RAM (Hot — Instant access, 30-min flush)            │
 │  EMA priority_map: {"code.exe": 0.89, "chrome.exe": 0.73}      │
-│  Markov transitions: {"code|chrome|Morning" → "chrome": 14}     │
+│  Markov transitions: {"code|chrome|Morning" -> "chrome": 14}    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -26,86 +27,138 @@ The memory system is a three-tier architecture:
 
 ## 1. The Database (SQLite + sqlite-vec)
 
-We use a local SQLite database enhanced with `sqlite-vec` for brute-force cosine similarity searches on embeddings.
+We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similarity searches on embeddings.
 
 ### Core Tables
 
-1. **`episodic_log`** (The Short-Term Memory)
-   Stores every chunk of text read from the screen.
-   - `id`: Primary key.
-   - `timestamp`: Unix time.
+1. **`episodic_memories`** (The Short-Term Memory)
+   Stores every chunk of text captured from clipboard or file saves.
+   - `id`: Primary key (AUTOINCREMENT).
    - `app_name`: "VS Code", "Chrome", etc.
-   - `raw_text`: The actual text on the screen.
-   - `vector_embedding`: 384-dimensional float array (from multilingual-e5).
-   - `importance_score`: Float (0.0 to 1.0) calculated by the AI (see *Importance-Based Pruning* below).
+   - `window_title`: The full window title at capture time.
+   - `text_content`: The raw text (up to 4000 chars for code files).
+   - `timestamp`: Auto-set by SQLite.
 
-2. **`core_persona`** (The Long-Term Memory)
-   Stores the structured JSON facts extracted during the nightly routine.
-   - `id`: Primary key.
-   - `fact_json`: The structured JSON (e.g. `{"topics_studied": ["Graph Algorithms"]}`).
-   - `timestamp`: When it was extracted.
+2. **`vec_episodic`** (The Vector Index — VIRTUAL TABLE)
+   Created with `sqlite-vec`'s `vec0` engine. Stores 384-dimensional float arrays
+   corresponding to `episodic_memories` rows. Shares the same `rowid`.
+   - `embedding float[384]`: Binary blob of IEEE 754 single-precision floats.
+   - Searched using `WHERE embedding MATCH ? AND k = ?` KNN syntax.
 
-3. **`transition_matrix`** (The Markov Chain)
-   Stores O(1) app switching behavior for prediction.
-   - `state_key`: e.g. "VS Code|Chrome|Night"
-   - `next_app`: e.g. "Terminal"
-   - `count`: How many times this happened.
+3. **`markov_edges`** (The Markov Chain)
+   Stores O(1) app switching behaviour for prediction.
+   - `source_app TEXT`, `target_app TEXT`, `transition_count INTEGER`
 
-4. **`priority_map`** (The Exponential Moving Average)
-   Stores the importance of an app based on frequency of use.
-   - `app_name`: "VS Code"
-   - `ema_score`: Float
-
-5. **`knowledge_library`** (The Concept Vault / Continual Learning)
-   Stores high-value architectural answers and explanations provided by the Gemini API, so Gemma can use them as reference in the future without calling the API again.
-   - `id`: Primary key.
-   - `topic_vector`: 384-dimensional float array for RAG lookup.
-   - `concept_summary`: The detailed markdown explanation.
-   - `source`: e.g. "Gemini API".
-   - `timestamp`: Unix time.
+4. **`app_paths`** (The RAM Prefetcher Vault)
+   Stores the absolute path to each process's executable for RAM prefetching.
+   - `process_name TEXT PRIMARY KEY`, `absolute_path TEXT NOT NULL`
 
 ---
 
-## 2. Importance-Based Memory Pruning
+## 2. The Phase 2 RAG Write Pipeline (Implemented)
 
-Instead of simply deleting the oldest memories (which might delete crucial study notes), Jugnu uses an **Importance-Based System**.
+### Why Python Writes Directly to SQLite (The Boundary Decision)
 
-### The Scoring Flow
-1. C++ reads the screen.
-2. The Python background service evaluates the text and assigns an `importance_score` (0.0 to 1.0).
-   - *0.1 = Scrolling YouTube.*
-   - *0.9 = Debugging C++ code.*
-3. C++ stores the row in `episodic_log`.
+When choosing how to store vectors, we had two options:
+
+| Option | Method | Problem |
+|---|---|---|
+| A | Python sends vector over Named Pipe to C++ | Pushes 1.5KB binary blobs over a text protocol. Messy and fragile. |
+| B | Python writes directly to SQLite | Clean. SQLite WAL handles concurrent C++ + Python access safely. |
+
+**We chose Option B.** SQLite's WAL (Write-Ahead Logging) mode allows Python and C++
+to hold simultaneous connections without corruption. Python connects with `timeout=5.0`
+so it waits safely if C++ is mid-transaction.
+
+### The Full Event Flow
+
+```
+C++ detects CLIPBOARD copy or FILE_SAVED
+    | JSON over Named Pipe (lightweight text)
+ipc_client.py receives the event
+    | spawns a daemon Thread so the pipe never blocks
+embedder.save_memory(app, title, text) runs in background
+    | runs e5-small ONNX on the text (CPU inference, ~20ms)
+float[384] vector produced
+    | packed into raw bytes via struct.pack('<384f')
+BEGIN TRANSACTION
+    INSERT into episodic_memories -> gets rowid
+    INSERT into vec_episodic at same rowid
+COMMIT
+    | memory is now permanently searchable
+```
+
+### The Two-Table Vector Design
+
+The vector and the metadata are stored in separate tables on purpose:
+
+- `episodic_memories` — stores human-readable text for the nightly Gemma extraction job.
+- `vec_episodic` — stores binary vectors for fast cosine KNN lookup.
+- They are linked by sharing the same `rowid`.
+
+When C++ searches for context, it JOINs both tables:
+```sql
+SELECT m.text_content
+FROM vec_episodic v
+INNER JOIN episodic_memories m ON v.rowid = m.id
+WHERE v.embedding MATCH ? AND k = 5
+ORDER BY distance ASC;
+```
+
+### e5-small Prefix Strategy (Asymmetric Search)
+
+The e5-small-v2 model uses **asymmetric** search:
+- Text being **stored**: prefix with `"passage: "`.
+- Text being **queried**: prefix with `"query: "`.
+
+Using the wrong prefix makes cosine similarity return garbage. We enforce this:
+
+```python
+# Storage (in Embedder.save_memory):
+prefixed = f"passage: {text}"
+
+# Search (in Embedder.semantic_search):
+query_prefixed = f"query: {query_text}"
+```
+
+---
+
+## 3. sqlite-vec Build Integration (The Static Linking Trap)
+
+`sqlite-vec.h` includes `sqlite3ext.h`, which redefines **every** SQLite function
+as a macro pointer (`sqlite3_api->exec`) that only exists in `.dll` extension code.
+
+**The Fix:** Never include `sqlite-vec.h` in application code. Forward-declare only:
+
+```cpp
+// db_handler.cpp — instead of #include "sqlite-vec.h"
+extern "C" {
+    int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg, const void *pApi);
+}
+
+// Register before sqlite3_open_v2:
+sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);
+```
+
+---
+
+## 4. Importance-Based Memory Pruning (Planned Phase 3)
+
+Instead of deleting oldest memories, Jugnu will use **Importance-Based Pruning**.
 
 ### The Nightly Decay
-Every night at 2 AM, the C++ engine runs an `UPDATE` query that decays the `importance_score` of all rows by 5% (e.g. `importance_score = importance_score * 0.95`).
+Every night at 2 AM, a score decays by 5%: `importance_score = importance_score * 0.95`
 
 ### The Pruning Rule
-Rows are only deleted from `episodic_log` if their `importance_score` drops below **0.2**. 
-- A highly important coding session (starting at 0.9) will survive for weeks.
-- A mindless scrolling session (starting at 0.15) will be deleted on the very first night.
+Rows deleted only if `importance_score` drops below 0.2.
+- A coding session (score 0.9) survives for weeks.
+- A YouTube scroll (score 0.15) is deleted the next morning.
 
 ---
 
-## 3. Structured Nightly Extraction
+## 5. The 30-Minute Flush Strategy (flush_worker.cpp — Next in Phase 2)
 
-While the `episodic_log` handles raw screen text, the `core_persona` handles abstract knowledge. 
-
-Every night, Jugnu gathers all the high-importance episodic logs from the day and sends them to the local Gemma model. The model is instructed (see `prompts_design.md`) to output a strict JSON structure containing the essence of the day:
-
-```json
-{
-  "key_topics_studied": ["Algorithms", "C++ Vectors"],
-  "struggles_or_bugs": ["Memory leak in WebView2"],
-  "projects_advanced": ["Jugnu AI Desktop App"],
-  "long_term_facts_learned": ["User prefers typing in dark mode"]
-}
-```
-This JSON is permanently saved in the `core_persona` table, ensuring Jugnu never forgets the "big picture" of your life.
-
----
-
-## 4. The 30-Minute Flush Strategy
-
-To keep the system running at 0% CPU, the Markov Chain and EMA maps are updated entirely in RAM (using C++ `std::unordered_map`). 
-To prevent data loss if the laptop crashes, a background C++ thread wakes up every 30 minutes, takes a mutex lock, and flushes the RAM maps into the SQLite database.
+The Markov Chain and EMA maps live in C++ RAM (`std::unordered_map`). A background
+thread wakes every 30 minutes, takes a mutex lock, and calls `FlushMarkovEdges()`
+to persist them to SQLite. On next boot, `loadPriorityMap()` and `loadTransitionMatrix()`
+restore the full learned state. Maximum data loss on a crash = 30 minutes.

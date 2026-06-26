@@ -25,7 +25,7 @@ namespace Jugnu
         static bool UpsertAppPath(const std::string& processName, const std::string& absolutePath);
         // Retrieve the absolute path for RAM prefetching
         static std::string GetAppPath(const std::string& processName);
-
+        
         private:
         // Sqlite DB Connection Handle
         static sqlite3* db;

@@ -3,7 +3,8 @@
 #include "db/db_handler.h"
 #include "server/ipc_server.h"
 #include<psapi.h> // for getWindowTextA
-
+// Definition of static member frequency                   
+LARGE_INTEGER Jugnu::WinMonitor::frequency;
 namespace Jugnu
 {
     HWINEVENTHOOK WinMonitor::hook = nullptr;
@@ -57,6 +58,8 @@ namespace Jugnu
             DWORD dwmsEventTime
         )
     {
+        double startTime = GetTimeMs();
+
         // We only care about the main Window changing, not sub-elements or cursors
         if(idObject != OBJID_WINDOW) return;
 
@@ -71,6 +74,24 @@ namespace Jugnu
         GetWindowThreadProcessId(hwnd, &windowPid);
 
         std::cout << "\033[90m[Debug] Foreground Switched: PID=" << windowPid << " | processName=" << processName << " | title=" << windowTitle << "\033[0m\n";
+
+        // Ignore Explorer.EXE during transient states (Alt-Tab task switcher, empty titles)
+        if(processName == "Explorer.EXE" || processName == "explorer.exe")
+        {
+            if(windowTitle == "Task Switching" || windowTitle.empty())
+            {
+                std::cout << "\033[90m[WinMonitor]\033[0m Ignoring Explorer.EXE transient state: \""
+                            << windowTitle << "\"\033[0m\n";
+                return;
+            }
+            if(windowTitle.find("File Explorer") == std::string::npos)
+            {
+                std::cout << "\033[90m[WinMonitor]\033[0m Ignoring non-file Explorer window: \""
+                        << windowTitle << "\"\033[0m\n";
+                return;
+            }
+        }
+
 
         if (ownPid == windowPid) {
             std::cout << "[Debug] Ignored because ownPid == windowPid\n";
@@ -97,7 +118,27 @@ namespace Jugnu
 
         // GENERATE JSON AND BROADCAST TO PYTHON
         std::string payload = Jugnu::MemoryManager::GenerateContextJSON(processName);
+
+        double ipcStart = GetTimeMs();
         Jugnu::IPCServer::SendMessageToPython(payload);
+        double ipcEnd = GetTimeMs();
+
+        if(ipcEnd - ipcStart > 0.5)
+        {
+            std::cout << "\033[1;33m[WinMonitor]\033[0m "
+                    << "IPC send took " << (ipcEnd - ipcStart) << " ms" << std::endl;
+        }
+
+        double endTime = GetTimeMs();
+        double durationMs = endTime - startTime;
+
+        if(durationMs > 1.0)
+        {
+            std::cout << "\033[1;33m[WinMonitor]\033[0m "
+                    << "Slow event processed in " << durationMs << " ms "
+                    << "(app: " << processName << ")" <<
+                std::endl;
+        }
     }
 
     void WinMonitor::Init()
@@ -127,6 +168,9 @@ namespace Jugnu
 
         if(!hook) std::cerr<<"\033[1;31m[WinMonitor]\033[0m FAILED to install hook!\n";
         else std::cout<<"\033[1;36m[WinMonitor]\033[0m Hook installed successfully.\n";
+
+        // Initialize the performances counter frequency
+        QueryPerformanceFrequency(&WinMonitor::frequency);
     }
 
     void WinMonitor::Cleanup()
@@ -159,6 +203,13 @@ namespace Jugnu
             return idleTime > 60000;
         }
         return false;
+    }
+
+    double WinMonitor::GetTimeMs()
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return (double)now.QuadPart / (double)frequency.QuadPart * 1000.0;
     }
 
     DWORD WINAPI WinMonitor::StuckTimerThread(LPVOID lpParam)

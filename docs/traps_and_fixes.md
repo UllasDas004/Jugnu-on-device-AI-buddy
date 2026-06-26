@@ -139,14 +139,65 @@ ORDER BY timestamp DESC LIMIT 10
 
 ---
 
-### Trap E-5: sqlite-vec Macro Override (SQLITE_CORE)
-**Problem:** Including `sqlite-vec.h` redefines all `sqlite3_*` functions as macros through a vtable pointer that only exists in extension code. Application code crashes with `'sqlite3_api' was not declared`.  
-**Fix:**
+### Trap E-5: sqlite-vec Header Inclusion Macro Override
+**Problem:** Including `sqlite-vec.h` pulls in `sqlite3ext.h`, which redefines ALL
+`sqlite3_*` functions as macro pointers (`sqlite3_api->exec`). This pointer only exists
+in dynamically loaded `.dll` extension code. In a statically linked application:
+```
+error: 'sqlite3_api' was not declared in this scope
+```
+This error appears on **every** sqlite3 call in the translation unit, not just the vec call.
+
+**The Wrong Fix:** `#define SQLITE_CORE` before the include. Only works when building the
+extension source itself, not in application code.
+
+**The Correct Fix:** Never include `sqlite-vec.h` in application code. Forward-declare only:
 ```cpp
-#define SQLITE_CORE          // MUST be before sqlite-vec.h include
-#include "sqlite-vec.h"
-```  
-**Source:** Synapse Trap G-3
+// db_handler.cpp — before namespace
+extern "C" {
+    int sqlite3_vec_init(sqlite3* db, char** pzErrMsg, const void* pApi);
+}
+// Inside DBHandler::Init(), BEFORE sqlite3_open_v2:
+sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);
+```
+**Source:** Discovered live in Phase 2 build
+
+---
+
+### Trap E-8: Python SQLite SQLITE_BUSY on Concurrent C++ Transaction
+**Problem:** Python's `Embedder.save_memory()` INSERTs a vector while C++ flush thread
+is inside a `BEGIN TRANSACTION`. Python gets `sqlite3.OperationalError: database is locked`.
+
+**Non-obvious:** Only manifests every 30 minutes (when flush fires). Invisible in dev testing.
+
+**Fix:**
+```python
+conn = sqlite3.connect("jugnu.db", timeout=5.0, check_same_thread=False)
+```
+SQLite retries internally for 5 seconds. C++ transactions are sub-millisecond, so Python
+waits < 1ms in practice.
+**Source:** Phase 2 Architecture Decision
+
+---
+
+### Trap E-9: e5-small Asymmetric Prefix Mismatch
+**Problem:** Storing and querying text without instruction prefixes produces low-quality
+cosine similarity. The search returns irrelevant memories. No crash — the bug is silent
+data quality corruption.
+
+**Root Cause:** e5-small-v2 is an *asymmetric* model fine-tuned with different prefixes
+for passages (stored) vs queries (searched). Without them, vectors land in the wrong
+region of embedding space and similarity scores become noisy.
+
+**Fix:**
+```python
+# Storing text:
+embedding = model.encode(f"passage: {text}", normalize_embeddings=True)
+
+# Searching:
+query_vec = model.encode(f"query: {query_text}", normalize_embeddings=True)
+```
+**Source:** Phase 2, intfloat/e5-small-v2 documentation
 
 ---
 
@@ -370,16 +421,20 @@ This is why `watchPath` is stored as a class-level static variable — so the ba
 
 ---
 
-### Trap H-3: PyWebView COM Thread Violation Errors (Non-Fatal)
-**Symptom:** On every notification trigger, the terminal floods with `System.InvalidCastException: Unable to cast COM object... CoreWebView2Controller members can only be accessed from the UI thread.`
+### Trap H-3: PyWebView COM Thread Violation + pythonnet Recursion Crash
+**Symptom:** On every notification trigger, the terminal floods with `SyncRoot.SyncRoot.SyncRoot: maximum recursion depth exceeded` and the Python service crashes or hangs permanently.
 
-**Root Cause:** This is a fundamental Windows COM threading model violation. COM (Component Object Model) is the underlying technology that WebView2 (and therefore pywebview) is built on. COM objects registered on the **Main UI Thread** (STA — Single-Threaded Apartment) cannot be called from a **background thread** (MTA — Multi-Threaded Apartment) without marshalling.
+**Root Cause:** Two cascading bugs:
+1. **COM Threading:** Closing a window (`win.destroy()`) from a background thread violates Windows Single-Threaded Apartment (STA) rules. PyWebView catches this `InvalidCastException` internally and passes it to the Python `logging` module.
+2. **pythonnet Recursion (The Fatal Part):** When `logging` tries to stringify the COM exception, the `.NET` exception wrapper (`pythonnet`) inspects the object properties. It hits the `SyncRoot` property, which points to itself. Python recursively inspects `SyncRoot` until it hits the recursion limit and crashes the whole thread.
 
-Our architecture deliberately offloads the notification UI to a `daemon=True` background thread to prevent deadlocking the Named Pipe reader. When that background thread calls `win.destroy()` on a window whose COM object was created on the Main Thread, Windows throws these exceptions.
-
-**Why It Doesn't Crash:** `pywebview`'s internal C# layer wraps every COM call in a `try/catch`. When the exception fires, it logs it to stderr and then calls `Invoke()` to re-dispatch the destroy call back onto the correct UI thread. So the window closes correctly — the errors are informational spam, not fatal.
-
-**Phase 4 Permanent Fix:** When we migrate to native C++ WebView2, all UI rendering will happen on the single C++ main thread. There will be no cross-thread COM violations because there's no Python daemon thread boundary.
+**The Fix:** We cannot easily avoid cross-thread calls without a massive UI architectural rewrite. Since PyWebView safely re-dispatches the `destroy()` to the main thread internally *after* logging the error, we just need to prevent the `logging` module from ever seeing the exception:
+```python
+# Mute PyWebView so it stops feeding .NET objects to pythonnet's buggy logger
+import logging
+logging.getLogger('pywebview').setLevel(logging.CRITICAL)
+```
+**Source:** Phase 1.5 Live-Fire, pythonnet issue #1126.
 
 ---
 
@@ -407,3 +462,20 @@ if win:                   # Narrows type from 'Window | None' to 'Window'
     win.events.closed += lambda: done.set()
 ```
 This pattern is called **Dependency Injection**. The Api object doesn't know or care where its window comes from — we set it from outside. Pylance is now fully satisfied because the `if win:` guard narrows the type from `Window | None` to just `Window` before assignment.
+
+---
+
+### Trap H-5: Ollama CUDA Stack Overrun (0xc0000409) on Warmup
+**Symptom:** Ollama server completely crashes with `exit status 0xc0000409: The system detected an overrun of a stack-based buffer` when evaluating the first prompt on `gemma4:e2b`.
+**Root Cause:** A known driver/CUDA mismatch issue specifically on mobile GPUs (like RTX 4050 Laptop) when `ggml_cuda_kernel_can_use_pdl` attempts to initialize the `cuda_v13` backend.
+**Fix 1:** Force CPU fallback via `$env:OLLAMA_LLM_LIBRARY="cpu"` and restart `ollama serve`.
+**Fix 2 (The Cold-Start Absorber):** Even on CPU, the first prompt can sometimes trigger a one-off initialization crash. In `ai_engine.py`, we emit a silent `_warmup()` query inside a try/except block at boot. This intentionally triggers and catches the crash gracefully, leaving the server warm and stable for real user queries.
+
+---
+
+### Trap H-6: Reasoning Models (gemma4:e2b) Returning Empty Strings
+**Symptom:** The AI returns a successful 200 OK, but the Jugnu Insight window displays a completely blank message.
+**Root Cause:** `gemma4:e2b` is a chain-of-thought reasoning model. It places its internal monologue inside a `<thought>` block. The Ollama Python library parses this into a separate `thinking` field, leaving the `content` field empty until the thought finishes. If `num_predict` is too low (e.g., 200 tokens), the model hits the limit while still thinking (`done_reason='length'`), resulting in a permanently empty `content` field.
+**Fix:** 
+1. Increase `num_predict` to 512 to give the model room to finish thinking.
+2. In `ai_engine.py`, extract both fields. If `content` is empty, fallback to returning `[Thinking]...\n` + the `thinking` string, ensuring the UI never renders a blank box.
