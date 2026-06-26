@@ -18,6 +18,10 @@ namespace Jugnu
     private:
         // Handle to the registered Windows Event Hook
         static HWINEVENTHOOK hook;
+        static LARGE_INTEGER frequency; // For QueryPerformanceCounter
+
+        // Helper function to get current time in milliseconds
+        static inline double GetTimeMs();
         
         static std::atomic<bool> isRunning;
         static HANDLE hStuckThread;
