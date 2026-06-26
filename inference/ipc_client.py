@@ -151,10 +151,7 @@ def pipe_listener_main(state, engine, embedder):
                                         print("\033[90m[System] Veto app detected. Skipping.\033[0m", flush=True)
                                     elif state.was_recently_coding():
                                         print("\n\033[1;33m[System] User may be stuck! Launching notification flow...\033[0m", flush=True)
-                                        # Must run in a background thread to prevent deadlocking the IPC pipe!
-                                        # Note: You may see COM Thread Violation errors in the console when the window closes.
-                                        # This is a known, non-fatal PyWebView quirk (Trap H-3). Do not remove the thread!
-                                        threading.Thread(target=notification.trigger_flow, args=(state, engine), daemon=True).start()
+                                        threading.Thread(target=notification.trigger_flow, args=(state, engine, embedder), daemon=True).start()
                                     else:
                                         print("\033[90m[System] No recent coding context. Skipping.\033[0m", flush=True)
                             except json.JSONDecodeError:

@@ -58,8 +58,12 @@ class StateManager:
         return "\n".join(parts) if parts else "No recent coding context found."
 
     
-    def generate_prompt_context(self, custom_problem = None):
-        """Packages all short term memory into a string for the LLM"""
+    def generate_prompt_context(self, custom_problem = None, embedder = None):
+        """
+        Packages all short-term memory + long-term RAG results into a string for the LLM.
+        If embedder is provided, injects the top 3 semantically similar past memories.
+        For file memories, re-reads the current file from disk for full context.
+        """
 
         context = f"The user is currently using: {self.current_app}.\n"
 
@@ -75,7 +79,24 @@ class StateManager:
 
         if self.clipboard_content:
             context += f"Clipboard: {self.clipboard_content[:300]}\n"
-        
+
+        if embedder:
+            query = custom_problem or self.active_code_content[:200] or self.current_app
+            memories = embedder.semantic_search(query, limit = 3)
+            if memories:
+                context += "\n Relevant past context (from long-term memory):\n"
+                for i, mem in enumerate(memories, 1):
+                    snippet = mem["snippet"]
+                    file_path = mem["file_path"]
+                    
+                    # If we stored a file path, re-read the current version for full context
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                full = f.read(800) # cap at 800 chars per past file
+                            context += f"[{i}] (from {os.path.basename(file_path)}):\n```\n{full}\n```\n"
+                        except Exception:
+                            context += f"   [{i}] {snippet}\n"        
         if custom_problem:
             context += f"\nThe user described their specific problem as:\n\"{custom_problem}\"\n"
 

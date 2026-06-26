@@ -1,3 +1,4 @@
+from embedder import Embedder
 import threading
 import time
 import json
@@ -78,7 +79,7 @@ def _spawn_interaction_window(context_summary):
 
 # ── Main Orchestrator ─────────────────────────────────────────────────
 
-def trigger_flow(state, engine):
+def trigger_flow(state, engine, embedder=None):
     global is_generating
 
     if is_generating or in_cooldown():
@@ -109,7 +110,7 @@ def trigger_flow(state, engine):
     is_generating = True
     print("\n\033[1;36m[Notification] Querying AI...\033[0m", flush=True)
     try:
-        context = state.generate_prompt_context(custom_problem=custom_problem)
+        context = state.generate_prompt_context(custom_problem=custom_problem, embedder=embedder)
         insight = engine.generate_insight(context)
         print("\033[1;32m[Jugnu AI Buddy] Insight generated successfully.\033[0m\n", flush=True)
 

@@ -74,11 +74,20 @@ namespace Jugnu
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 app_name TEXT NOT NULL,
                 window_title TEXT NOT NULL,
+                file_path TEXT,
                 text_content TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         )";
         if(!ExecuteSQL(create_episodic_sql)) return false;
+
+        // OPTIMIZATION: Index on test_content for O(1) dedup checks In Python.
+        // Without this, every save_memory() call is a full table scan (O(N)).
+        std::string create_text_index_sql = R"(
+            CREATE INDEX IF NOT EXISTS idx_episodic_text
+            ON episodic_memories(text_content);
+        )";
+        if(!ExecuteSQL(create_text_index_sql)) return false;
 
         // Create the Virtual Table for the vectors (384 dimensions for e5-small)
         // Why Virtual?

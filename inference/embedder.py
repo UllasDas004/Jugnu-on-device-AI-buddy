@@ -1,15 +1,21 @@
 """
-The Python-side semantic memory writer for Jugnu
+The Python-side semantic memory writer for Jugnu.
 Responsibility:
-    - Load the e5-small-v2 ONNX model to generate 384-dim text vectors.
+    - Load the e5-small-v2 model to generate 384-dim text vectors.
     - Receive text events from ipc_client.py.
-    - Write the text + its vector directly into jugnu.db using sqlite-vec Python bindings.
-Architecture note:
-    - Python writes vectors directly to SQLite. C++ reads them for RAG.
-    - This avoids reverse IPC (sending binary blob back through the Named Pipe)
-    - and correctly respects our boundary: C++ = OS hooks, Python = ML math.
+    - Write a SHORT SNIPPET + file_path into jugnu.db (not the full file).
+    - Provide semantic search for RAG context injection.
+Architecture Optimizations:
+    - Snippet-only storage: embed only first 300 chars, store filepath for full retrieval.
+    - Quality gate: skip content with fewer than 5 words (junk filter).
+    - In-memory dedup: skip if same content was embedded in last 60 seconds.
+    - DB dedup: skip if exact text snippet already exists in episodic_memories.
+    - INSERT OR IGNORE on vec_episodic: prevents UNIQUE constraint crash on retry.
+    - Lazy search: skip KNN query entirely if DB is empty (day 1 protection).
 """
+import sqlite3
 import struct
+import time
 import sqlite3
 import sqlite_vec
 import numpy as np
@@ -22,6 +28,12 @@ _GREEN  = "\033[1;32m"
 _RED    = "\033[1;31m"
 _YELLOW = "\033[1;33m"
 _RESET  = "\033[0m"
+
+# How many characters of a file to embed as its "fingerprint"
+SNIPPET_LEN = 300
+
+# Minimum word count to consider content worth embedding
+MIN_WORDS = 5
 
 class Embedder:
     """
@@ -42,6 +54,11 @@ class Embedder:
         self._model = SentenceTransformer(self.MODEL_ID)
         print(f"{_GREEN}[Embedder] Model ready.{_RESET}")
 
+        # OPTIMIZATION: In-memory throttle
+        # Maps app_name -> (snippet, timestamp) of the last embedded content.
+        # If the same app sends the same snippet within 60 seconds, we skip it.
+        self._last_embedded: dict[str, tuple[str, float]] = {}
+
         # Open our own SQLite connection.
         # TRAP FIX: Use timeout=5.0 so that if C++ is in the middle of a
         # BEGIN TRANSCATION flush, Python waits up to 5 seconds rather than
@@ -59,16 +76,13 @@ class Embedder:
     
     def _embed(self, text: str) -> list[float]:
         """
-        Convert a raw string into a 384-dimensional float vector.
-        e5-small-v2 expects an 'instruction prefix' for best results:
-          - Passage (things being stored):  "passage: <text>"
-          - Query  (things being searched): "query: <text>"
-        We use "passage:" for everything we store in episodic_memory.
+        Convert text into a 384-dim float vector.
+        IMPORTANT: e5-small-v2 is asymmetric.
+          - Stored passages must use prefix: "passage: <text>"
+          - Search queries must use prefix:  "query: <text>"
         """
-        prefixed = f"passage: {text}"
-
         # SentenceTransformer returns a numpy float32 array
-        embedding: np.ndarray = self._model.encode(prefixed, normalize_embeddings=True)
+        embedding: np.ndarray = self._model.encode(f"passage: {text}", normalize_embeddings=True)
         return embedding.tolist()
 
     
@@ -81,7 +95,7 @@ class Embedder:
 
         return struct.pack(f"<{len(vec)}f", *vec)
 
-    def save_memory(self, app_name: str, window_title: str, text_content: str) -> bool:
+    def save_memory(self, app_name: str, window_title: str, text_content: str, file_path: str | None = None) -> bool:
         """
         Embed text_content and write it into the jugnu.db vector store.
         This function is the core of the Semantic RAG pipeline.
@@ -94,62 +108,106 @@ class Embedder:
           - episodic_memories stores human-readable text (for nightly extraction).
           - vec_episodic stores the binary vector (for cosine similarity search).
           They share a rowid so a JOIN can reunite the vector result with its text.
+
+          TRAP FIX: We check for duplicate text before inserting.
+          - If the same text was already stored, we skip it entirely.
+          - This prevents both the episodic_memories duplication AND the
+          - vec_episodic UNIQUE constraint failure that happens when rowids
+          - get out of sync on a retry.
         """
+        # --- GATE 1: Empty content ---
         if not text_content or not text_content.strip():
             return False
 
-        try:
-            print(f"{_CYAN}[Embedder] Embedding memory for: {app_name}{_RESET}")
-            vec = self._embed(text_content)
-            blob = self._serialize_vector(vec)
+        # ---GATE 2: Quality filter - skip junk like "ok", single variable names ---
+        if len(text_content.split()) < MIN_WORDS:
+            print(f"{_YELLOW}[Embedder] Skipping low-quality content (<{MIN_WORDS} words).{_RESET}")
+            return False
 
+        # --- GATE 3: Snppet extraction ---
+        # For files: we only embed the first SNIPPET_LEN chars as the "fingerprint".
+        # The full content stays on disk at file_path - we re-read it at query time.
+        snippet = text_content[:SNIPPET_LEN]
+
+        # --- GATE 4: In-memory throttle ---
+        # If same app sent snippet within 60 seconds, skip entirely.
+        now = time.time()
+        last_snippet, last_time = self._last_embedded.get(app_name, ("", 0.0))
+        if snippet == last_snippet and (now - last_time) < 60.6:
+            print(f"{_YELLOW}[Embedder] Throttled duplicate from {app_name}.{_RESET}")
+            return False
+        self._last_embedded[app_name] = (snippet, now)
+
+
+        try:
             cursor = self._conn.cursor()
 
-            # Step 1: Insert metadata
+            # --- GATE 5: DB dedup - O(1) thanks to idx_episodic_text_index ---
+
             cursor.execute(
-                "INSERT INTO episodic_memories (app_name, window_title, text_content) VALUES (?, ?, ?);",
-                (app_name, window_title, text_content)
+                "SELECT id FROM episodic_memories WHERE text_content = ? LIMIT 1;",
+                (snippet,)
             )
+            if cursor.fetchone():
+                print(f"{_YELLOW}[Embedder] Duplicate snippet in DB, skipping.{_RESET}")
+                return False
+            
+            # --- EMBED & STORE ---
+            print(f"{_CYAN}[Embedder] Embedding memory for: {app_name}{_RESET}")
+            vec = self._embed(snippet)
+            blob = self._serialize_vector(vec)
 
-            rowid = cursor.lastrowid # sqlite3 gives us the last inserted rowid
-
-            # Step 2: Insert vector, linking it via the SAME rowid
+            # Insert metadata row (snippet only, not full file content)
             cursor.execute(
-                "INSERT INTO vec_episodic(rowid, embedding) VALUES (?, ?);",
+                """INSERT INTO episodic_memories
+                    (app_name, window_title, file_path, text_content)
+                   VALUES (?, ?, ?, ?);""",
+                   (app_name, window_title, file_path, snippet)
+            )
+            rowid = cursor.lastrowid
+
+            # Insert vector linked by the same rowid.
+            # INSERT OR IGNORE: safety not agaist UNIQUE constraint on retry.
+            cursor.execute(
+                "INSERT OR IGNORE INTO vec_episodic(rowid, embedding) VALUES (?, ?);",
                 (rowid, blob)
             )
-
             self._conn.commit()
-            print(f"{_GREEN}[Embedder] Saved memory #{rowid} ({len(text_content)} chars).{_RESET}")
+            print(f"{_GREEN}[Embedder] Saved memory #{rowid} for {app_name} ({len(snippet)} chars).{_RESET}")
             return True
         except sqlite3.Error as e:
-            print(f"{_RED}[Embedder] DB error saving memory: {e}{_RESET}")
+            print(f"{_RED}[Embedder] DB error: {e}{_RESET}")
             self._conn.rollback()
             return False
+
         except Exception as e:
             print(f"{_RED}[Embedder] Unexpected error: {e}{_RESET}")
             return False
 
-    def semantic_search(self, query_text: str, limit: int = 5) -> list[str]:
+    def semantic_search(self, query_text: str, limit: int = 5) -> list[dict]:
         """
-        Find the most semantically similar memories to a query string.
-        Uses sqlite-vec's KNN (K-Nearest Neighbour) syntax with MATCH.
-        The query uses the "query:" prefix (not "passage:") — this is the
-        correct e5-small-v2 asymmetric search pattern.
-        Returns: list of text_content strings, ordered by similarity (closest first).
-        """
+        Find the most semantically similar memories to a query.
+        Returns a list of dicts with 'snippet' and 'file_path' keys.
+        The caller can re-read the file from file_path for full context.
 
-        query_prefixed = f"query: {query_text}"
-        query_vec = self._model.encode(query_prefixed, normalize_embeddings=True)
-        query_blob = self._serialize_vector(query_vec.tolist())
+        OPTIMIZATION: Lazy guard — skip KNN entirely if DB is empty.
+        """
 
         try:
+            # Lazy guard: don't run KNN on empty table (day 1 protection)
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM episodic_memories"
+            ).fetchone()[0]
+            if count == 0:
+                return []
+
+            query_vec = self._model.encode(f"query: {query_text}", normalize_embeddings=True)
+            query_blob = self._serialize_vector(query_vec.tolist())
+
             cursor = self._conn.cursor()
-            # sqlite-vec KNN syntax: WHERE embedding MATCH ? AND k = ?
-            # It automatically orders by distance ASC (closest first).
             cursor.execute(
                 """
-                SELECT m.text_content
+                SELECT m.text_content, m.file_path
                 FROM vec_episodic v
                 INNER JOIN episodic_memories m ON v.rowid = m.id
                 WHERE v.embedding MATCH ? AND k = ?
@@ -158,12 +216,16 @@ class Embedder:
                 (query_blob, limit)
             )
             rows = cursor.fetchall()
-            results = [row[0] for row in rows]
-            print(f"{_GREEN}[Embedder] Semantic search returned {len(results)} results.{_RESET}")
+            results = [{"snippet": row[0], "file_path": row[1]} for row in rows]
+            print(f"{_GREEN}[Embedder] Semantic search: {len(results)} results.{_RESET}")
             return results
         except sqlite3.Error as e:
             print(f"{_RED}[Embedder] DB error during search: {e}{_RESET}")
             return []
+        except Exception as e:
+            print(f"{_RED}[Embedder] Unexpected error: {e}{_RESET}")
+            return []
+
     
     def close(self):
         """Cleanly close the SQLite connection."""

@@ -42,21 +42,22 @@ graph TD
 
 ---
 
-## 🚀 What It Does Right Now (Phase 1.5 Completed)
-Jugnu has successfully completed **Phase 1.5: Hybrid Core Integration & Terminal UI**.
+## 🚀 What It Does Right Now (Phase 2 Completed)
+Jugnu has successfully completed **Phase 2: Semantic RAG & The 5-Gate Pipeline**.
 - **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
 - **IPC Telemetry**: A Named Pipe streams JSON payloads from the C++ Kernel into the isolated Python `uv` environment.
-- **Semantic RAG Database**: The new `embedder.py` converts code snippets and clipboard text into 384-dimensional vectors using `e5-small-v2`, storing them in `sqlite-vec`.
+- **Semantic RAG Database**: The `embedder.py` converts text into 384-dimensional vectors using `e5-small-v2`. It uses a **Snippet + Filepath Hybrid** model to save 10x DB space and always retrieve fresh code from disk.
+- **5-Gate Optimization**: RAG pipeline runs through empty checks, quality filters, in-memory throttles, and O(1) DB deduplication before hitting the expensive neural net.
 - **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a custom `_warmup()` routine to bypass CUDA initialization crashes on RTX 4050/Mobile GPUs.
-- **Terminal Interaction UI**: When stuck, Jugnu spawns a lightweight, native PowerShell popup window (`jugnu_interact.py`) to query the user for context and deliver insights without blocking the background daemon.
+- **Terminal Interaction UI**: When stuck, Jugnu spawns a native PowerShell popup window (`jugnu_interact.py`) to query the user, injects top-3 past context from the vector DB, and delivers insights.
 
 ---
 
 ## 📅 Development Roadmap (Future Plans)
 
-### Phase 2 — The Brain & RAG Fixes (Current Focus)
-- [ ] Fix the `sqlite-vec` UNIQUE constraint bug in `embedder.py` so memory chunks successfully persist into the `vec_episodic` virtual table.
-- [ ] Fully wire the RAG search pipeline: connect `embedder.semantic_search()` directly into `state_manager.py`'s AI context window.
+### Phase 2 — The Brain & RAG Fixes (Completed)
+- [x] Fix the `sqlite-vec` UNIQUE constraint bug in `embedder.py` (via `INSERT OR IGNORE`) so memory chunks successfully persist into the `vec_episodic` virtual table.
+- [x] Fully wire the RAG search pipeline: connect `embedder.semantic_search()` directly into `state_manager.py`'s AI context window.
 - [ ] Upgrade the OS App Prefetching logic (`memory_manager.cpp`) from dummy 4KB reads to full OS Memory Mapping.
 
 ### Phase 3 — Persistence Polish
