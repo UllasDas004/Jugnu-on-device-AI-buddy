@@ -72,8 +72,6 @@ namespace Jugnu
 
                         std::string absolutePath = watchPath + "\\" + filename;
 
-                        std::cout << "\033[1;35m[GhostWriter]\033[0m Detected change in: \033[4m" << absolutePath << "\033[0m\n";
-
                         // Ignore temporary files, metadata, and environment folders
                         if( filename.find(".git") == std::string::npos &&
                             filename.find(".venv") == std::string::npos &&
@@ -86,6 +84,7 @@ namespace Jugnu
                             filename.find("uv.lock") == std::string::npos
                         )
                         {
+                            std::cout << "\033[1;35m[GhostWriter]\033[0m Detected change in: \033[4m" << absolutePath << "\033[0m\n";
                             std::cout << "\033[1;35m[GhostWriter]\033[0m User saved: \033[3m" << filename << "\033[0m. Sending to Python...\n";
 
                             std::string escapePath = absolutePath;
@@ -95,7 +94,6 @@ namespace Jugnu
                                 escapePath.replace(pos, 1, "\\\\");
                                 pos += 2;
                             }
-                            std::cout << "\033[1;35m[GhostWriter]\033[0m User saved: \033[3m" << filename << "\033[0m. Sending to Python...\n";
     
                             // Send the file change event to Python!
                             std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + escapePath + "\"}";

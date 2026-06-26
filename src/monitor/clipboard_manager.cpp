@@ -38,7 +38,7 @@ namespace Jugnu
         RegisterClass(&wc);
 
         hMessageWindow = CreateWindowEx(
-            0, wc,lpszClassName, "JugnuClipboardListener",
+            0, wc.lpszClassName, "JugnuClipboardListener",
             0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL
         );
 
@@ -75,6 +75,7 @@ namespace Jugnu
     std::string ClipboardManager::EscapeJSON(const std::string& input)
     {
         std::string output;
+        output.reserve(input.length() + input.length() / 8);
         for(char c : input)
         {
             switch(c)
@@ -86,7 +87,15 @@ namespace Jugnu
                 case '\n': output += "\\n"; break;
                 case '\r': output += "\\r"; break;
                 case '\t': output += "\\t"; break;
-                default: output += c; break;
+                default: 
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[7];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        output += buf;
+                    } else {
+                        output += c;
+                    }
+                    break;
             }
         }
         return output;
@@ -106,14 +115,16 @@ namespace Jugnu
                 std::wstring wStr(wText);
                 GlobalUnlock(hData);
 
+                // Trim massive copies before converting to UTF-8 to prevent slicing multi-byte chars
+                if(wStr.length() > 5000)
+                {
+                    wStr = wStr.substr(0, 5000) + L"...[TRUNCATED]";
+                }
+
                 // Convert UTF-16 to UTF-8
                 int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wStr[0], (int)wStr.size(), NULL, 0, NULL, NULL);
                 std::string utf8_text(size_needed, 0);
                 WideCharToMultiByte(CP_UTF8, 0, &wStr[0], (int)wStr.size(), &utf8_text[0], size_needed, NULL, NULL);
-
-                // Trim massive copies to avoid blowing up IPC limits for now
-                if(utf8_text.length() > 5000)
-                    utf8_text = utf8_text.substd(0, 5000) + "...[TRUNCATED]";
 
                 std::cout << "\033[1;36m[Clipboard]\033[0m Intercepted copied text (" << utf8_text.length() << " chars)\n";
                 

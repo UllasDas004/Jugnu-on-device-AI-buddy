@@ -19,6 +19,7 @@ set(
     src/db/db_handler.cpp
     src/monitor/memory_manager.cpp
     src/monitor/file_watcher.cpp
+    src/monitor/clipboard_manager.cpp
     src/server/flush_worker.cpp
 )
 
