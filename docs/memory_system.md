@@ -73,7 +73,7 @@ so it waits safely if C++ is mid-transaction.
 ### The Full Event Flow
 
 ```
-C++ detects CLIPBOARD copy or FILE_SAVED
+C++ detects CLIPBOARD copy, FILE_SAVED, or runs OCR_SCREEN via WinRT GPU
     | JSON over Named Pipe (lightweight text)
 ipc_client.py receives the event
     | spawns a daemon Thread so the pipe never blocks
@@ -139,6 +139,8 @@ extern "C" {
 // Register before sqlite3_open_v2:
 sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);
 ```
+
+**MSVC Migration Note:** During Phase 3, we migrated to MSVC (`cl.exe`) to unlock native WinRT OCR. MSVC requires the `sqlite3.c` amalgamation to be explicitly compiled as C code, not C++, otherwise `sqlite3_vec_init` will trigger undefined reference linker errors due to C++ name mangling.
 
 ---
 

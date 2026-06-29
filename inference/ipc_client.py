@@ -125,8 +125,9 @@ def pipe_listener_main(state, engine, embedder):
                                         threading.Thread(
                                             target = embedder.save_memory,
                                             args = (state.current_app or 'unknown',
-                                            state.active_code_file or '',
-                                            text),
+                                                    state.current_app or 'clipboard',
+                                                    text),
+                                            kwargs = {'file_path': None},
                                             daemon=True
                                         ).start()
 
@@ -138,11 +139,14 @@ def pipe_listener_main(state, engine, embedder):
                                         try:
                                             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                                                 code_text = f.read()
-                                                threading.Thread(
-                                                    target = embedder.save_memory,
-                                                    args = (state.current_app or 'unknown', filepath, code_text[:4000]),
-                                                    daemon=True
-                                                ).start()
+                                            threading.Thread(
+                                                target = embedder.save_memory,
+                                                args = (state.current_app or 'unknown',
+                                                        state.current_app or 'unknown',
+                                                        code_text),
+                                                kwargs = {'file_path': filepath},
+                                                daemon=True
+                                            ).start()
                                         except Exception as e:
                                             print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
@@ -168,6 +172,13 @@ def pipe_listener_main(state, engine, embedder):
             else:
                 print(f"[Python] Pipe read error: {e}", flush=True)
                 break
+        except KeyboardInterrupt:
+            print("\n[Python] KeyboardInterrupt received. Shutting down gracefully...", flush=True)
+            win32file.CloseHandle(handle)
+            sys.exit(0)
+        except Exception as e:
+            print(f"\n[Python] Unexpected error: {e}", flush=True)
+            break
 
 if __name__ == "__main__":
     ensure_models_downloaded()

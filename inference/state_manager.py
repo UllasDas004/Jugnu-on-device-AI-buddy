@@ -94,9 +94,13 @@ class StateManager:
                         try:
                             with open(file_path, "r", encoding="utf-8") as f:
                                 full = f.read(800) # cap at 800 chars per past file
-                            context += f"[{i}] (from {os.path.basename(file_path)}):\n```\n{full}\n```\n"
+                            context += f"[Memory {i}] (from {os.path.basename(file_path)}):\n```\n{full}\n```\n"
                         except Exception:
-                            context += f"   [{i}] {snippet}\n"        
+                            context += f"[Memory {i}] {snippet}\n"
+                    else:
+                        # Clipboard memory or deleted file — use the stored snippet directly
+                        context += f"[Memory {i}] {snippet}\n"
+
         if custom_problem:
             context += f"\nThe user described their specific problem as:\n\"{custom_problem}\"\n"
 

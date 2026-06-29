@@ -30,7 +30,7 @@ class AIEngine:
         prompt = f"""You are Jugnu, a smart background AI assistant for a developer.
 The developer seems stuck. Here is their current OS context:
 {context_str}
-Provide a short, proactive suggestion to help them move forward. Keep it under 3 sentences. Be direct and specific."""
+Provide a short, proactive suggestion to help them move forward. Keep it under 3 sentences. Be direct and specific. Do NOT show your reasoning or thinking process."""
 
         print(f"\n\033[1;35m[AIEngine]\033[0m Querying local model {self.model_name}...")
 
@@ -38,22 +38,35 @@ Provide a short, proactive suggestion to help them move forward. Keep it under 3
             response = ollama.chat(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
+                think=False,         # Disable chain-of-thought — we want a direct answer
                 options={
                     "num_ctx": 2048,      # Safe window that fits in VRAM without warmup crash
                     "flash_attn": False,  # Disable Flash Attention — fixes CUDA PDL crash on RTX 4050
-                    "num_predict": 512,   # Increased to give reasoning models room to think
+                    "num_predict": 256,   # Short direct answer — no room for thinking dumps
                 }
             )
-            msg = response.get('message', {})
-            content = msg.get('content', '').strip()
-            thinking = msg.get('thinking', '').strip()
-            
+
+            # TRAP FIX: newer ollama library returns a Pydantic ChatResponse object,
+            # not a plain dict. We must use attribute access, not .get().
+            # Use `or ''` everywhere — content/thinking can be None, not just missing.
+            if hasattr(response, 'message') and response.message:
+                content  = (response.message.content  or '').strip()
+                thinking = (getattr(response.message, 'thinking', None) or '').strip()
+            else:
+                # Fallback for old dict-style response format
+                msg      = (response or {}).get('message', {}) or {}
+                content  = (msg.get('content')  or '').strip()
+                thinking = (msg.get('thinking') or '').strip()
+
             if content:
                 return content
             elif thinking:
-                return f"[Thinking]...\n{thinking}"
+                # Model returned empty content but has thinking — extract just the last
+                # paragraph which typically contains the actual answer/conclusion.
+                paragraphs = [p.strip() for p in thinking.split('\n\n') if p.strip()]
+                return paragraphs[-1] if paragraphs else "I noticed you seem stuck — could you tell me what you're working on?"
             else:
-                return "The AI generated an empty response. Try asking again."
+                return "I noticed you seem stuck — could you tell me what you're working on?"
 
         except Exception as e:
             return f"Ollama Connection Failed! {e}"

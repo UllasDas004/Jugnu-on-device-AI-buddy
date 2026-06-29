@@ -9,6 +9,9 @@ This document provides a conceptual overview of the Jugnu hybrid architecture.
 ### Why Not Pure C++?
 Running AI models (like Gemma) directly inside C++ is extremely complex, rigid, and hard to update. By moving the model inference to a Python background service, we can use standard, industry-grade libraries (`llama-cpp-python` and `onnxruntime`) while keeping the C++ engine tiny and lightning-fast. Communication happens instantly via Windows Named Pipes (`\\.\pipe\jugnu_ipc`).
 
+### The MSVC & WinRT Decision
+In Phase 3, we strictly migrated the C++ engine to **MSVC (Visual Studio Build Tools)** instead of MinGW. This was done to unlock native Windows Runtime (WinRT) APIs. Things like OCR (`Windows.Media.Ocr`) and Graphics Capture are now executed in pure C++ on the GPU, completely eliminating the need for slow Python `subprocess` shell scripts.
+
 ---
 
 ## The Hybrid Architecture Flow
@@ -96,7 +99,7 @@ jugnu/
 ├── vcpkg.json                  ← C++ dependencies (nlohmann_json)
 ├── requirements.txt            ← Python dependencies (llama-cpp-python, onnxruntime)
 │
-├── src/                        ← C++ Engine
+├── src/                        ← C++ Engine (MSVC Native)
 │   ├── main.cpp
 │   ├── core/
 │   │   ├── db_handler.h/.cpp
@@ -104,7 +107,7 @@ jugnu/
 │   │   └── memory_manager.h/.cpp
 │   ├── monitor/
 │   │   ├── win_monitor.h/.cpp
-│   │   ├── screen_monitor.h/.cpp
+│   │   ├── screen_reader.h/.cpp ← Native WinRT OCR Engine
 │   │   ├── clipboard_monitor.h/.cpp
 │   │   ├── fs_watcher.h/.cpp
 │   │   └── audio_monitor.h/.cpp

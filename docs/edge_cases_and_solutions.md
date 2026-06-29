@@ -309,6 +309,8 @@
 - **Case**: When the Python script detects user idleness, popping a PyWebView dialog halts the thread execution until the user clicks an option. Because the IPC read loop is on the same thread, telemetry drops completely.
 - **Solution**: Delegated the UI invocation to a background `threading.Thread()`. The UI thread safely uses `Event().wait()` to simulate blocking for the user's answer, while the main thread continuously parses the IPC named pipe.
 
+
+
 ### 3. Display Scaling UI Clipping
 - **Case**: Frameless window borders on Windows often reserve hidden padding due to display scaling (125%/150%), causing fixed-height bottom UI buttons to be chopped in half.
 - **Solution**: Padding the explicit `webview.create_window` height parameter by a safe margin (e.g., +30px) guarantees the browser rendering engine maintains a safe internal margin for HTML components.
@@ -316,3 +318,7 @@
 ### 4. Package Manager OS Noise (Win32)
 - **Case**: Installing packages via `uv` triggers hundreds of Win32 `FILE_ACTION_MODIFIED` events in the virtual environment.
 - **Solution**: Strict, explicit string filtering in C++ ignoring `.git`, `.venv`, `.db`, `pyproject.toml`, and `.tmp`.
+
+### 5. The Python Subprocess OCR Trap
+- **Case**: Originally, OCR was planned via Python `mss` taking a screenshot and spawning a `subprocess.Popen` to PowerShell or Tesseract to extract text. This caused massive CPU spikes, disk write thrashing, and high latency.
+- **Solution**: Complete compiler migration to **MSVC (Visual Studio Build Tools)**. Jugnu now uses `Windows.Media.Ocr` via native C++/WinRT. It takes a screenshot directly into a RAM buffer (no disk writes) and processes it on the GPU, dropping OCR overhead to nearly 0%.

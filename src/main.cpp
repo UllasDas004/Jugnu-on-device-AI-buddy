@@ -6,6 +6,7 @@
 #include "server/flush_worker.h"
 #include "db/db_handler.h"
 #include "monitor/clipboard_manager.h"
+#include "monitor/screen_reader.h"
 
 
 int main()
@@ -35,6 +36,9 @@ int main()
 
     // Start the clipboard manager thread
     Jugnu::ClipboardManager::Start();
+
+    // Start the screen reader thread
+    Jugnu::ScreenReader::Start();
 
     // Start the flush worker thread
     Jugnu::FlushWorker::Start();
@@ -71,6 +75,8 @@ int main()
     Jugnu::FileWatcher::Stop();
     // Clean up Clipboard Manager
     Jugnu::ClipboardManager::Stop();
+    // Clean up Screen Reader
+    Jugnu::ScreenReader::Stop();
     // Clean up DB
     Jugnu::DBHandler::Cleanup();
 

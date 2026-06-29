@@ -24,11 +24,11 @@ This is the same API used by Windows Narrator. It directly asks the active appli
 - **Pros:** Instant, flawless accuracy, practically zero CPU overhead.
 - **Cons:** Some apps (like Discord or specific web pages) do not expose their text trees properly to UI Automation.
 
-### Tier 2: WGC + OCR (Hardware Accelerated)
-**Technology:** Windows Graphics Capture (WGC) + Windows.Media.Ocr.
-If Tier 1 fails to find meaningful text, Jugnu takes a high-speed, invisible capture of the window using WGC, and passes it to the built-in Windows 10/11 OCR engine.
-- **Pros:** Works on literally anything, including images, PDFs, and custom UIs.
-- **Cons:** Slightly heavier on the CPU/GPU than Tier 1.
+### Tier 2: WGC + OCR (Hardware Accelerated via Native C++)
+**Technology:** Windows Graphics Capture (WGC) + `Windows.Media.Ocr` (MSVC C++/WinRT).
+If Tier 1 fails to find meaningful text, Jugnu takes a high-speed, invisible capture of the window into RAM using WGC, and processes it directly on the GPU using the native Windows OCR engine.
+- **Pros:** Works on literally anything, including images, PDFs, and custom UIs. No Python subprocesses required (avoiding the CPU spikes seen in earlier versions).
+- **Cons:** Slightly heavier on the GPU than Tier 1, but massively more efficient than Python `mss` or `tesseract`.
 
 ### Tier 3: The Ignore List
 If Jugnu detects massive screen updates with no readable text (e.g., a video game rendering via DirectX, or a full-screen YouTube video), it automatically categorizes the app into Tier 3.

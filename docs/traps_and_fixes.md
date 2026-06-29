@@ -308,6 +308,12 @@ DWORD ownPid = GetCurrentProcessId();
 
 ---
 
+### Trap F-12: The Python OCR Subprocess Battery Drain
+**Problem:** Originally, OCR was implemented by spawning a Python `subprocess.Popen` to capture the screen and run Tesseract/PowerShell. This approach bypassed the C++ engine entirely, resulting in 100% CPU spikes, memory bloat, and severe battery drain.
+**Fix:** Complete architectural compiler migration from MinGW/GCC to **MSVC (Visual Studio Build Tools)**. This unlocked native Windows Runtime (WinRT) APIs in C++. We replaced the Python subprocess with native `Windows.Media.Ocr`, which captures frames directly to RAM via WGC and executes purely on the GPU.
+
+---
+
 ## Calibration Items (Pre-Launch Validation Required)
 
 | # | Item | Action |
@@ -479,3 +485,24 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 **Fix:** 
 1. Increase `num_predict` to 512 to give the model room to finish thinking.
 2. In `ai_engine.py`, extract both fields. If `content` is empty, fallback to returning `[Thinking]...\n` + the `thinking` string, ensuring the UI never renders a blank box.
+
+---
+
+### Trap H-7: Python `KeyboardInterrupt` Swallowed by Win32 Pipe Exception
+**Symptom:** When pressing `Ctrl+C` to gracefully shut down the Python `ipc_client.py` listener, the terminal dumps a massive traceback ending in `Normalization failed: type=error args=(109, 'ReadFile', 'The pipe has been ended.')`.
+**Root Cause:** When the user hits `Ctrl+C`, the `KeyboardInterrupt` is thrown *while* Python is blocked inside the native C extension `win32file.ReadFile()`. The interrupt forces the C extension to abort the pipe read violently, returning the Win32 `109 ERROR_BROKEN_PIPE` code. This bubbles up concurrently with the `KeyboardInterrupt`, causing `pythonnet` and the traceback printer to collide.
+**Fix:** Add an explicit `except KeyboardInterrupt:` block *below* the `pywintypes.error` block. This catches the abort signal, explicitly calls `win32file.CloseHandle(handle)` to release the kernel lock, and calls `sys.exit(0)` to shut down cleanly without traceback vomit.
+
+---
+
+### Trap H-8: The Ollama Pydantic vs Dict Breaking Change
+**Symptom:** `response.get('message', {})` crashes with an `AttributeError: 'ChatResponse' object has no attribute 'get'`.
+**Root Cause:** The newer `ollama` Python library migrated its return types from raw dictionaries (`dict`) to Pydantic objects (`ChatResponse`). Accessing fields via `.get()` fails.
+**Fix:** Use an object-aware fallback block (`if hasattr(response, 'message')`) to safely extract `content` and `thinking` via standard attribute access, while keeping the `.get()` block as a fallback for older versions of the library. Also ensure `getattr()` is paired with `or ''` to handle `None` values gracefully.
+
+---
+
+### Trap H-9: The Stale Memory API Signature Crash
+**Symptom:** The background `embedder.save_memory` thread silently crashes or saves corrupt paths when trying to embed clipboard data.
+**Root Cause:** A refactor to the `save_memory` signature changed it to accept explicit positional arguments plus a `file_path` kwarg. Code calling the old `state.active_code_file` API format passed mismatched arguments, resulting in `None` being treated as a file path during semantic RAG vectoring.
+**Fix:** Explicitly pass `kwargs={'file_path': None}` for clipboard/app telemetry, and `kwargs={'file_path': filepath}` for actual files in the IPC listener. In `state_manager.py`, if reading the physical `file_path` fails (e.g., deleted file or `None` clipboard path), safely fall back to using the raw `snippet` stored in the vector database directly, ensuring no crash occurs.

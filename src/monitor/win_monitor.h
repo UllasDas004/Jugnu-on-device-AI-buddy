@@ -14,6 +14,12 @@ namespace Jugnu
         
         // Cleans up and unregisters the hook before exiting
         static void Cleanup();
+
+        // Helper: Extracts the underlying executable name (e.g., "Code.exe")
+        static std::string GetProcessName(HWND hwnd);
+
+        // Checks if the keyboard/mouse has been idle for 60 seconds
+        static bool IsUserIdle();
         
     private:
         // Handle to the registered Windows Event Hook
@@ -41,11 +47,5 @@ namespace Jugnu
         
         // Helper: Extracts the text title of the window (e.g., "Jugnu - VS Code")
         static std::string GetWindowTextString(HWND hwnd);
-        
-        // Helper: Extracts the underlying executable name (e.g., "Code.exe")
-        static std::string GetProcessName(HWND hwnd);
-
-        // Checks if the keyboard/mouse has been idle for 60 seconds
-        static bool IsUserIdle();
     };
 }

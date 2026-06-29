@@ -23,12 +23,14 @@ graph TD
         W[WinMonitor] -->|WinEventHooks| AppSwitch[App & Idle Tracking]
         FW[FileWatcher] -->|ReadDirectoryChangesW| FileMonitor[File Saves]
         CB[Clipboard] -->|WM_CLIPBOARDUPDATE| ClipTracker[Copy/Paste]
+        SR[ScreenReader] -->|Windows.Media.Ocr| ScreenReader[WinRT OCR]
     end
 
     subgraph "Named Pipe IPC"
         AppSwitch -->|JSON Stream| Pipe((jugnu_ipc))
         FileMonitor -->|JSON Stream| Pipe
         ClipTracker -->|JSON Stream| Pipe
+        ScreenReader -->|JSON Stream| Pipe
     end
 
     subgraph "Python Inference & UI Server (uv venv)"
@@ -42,10 +44,11 @@ graph TD
 
 ---
 
-## 🚀 What It Does Right Now (Phase 2 Completed)
-Jugnu has successfully completed **Phase 2: Semantic RAG & The 5-Gate Pipeline**.
+## 🚀 What It Does Right Now (Phase 3 Completed)
+Jugnu has successfully completed **Phase 3: Native WinRT Screen Awareness & MSVC Migration**.
 - **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
-- **IPC Telemetry**: A Named Pipe streams JSON payloads from the C++ Kernel into the isolated Python `uv` environment.
+- **Native GPU OCR Engine**: Uses MSVC and C++/WinRT to silently capture `BitBlt` screenshots directly into RAM and extract text via `Windows.Media.Ocr` on the GPU, avoiding expensive Python subprocesses.
+- **IPC Telemetry**: A Named Pipe streams JSON payloads (with strict defensive escaping) from the C++ Kernel into the isolated Python `uv` environment.
 - **Semantic RAG Database**: The `embedder.py` converts text into 384-dimensional vectors using `e5-small-v2`. It uses a **Snippet + Filepath Hybrid** model to save 10x DB space and always retrieve fresh code from disk.
 - **5-Gate Optimization**: RAG pipeline runs through empty checks, quality filters, in-memory throttles, and O(1) DB deduplication before hitting the expensive neural net.
 - **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a custom `_warmup()` routine to bypass CUDA initialization crashes on RTX 4050/Mobile GPUs.
@@ -55,18 +58,14 @@ Jugnu has successfully completed **Phase 2: Semantic RAG & The 5-Gate Pipeline**
 
 ## 📅 Development Roadmap (Future Plans)
 
-### Phase 2 — The Brain & RAG Fixes (Completed)
-- [x] Fix the `sqlite-vec` UNIQUE constraint bug in `embedder.py` (via `INSERT OR IGNORE`) so memory chunks successfully persist into the `vec_episodic` virtual table.
-- [x] Fully wire the RAG search pipeline: connect `embedder.semantic_search()` directly into `state_manager.py`'s AI context window.
-- [ ] Upgrade the OS App Prefetching logic (`memory_manager.cpp`) from dummy 4KB reads to full OS Memory Mapping.
+### Phase 3 — Screen Awareness & Native Port (Completed)
+- [x] Complete compiler migration from MinGW/GCC to MSVC for WinRT support.
+- [x] Build native `Windows.Media.Ocr` pipeline using Win32 GDI captures and `SoftwareBitmap`.
+- [x] Handle IPC defensive JSON escaping to prevent unprintable pixels crashing Python.
 
-### Phase 3 — Persistence Polish
+### Phase 4 — Persistence Polish & CPU Governor
 - [ ] Validate the C++ `FlushWorker` background thread to ensure Markov Chains and EMA scores are committed to SQLite every 30 minutes without draining laptop battery.
-- [ ] Create a DB reset tool for clean interview demos.
-
-### Phase 4 — Screen Awareness (Far Future)
-- [ ] UI Automation Tier 0 (accessibility text reading)
-- [ ] CPU Governor: Dynamically throttle CPU priority of "distractor" apps (Discord/Spotify) when Deep Work IDEs are focused.
+- [ ] Dynamically throttle CPU priority of "distractor" apps (Discord/Spotify) when Deep Work IDEs are focused.
 
 ---
 
@@ -82,7 +81,7 @@ Jugnu has successfully completed **Phase 2: Semantic RAG & The 5-Gate Pipeline**
 ---
 
 ## 🧩 Tech Stack
-- **C++20**: Win32 API, `ReadDirectoryChangesW`, `GetLastInputInfo`
+- **C++20 (MSVC)**: Win32 API, WinRT, `Windows.Media.Ocr`, `ReadDirectoryChangesW`
 - **Python 3**: `uv` package management, `pywin32`, PowerShell Terminal UI
 - **AI/ML**: `ollama` (Gemma4:e2b), `sentence-transformers` (multilingual-e5)
 - **Database**: `sqlite3` bundled with `sqlite-vec` extension for unified memory
