@@ -506,3 +506,27 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 **Symptom:** The background `embedder.save_memory` thread silently crashes or saves corrupt paths when trying to embed clipboard data.
 **Root Cause:** A refactor to the `save_memory` signature changed it to accept explicit positional arguments plus a `file_path` kwarg. Code calling the old `state.active_code_file` API format passed mismatched arguments, resulting in `None` being treated as a file path during semantic RAG vectoring.
 **Fix:** Explicitly pass `kwargs={'file_path': None}` for clipboard/app telemetry, and `kwargs={'file_path': filepath}` for actual files in the IPC listener. In `state_manager.py`, if reading the physical `file_path` fails (e.g., deleted file or `None` clipboard path), safely fall back to using the raw `snippet` stored in the vector database directly, ensuring no crash occurs.
+
+---
+
+## Group I: Phase 3 OCR Dataflow Traps
+
+### Trap I-1: The "Incomplete SQL Input" Trap
+**Problem:** Defining a multi-line SQL query (like `CREATE TABLE ocr_buffer(...)`) in C++ using a raw string literal `R"()"` but missing the closing `);` inside the string. The C++ compiler ignores string contents, so it compiles perfectly, but SQLite crashes at runtime with `[DB] SQL error: incomplete input`.
+**Fix:** Always test multi-line SQL queries in a native SQLite REPL before pasting them into C++ raw string literals.
+
+### Trap I-2: The Offline Embedder IPC Tear-Down
+**Problem:** The `SentenceTransformer` defaults to checking HuggingFace (`huggingface.co`) for updated config files on boot. If the user is offline (e.g. on a flight), the Python script crashes entirely with `[Errno 11001] getaddrinfo failed`. Because the Python process dies, the Named Pipe closes, and the C++ engine deadlocks trying to write to a broken pipe.
+**Fix:** Implemented a custom `_is_online()` check using Python's `socket` library to ping port 80. If it fails, explicitly pass `local_files_only=True` to the `SentenceTransformer` constructor to bypass network calls and load from the `.cache`.
+
+### Trap I-3: The Database Loop Closure Indentation
+**Problem:** In `flush_worker.py`, the `conn.close()` statement was indented one tab too deep, placing it inside the `for chunk in chunks:` loop. The worker processed the first chunk successfully, closed the DB connection, and instantly crashed on the second chunk with `Cannot operate on a closed database`.
+**Fix:** Strictly audit Python indentation when managing DB connections across batch loops.
+
+### Trap I-4: The Stale C++ Engine Schema Mismatch
+**Problem:** We updated `db_handler.cpp` to create the new `ocr_buffer` table, but forgot to recompile `jugnu.exe`. The Python script booted up and connected to the *old* running C++ executable, instantly crashing with `sqlite3.OperationalError: no such table: ocr_buffer`.
+**Fix:** Maintain strict build discipline. Stop the C++ background daemon, run `ninja`, and restart `jugnu.exe` before testing Python scripts that rely on new C++ SQLite schemas.
+
+### Trap I-5: Unprintable OCR Pixel Garbage
+**Problem:** The WinRT OCR engine occasionally misinterprets graphical UI elements (like scrollbars) as ASCII control characters (like `0x1B` ESC). Passing these over the IPC pipe caused Python's `json.loads()` to throw a `JSONDecodeError: Invalid control character`.
+**Fix:** The C++ IPC layer explicitly checks if `static_cast<unsigned char>(c) < 0x20` and converts raw bytes into safely escaped Unicode sequences (e.g., `\u001b`) before sending them.

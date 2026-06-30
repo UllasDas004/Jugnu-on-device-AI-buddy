@@ -322,3 +322,27 @@
 ### 5. The Python Subprocess OCR Trap
 - **Case**: Originally, OCR was planned via Python `mss` taking a screenshot and spawning a `subprocess.Popen` to PowerShell or Tesseract to extract text. This caused massive CPU spikes, disk write thrashing, and high latency.
 - **Solution**: Complete compiler migration to **MSVC (Visual Studio Build Tools)**. Jugnu now uses `Windows.Media.Ocr` via native C++/WinRT. It takes a screenshot directly into a RAM buffer (no disk writes) and processes it on the GPU, dropping OCR overhead to nearly 0%.
+
+---
+
+## Category 7: OCR & Data Processing Edge Cases (Phase 3 Updates)
+
+### EC-O1 — The "Incomplete SQL Input" Trap
+**Situation:** When defining the `CREATE TABLE ocr_buffer` query in C++ using a raw string literal `R"()"`, we accidentally forgot the closing `);` inside the string. The C++ compiler compiled it perfectly, but SQLite crashed at runtime with `[DB] SQL error: incomplete input`.
+**Solution:** Always manually test multi-line SQL queries in a SQLite REPL before embedding them in C++ raw literals. 
+
+### EC-O2 — The "Offline Embedder Crash" Problem
+**Situation:** The `SentenceTransformer` class defaults to pinging HuggingFace (`huggingface.co`) to check for updated config files on boot. If the user is on an airplane or offline, the Python script crashed entirely with `[Errno 11001] getaddrinfo failed`, tearing down the IPC Named Pipe and deadlocking the system.
+**Solution:** We implemented a custom `_is_online()` check using Python's raw `socket` to try an 80-port connection to HuggingFace. If it fails, we explicitly pass `local_files_only=True` to the `SentenceTransformer` constructor, forcing it to load from the local `.cache` folder and bypass all network calls.
+
+### EC-O3 — The "Database Loop Closure" Indentation Trap
+**Situation:** In the `flush_worker.py` daemon, the `conn.close()` statement was accidentally indented one tab too deep, putting it *inside* the `for chunk in chunks:` loop. The daemon successfully processed the very first chunk, closed the database, and then instantly crashed with `Cannot operate on a closed database` on the second chunk.
+**Solution:** Strictly verify Python indentation levels when managing persistent DB connections across batches, or use `with sqlite3.connect(...) as conn:` context managers to guarantee safe connection lifecycle handling.
+
+### EC-O4 — The "Stale C++ Engine" Trap
+**Situation:** We updated `db_handler.cpp` to create the new `ocr_buffer` table, but forgot to recompile `jugnu.exe`. When we started the Python script, it connected to the *old* running C++ executable, which hadn't created the table. Python instantly crashed with `no such table: ocr_buffer`.
+**Solution:** Always maintain strict build discipline. Stop the C++ background daemon, run `ninja`, and restart `jugnu.exe` whenever a SQLite schema is modified in the C++ layer.
+
+### EC-O5 — The "Unprintable OCR Pixel Garbage" Trap
+**Situation:** The OCR engine sometimes interprets weird UI textures or scrollbars as ASCII control characters (like `0x1B` ESC). Sending these over the IPC pipe to Python caused `json.loads()` to throw a `JSONDecodeError: Invalid control character`.
+**Solution:** The C++ IPC layer explicitly checks if `static_cast<unsigned char>(c) < 0x20` and manually converts those raw bytes into safely escaped Unicode sequences (`\u001b`) before sending them across the pipe.

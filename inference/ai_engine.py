@@ -1,3 +1,5 @@
+from torch import mode
+import ollama
 import ollama
 
 class AIEngine:
@@ -70,3 +72,54 @@ Provide a short, proactive suggestion to help them move forward. Keep it under 3
 
         except Exception as e:
             return f"Ollama Connection Failed! {e}"
+    
+
+    def extract_ocr_chunk(self, chunk: str) -> str:
+        """
+        Uses Gemma as an extraction engine, not a classifier.
+        Given a noisy OCR chunk, extracts only genuinely useful technical content.
+        
+        Returns the cleaned text string, or empty string if nothing useful found.
+        
+        Key settings:
+        - num_predict: 300 — enough for a full code snippet or explanation
+        - temperature: 0.1 — near-deterministic, we don't want creative extraction
+        - think: False — no reasoning monologue, just the extracted text
+        """
+
+        prompt = f"""You are a technical knowledge extractor for a developer AI assistant.
+        You are given raw text captured from a developer's screen via OCR. The text contains a mix of actual content and UI noise (window titles, tab names, menu bars, button labels, scrollbar text).
+        Your job: extract ONLY the genuinely useful technical information.
+        Keep: code snippets, error messages, algorithm explanations, problem statements, documentation paragraphs, technical concepts.
+        Remove: window chrome, browser navigation, tab titles, menu items, OS UI elements, random single words.
+        If there is no useful technical content at all, return exactly: NONE
+
+        Text:
+        {chunk}
+
+        Extracted content:"""
+
+        try:
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                think=False,
+                options={
+                    "num_predict": 300,
+                    "temperature": 0.1,   # near-deterministic extraction
+                    "flash_attn": False,
+                }
+            )
+
+            if hasattr(response, 'message') and response.message:
+                result = (response.message.content or '').strip()
+            else:
+                result = ((response or {}).get('message', {}) or {}).get('content', '').strip()
+
+            # If gemma returned "NONE" or empty, signal no useful content
+            if not result or result.upper() == "NONE":
+                return ""
+            return result
+        except Exception as e:
+            print(f"\033[1;31m[AIEngine] extract_ocr_chunk error: {e}\033[0m")
+            return ""

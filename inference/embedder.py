@@ -51,7 +51,16 @@ class Embedder:
 
         # SentenceTransformaer caches the model locally after first download.
         # On subsequent runs it loads from the HuggingFace cache (~133MB).
-        self._model = SentenceTransformer(self.MODEL_ID)
+        # We must check if we're online, otherwise HF throws getaddrinfo failed.
+        import socket
+        try:
+            socket.setdefaulttimeout(3)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+            is_online = True
+        except Exception:
+            is_online = False
+            
+        self._model = SentenceTransformer(self.MODEL_ID, local_files_only=not is_online)
         print(f"{_GREEN}[Embedder] Model ready.{_RESET}")
 
         # OPTIMIZATION: In-memory throttle

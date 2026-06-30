@@ -101,6 +101,18 @@ namespace Jugnu
         )";
         if(!ExecuteSQL(create_vec_sql)) return false;
 
+        // STaging table for raw OCR captures.
+        // C++ writes here directly. Python's FlishWorker reads, cleans with Gemma, then vectorizes.
+        std::string create_ocr_buffer_sql = R"(
+            CREATE TABLE IF NOT EXISTS ocr_buffer (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name  TEXT NOT NULL,
+                raw_text  TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        )";
+        if(!ExecuteSQL(create_ocr_buffer_sql)) return false;
+
         return true;
     }
 
@@ -238,5 +250,27 @@ namespace Jugnu
             sqlite3_finalize(stmt);
         }
         return result;
+    }
+
+    bool DBHandler::BufferOCR(const std::string& appName, const std::string& rawText)
+    {
+        if(!db) return false;
+
+        // Use a prepared statement so special characters in OCR text
+        // (quotes, backslashes, unicode) are handled safely by SQLite.
+        // No manual escaping needed — that was only required for the JSON IPC pipe.
+
+        sqlite3_stmt* stmt;
+        const char* sql = "INSERT INTO ocr_buffer (app_name, raw_text) VALUES (?, ?);";
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        if(rc != SQLITE_OK) return false;
+
+        sqlite3_bind_text(stmt, 1, appName.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, rawText.c_str(), -1, SQLITE_TRANSIENT);
+
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        return (rc == SQLITE_DONE);
     }
 }

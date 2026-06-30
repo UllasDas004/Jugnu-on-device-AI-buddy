@@ -30,14 +30,17 @@ graph TD
         AppSwitch -->|JSON Stream| Pipe((jugnu_ipc))
         FileMonitor -->|JSON Stream| Pipe
         ClipTracker -->|JSON Stream| Pipe
-        ScreenReader -->|JSON Stream| Pipe
+        ScreenReader -->|Direct SQL Dump| OCRBuffer[(ocr_buffer DB)]
     end
 
     subgraph "Python Inference & UI Server (uv venv)"
         Pipe -->|Listener| StateManager[State Aggregator]
-        StateManager -->|Embeddings| Embedder[embedder.py]
+        OCRBuffer -->|Batch Clean| FlushWorker[FlushWorker Daemon]
+        FlushWorker -->|Noise Filter| AIEngine[Local Ollama / Gemma]
+        FlushWorker -->|Clean Text| Embedder[embedder.py]
+        StateManager -->|Direct Text| Embedder
         Embedder -->|vec_episodic| SQLiteVec[(sqlite-vec DB)]
-        StateManager -->|Context| AIEngine[Local Ollama / Gemma]
+        StateManager -->|Context| AIEngine
         StateManager -->|Trigger| TerminalUI[PowerShell jugnu_interact.py]
     end
 ```
@@ -48,8 +51,9 @@ graph TD
 Jugnu has successfully completed **Phase 3: Native WinRT Screen Awareness & MSVC Migration**.
 - **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
 - **Native GPU OCR Engine**: Uses MSVC and C++/WinRT to silently capture `BitBlt` screenshots directly into RAM and extract text via `Windows.Media.Ocr` on the GPU, avoiding expensive Python subprocesses.
+- **Two-Stage Deferred Processing**: C++ acts as a high-speed Producer dumping raw OCR text into an `ocr_buffer`. A Python `FlushWorker` consumes it every 60s (only on AC power), using Gemma to filter out UI noise before embedding.
 - **IPC Telemetry**: A Named Pipe streams JSON payloads (with strict defensive escaping) from the C++ Kernel into the isolated Python `uv` environment.
-- **Semantic RAG Database**: The `embedder.py` converts text into 384-dimensional vectors using `e5-small-v2`. It uses a **Snippet + Filepath Hybrid** model to save 10x DB space and always retrieve fresh code from disk.
+- **Semantic RAG Database**: The `embedder.py` converts text into 384-dimensional vectors using `e5-small-v2` (featuring an offline fallback network check). It uses a **Snippet + Filepath Hybrid** model to save 10x DB space and always retrieve fresh code from disk.
 - **5-Gate Optimization**: RAG pipeline runs through empty checks, quality filters, in-memory throttles, and O(1) DB deduplication before hitting the expensive neural net.
 - **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a custom `_warmup()` routine to bypass CUDA initialization crashes on RTX 4050/Mobile GPUs.
 - **Terminal Interaction UI**: When stuck, Jugnu spawns a native PowerShell popup window (`jugnu_interact.py`) to query the user, injects top-3 past context from the vector DB, and delivers insights.

@@ -1,3 +1,5 @@
+from torch import true_divide
+from socket import socket
 import threading
 import win32file
 import pywintypes
@@ -9,40 +11,73 @@ import notification
 from state_manager import StateManager
 from ai_engine import AIEngine
 from embedder import Embedder
+from flush_worker import FlushWorker
 from sentence_transformers import SentenceTransformer
 import ollama
 
 # Fix CUDA warmup crash on RTX 4050 / Turing+ with Ollama's Flash Attention PDL kernel
 os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "0")
+
+def _is_online() -> bool:
+    """Quick connectivity check - try to reach Ollama's update endpoint."""
+    import socket
+    try:
+        socket.setdefaulttimeout(3)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+        return True
+    except Exception:
+        return False
+        
 def ensure_models_downloaded():
     print("[INIT] Checking AI Models... Please wait.")
 
-    # 1. Check e5-small (Downloads to HuggingFace cache if missing)
+    online = _is_online()
+    if not online:
+        print("[INIT] Offline mode detected. Will only use locally cached models.")
+    
+    # ── 1. e5-small-v2 (SentenceTransformer / HuggingFace) ──────────────────
     try:
         print("[INIT] Loading intfloat/e5-small-v2...")
-        # This will automatically pull it if it doesn't exist locally
-        model = SentenceTransformer('intfloat/e5-small-v2')
+        # SentenceTransformer loads from local HF cache automatically.
+        # If cache is missing AND we're offline, this will raise and we exit —
+        # because we genuinely cannot run without the embedder.
+        # We pass local_files_only=True if offline to prevent HuggingFace from 
+        # trying to check for updates (which throws getaddrinfo failed).
+        model = SentenceTransformer('intfloat/e5-small-v2', local_files_only=not online)
         print("[INIT] e5-small is ready!")
-    
     except Exception as e:
-        print(f"[FATAL] Failed to load e5-small: {e}")
+        print(f"[FATAL] e5-small not available locally and cannot download: {e}")
         sys.exit(1)
 
-    # 2. Check Gemma model via Ollama
+    # ── 2. Gemma (Ollama) ────────────────────────────────────────────────────
     model_name = "gemma4:e2b"
     try:
         ollama.show(model_name)
+        # Model exists locally — we're done regardless of internet status
         print(f"[INIT] {model_name} is ready!")
+        return
+    
     except ollama.ResponseError:
-        print(f"[INIT] Model {model_name} not found locally. Pulling from Ollama... This might take a few minutes depending on your internet.")
-
-    try:
-        # This blocks and downloads the multi-gigabyte model
-        ollama.pull(model_name)
-        print(f"[INIT] Successfully downloaded {model_name}!")
-    except Exception as pull_err:
-        print(f"[FATAL] Failed to pull Ollama model: {pull_err}")
-        print("Make sure the Ollama background service is running!")
+        # Model NOT found locally
+        if not online:
+            # Offline AND model missing - cannot proceed
+            print(f"[FATAL] {model_name} is not cached locally and you are offline.")
+            print("Please connect to the internet once to download the model, then run again.")
+            sys.exit(1)
+        else:
+            # Online AND model missing - pull it
+            print(f"[INIT] {model_name} not found locally. Downloading (this may take a few minutes)...")
+            try:
+                ollama.pull(model_name)
+                print(f"[INIT] Successfully downloaded {model_name}!")
+            except Exception as e:
+                print(f"[FATAL] Failed to pull Ollama model: {pull_err}")
+                print("Make sure the Ollama background service is running: 'ollama serve'")
+                sys.exit(1)
+    except Exception as e:
+        # ollama service itself is not running
+        print(f"[FATAL] Cannot reach Ollama service: {e}")
+        print("Start it with: ollama serve")
         sys.exit(1)
 
 
@@ -185,6 +220,8 @@ if __name__ == "__main__":
     state = StateManager()
     engine = AIEngine()
     embedder = Embedder()
+    flush_worker = FlushWorker(embedder, engine)
+    flush_worker.start()
 
     # Python is now a pure headless AI backend.
     # The listener loop runs synchronously on the main thread.

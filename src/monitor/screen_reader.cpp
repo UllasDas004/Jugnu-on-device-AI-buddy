@@ -139,29 +139,17 @@ namespace Jugnu
                     std::string utf8_text(size_needed, 0);
                     WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), &utf8_text[0], size_needed, NULL, NULL);
 
-                    // Escape JSON manualy (CRITICAL)
-                    std::string escaped_text;
-                    for(char c : utf8_text)
+                    // ARCHITECTURE CHANGE: Write directly to SQLite ocr_buffer.
+                    // No JSON escaping needed — SQLite prepared statements handle all special chars safely.
+                    // No IPC pipe involved — large OCR text blobs never travel over Named Pipes.
+                    // Python's FlushWorker will read this table every 60s and clean it with Gemma.
+
+                    if(DBHandler::BufferOCR(currentApp, utf8_text))
                     {
-                        switch(c)
-                        {
-                            case '"': escaped_text += "\\\""; break;
-                            case '\\': escaped_text += "\\\\"; break;
-                            case '\n': escaped_text += "\\n"; break;
-                            case '\r': escaped_text += "\\r"; break;
-                            case '\t': escaped_text += "\\t"; break;
-                            default: 
-                                if (static_cast<unsigned char>(c) < 0x20) {
-                                    char buf[7];
-                                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                                    escaped_text += buf;
-                                } else escaped_text += c;
-                                break;
-                        }
+                        std::cout << "\033[32m[ScreenReader]\033[0m Buffered " 
+                                  << utf8_text.length() << " chars from " 
+                                  << currentApp << " to ocr_buffer.\n";
                     }
-                    std::string payload = "{\"type\": \"OCR_SCREEN\", \"app\": \"" + currentApp + "\", \"text\": \"" + escaped_text + "\"}";
-                    Jugnu::IPCServer::SendMessageToPython(payload);
-                    std::cout << "\033[32m[ScreenReader]\033[0m Sent " << utf8_text.length() << " chars to Python.\n";
                 }
             }
         }

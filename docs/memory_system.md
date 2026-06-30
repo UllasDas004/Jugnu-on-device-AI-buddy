@@ -17,6 +17,9 @@ The memory system is a three-tier architecture:
 │  "User researched: sliding window technique [Mon 5PM]"          │
 │  + vec_episodic (VIRTUAL TABLE — 384-dim float vectors)         │
 ├─────────────────────────────────────────────────────────────────┤
+│  TIER 0.5: ocr_buffer (Staging — Cleared by Python flush_worker)│
+│  "Raw dirty screen pixels with UI noise..."                     │
+├─────────────────────────────────────────────────────────────────┤
 │  TIER 0: In-RAM (Hot — Instant access, 30-min flush)            │
 │  EMA priority_map: {"code.exe": 0.89, "chrome.exe": 0.73}      │
 │  Markov transitions: {"code|chrome|Morning" -> "chrome": 14}    │
@@ -38,6 +41,13 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
    - `window_title`: The full window title at capture time.
    - `text_content`: The raw text (up to 4000 chars for code files).
    - `timestamp`: Auto-set by SQLite.
+
+2. **`ocr_buffer`** (The Staging Area)
+   A temporary holding zone for massive, dirty screen text captured by C++.
+   - `id`: Primary key.
+   - `app_name`: Source of the screenshot.
+   - `raw_text`: The uncleaned OCR dump.
+   - *Note*: Rows here are aggressively chunked, cleaned by Gemma via `flush_worker.py`, inserted into `episodic_memories`, and then deleted from this table.
 
 2. **`vec_episodic`** (The Vector Index — VIRTUAL TABLE)
    Created with `sqlite-vec`'s `vec0` engine. Stores 384-dimensional float arrays

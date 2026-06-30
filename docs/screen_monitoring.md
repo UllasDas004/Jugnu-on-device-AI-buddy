@@ -36,11 +36,18 @@ If Jugnu detects massive screen updates with no readable text (e.g., a video gam
 
 ---
 
-## 3. The Embedding Gate
+## 3. The Embedding Gate (Two-Stage Pipeline)
 
-Once text is successfully extracted via Tier 1 or Tier 2, it isn't automatically saved. 
-1. The text is passed to the local Python Inference service.
-2. The AI generates an **Importance Score** (0.0 to 1.0).
-3. If the score is high enough, the text is converted into a 384-dimensional vector and saved to the SQLite `episodic_log`.
+Once text is successfully extracted via Tier 1 or Tier 2, it isn't automatically saved as a permanent memory.
 
-*(Note: See `memory_system.md` for how this Importance Score controls database pruning).*
+**Stage 1: The Buffer**
+1. C++ dumps the raw, noisy text directly into the SQLite `ocr_buffer` table. This happens instantly, with zero python overhead.
+
+**Stage 2: The Flush Worker**
+1. A background Python daemon (`flush_worker.py`) wakes up every 60 seconds (but only if the laptop is plugged into AC power, to save battery).
+2. It reads chunks from the `ocr_buffer`.
+3. It passes the chunks through the Gemma **OCR Noise Extractor** prompt. If Gemma replies "NONE" (meaning it was just UI scrollbars/timestamps), the chunk is discarded.
+4. If real technical knowledge is extracted, it is converted into a 384-dimensional vector and saved to the permanent `episodic_memories` table.
+5. The processed rows are deleted from the buffer.
+
+*(Note: See `memory_system.md` for database schema details and `prompts_design.md` for the Noise Extractor prompt).*

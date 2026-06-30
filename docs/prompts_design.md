@@ -75,6 +75,23 @@ Activity:
 <end_of_turn>
 ```
 
+### D. The OCR Noise Extractor
+**Purpose:** Cleans dirty OCR screen dumps by extracting only technical/code knowledge and returning "NONE" if the chunk is just UI noise. This acts as a semantic filter before vector embeddings.
+**Temperature:** 0.0 (Must be strictly deterministic)
+```text
+<start_of_turn>system
+You are a strict data extraction tool.
+I am going to give you a chunk of raw OCR text from my computer screen.
+It contains a lot of UI noise (buttons, timestamps, scrollbars).
+Your job is to extract ONLY the technical, factual, or code-related knowledge.
+Do NOT output any markdown, pleasantries, or formatting.
+If the chunk contains only UI noise, return exactly the word "NONE".
+
+Raw OCR:
+{SCREEN_CHUNK}
+<end_of_turn>
+```
+
 ---
 
 ## 2. Cloud Inference (Gemini API Fallback)

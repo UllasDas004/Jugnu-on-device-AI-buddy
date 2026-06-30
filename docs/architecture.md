@@ -38,6 +38,7 @@ In Phase 3, we strictly migrated the C++ engine to **MSVC (Visual Studio Build T
 │                                                                     │
 │  • llama-cpp-python (Runs the Gemma 3-4B model)                     │
 │  • ONNX Runtime (Runs the e5-small text embedding model)            │
+│  • Background FlushWorker (Cleans OCR data into vector memory)      │
 │  • Gemini API Fallback (For broad web knowledge)                    │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -65,6 +66,7 @@ In Phase 3, we strictly migrated the C++ engine to **MSVC (Visual Studio Build T
 | Frontend HTTP server (:7331) | **C++** | Serves web UI to WebView2 |
 | Named Pipe IPC Server | **C++** | Zero-latency, secure C++ ↔ Python comms |
 | Periodic flush thread | **C++** | Background thread, always running |
+| OCR batch cleaner | **Python** | flush_worker.py (runs every 60s on AC power) |
 | Clipboard monitor | **C++** | Win32 API |
 | File system watcher | **C++** | Win32 API (ReadDirectoryChangesW) |
 | Audio monitor | **C++** | WASAPI COM API |
@@ -118,6 +120,7 @@ jugnu/
 │
 ├── inference/                  ← Python Inference Service
 │   ├── inference_service.py    ← Named Pipes client (main entry point)
+│   ├── flush_worker.py         ← Background OCR cleaner and embedder
 │   ├── embedder.py             ← e5-small ONNX wrapper
 │   ├── generator.py            ← Gemma llama-cpp-python wrapper
 │   ├── gemini_client.py        ← Gemini API fallback
@@ -209,9 +212,9 @@ EVENT_SYSTEM_FOREGROUND fires →
   Parse: fileName="solution.py", language="Python", topic="LeetCode" →
   updateMarkov(prevApp, currApp, timeBlock) →     ← pure C++ DSA
   updateAppPriority(appName) →                   ← pure C++ DSA
-  screen_monitor.readWindow(hwnd) →              ← triggers 3-tier screen read
-  Send over Named Pipe {text} → get vector →     ← calls Python for ML only
-  queueEpisodicMemory(app, text, vector, authored)
+  screen_monitor.CaptureAndOCR(hwnd) →           ← C++ GPU OCR
+  DBHandler::BufferOCR(app, text) →              ← Saves to ocr_buffer SQLite table
+  (Later: flush_worker.py extracts code via Gemma and embeds it)
 ```
 
 **Time Block (same as Synapse, unchanged):**
@@ -258,6 +261,7 @@ User types "what was I working on yesterday?"
 | Task | Runs in | Interval | What it does |
 |---|---|---|---|
 | Periodic flush | C++ thread | 30 min | Write EMA + Markov from RAM → SQLite |
+| OCR cleaner | Python thread | 60 sec | Gemma extracts tech data from `ocr_buffer` (AC power only) |
 | Gemma idle unload | Python | 5 min no queries | Unload model from VRAM (free 2.7GB) |
 | Nightly extraction | Python (Task Scheduler) | 2 AM | Fact extraction → core_persona |
 | EMA decay | Python (nightly) | Nightly | Apply decay to priority_map |
