@@ -261,8 +261,21 @@ User types "what was I working on yesterday?"
 | Task | Runs in | Interval | What it does |
 |---|---|---|---|
 | Periodic flush | C++ thread | 30 min | Write EMA + Markov from RAM → SQLite |
-| OCR cleaner | Python thread | 60 sec | Gemma extracts tech data from `ocr_buffer` (AC power only) |
+| OCR batch cleaner | Python thread | 60 sec | Gemma extracts tech data from `ocr_buffer` (AC power only) |
+| Async File Synthesis | Python daemon | On File Save | Synthesizes massive code files into OKF documents without blocking IPC |
 | Gemma idle unload | Python | 5 min no queries | Unload model from VRAM (free 2.7GB) |
+
+---
+
+## Python AI Orchestration Pipeline
+
+The Python layer is highly optimized for performance and defensive programming to avoid blocking the C++ kernel pipeline.
+
+1. **`ipc_client.py`**: The bridge to C++. It reads the Named Pipe using `win32file.ReadFile`. It strictly separates telemetry ingestion (main thread) from heavy file synthesis (daemon thread `_synthesize_and_save_file`).
+2. **`ai_engine.py`**: Manages the Ollama inference. Features a cold-start `_warmup()` 1-token query to absorb CUDA crashes, completely disables Flash Attention for mobile GPU stability, and uses a two-pass `extract_ocr_chunk` → `synthesize_ocr_extractions` pipeline to build structured OKF JSON docs.
+3. **`flush_worker.py`**: The background OCR sweeper. It uses `ctypes` to check `GetSystemPowerStatus` and aborts if on battery. It forces a 30-second settle time before reading `ocr_buffer` and uses `difflib.SequenceMatcher` to skip Gemma extraction entirely if the screen hasn't changed >85%.
+4. **`embedder.py`**: The vector store interface. Prevents fatal HuggingFace API network timeouts during offline usage by pinging `8.8.8.8` and gracefully falling back to `local_files_only=True`. Connects to SQLite with `timeout=5.0` to avoid crashing when C++ executes a massive `BEGIN TRANSACTION` lock.
+5. **`notification.py`**: The UI bridge. Uses `subprocess.CREATE_NEW_CONSOLE` to spawn an interactive PowerShell prompt over the user's IDE instantly, preventing the main IPC loop from blocking on `input()`. Features the "Custom Problem Override" — throwing away pre-fetched screen context if the user asks a manual, unrelated question.
 | Nightly extraction | Python (Task Scheduler) | 2 AM | Fact extraction → core_persona |
 | EMA decay | Python (nightly) | Nightly | Apply decay to priority_map |
 | Row limit | C++ (nightly trigger) | Nightly | Trim episodic_log to 5,000 |

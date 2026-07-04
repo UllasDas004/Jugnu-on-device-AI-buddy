@@ -6,15 +6,15 @@ The memory system is a three-tier architecture:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  TIER 2: core_persona (Permanent — Never evicted)               │
+│  TIER 3: core_persona (Permanent — Never evicted)               │
 │  "User is preparing for FAANG placements"                       │
-│  "User codes in Python and C++"                                 │
-│  "User is in 3rd year Computer Science"                         │
+├─────────────────────────────────────────────────────────────────┤
+│  TIER 2: knowledge_docs & vec_knowledge (The OKF Vault)         │
+│  Synthesized JSON knowledge (e.g., Code logic, SQL schemas)     │
+│  "Topic: sqlite_vec integration in db_handler.cpp"              │
 ├─────────────────────────────────────────────────────────────────┤
 │  TIER 1: episodic_memories (Rolling — 5,000-row EMA cap)        │
 │  "User read: Virtual Memory — Galvin Ch9 [Mon 3PM]"             │
-│  "User coded: twoSum in Python [Mon 4PM]"                       │
-│  "User researched: sliding window technique [Mon 5PM]"          │
 │  + vec_episodic (VIRTUAL TABLE — 384-dim float vectors)         │
 ├─────────────────────────────────────────────────────────────────┤
 │  TIER 0.5: ocr_buffer (Staging — Cleared by Python flush_worker)│
@@ -55,11 +55,21 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
    - `embedding float[384]`: Binary blob of IEEE 754 single-precision floats.
    - Searched using `WHERE embedding MATCH ? AND k = ?` KNN syntax.
 
-3. **`markov_edges`** (The Markov Chain)
+3. **`knowledge_docs`** (The OKF Vault)
+   Stores highly structured, LLM-synthesized Objective Knowledge Format (OKF) documents extracted from raw code files and screens.
+   - `id`: Primary key.
+   - `topic`: A short, descriptive title (e.g., "Dependency Injection in Python").
+   - `content`: The detailed, structured JSON/Markdown synthesis.
+   - `capture_count`: Incremented if the same knowledge is detected again, proving importance.
+
+4. **`vec_knowledge`** (The OKF Vector Index — VIRTUAL TABLE)
+   The `sqlite-vec` index for `knowledge_docs`, enabling RAG against deep technical synthesized knowledge rather than just raw episodes.
+
+5. **`markov_edges`** (The Markov Chain)
    Stores O(1) app switching behaviour for prediction.
    - `source_app TEXT`, `target_app TEXT`, `transition_count INTEGER`
 
-4. **`app_paths`** (The RAM Prefetcher Vault)
+6. **`app_paths`** (The RAM Prefetcher Vault)
    Stores the absolute path to each process's executable for RAM prefetching.
    - `process_name TEXT PRIMARY KEY`, `absolute_path TEXT NOT NULL`
 

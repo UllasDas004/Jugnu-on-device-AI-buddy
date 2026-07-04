@@ -530,3 +530,25 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 ### Trap I-5: Unprintable OCR Pixel Garbage
 **Problem:** The WinRT OCR engine occasionally misinterprets graphical UI elements (like scrollbars) as ASCII control characters (like `0x1B` ESC). Passing these over the IPC pipe caused Python's `json.loads()` to throw a `JSONDecodeError: Invalid control character`.
 **Fix:** The C++ IPC layer explicitly checks if `static_cast<unsigned char>(c) < 0x20` and converts raw bytes into safely escaped Unicode sequences (e.g., `\u001b`) before sending them.
+
+---
+
+## Group J: Phase 4 RAG & Battery Optimizations
+
+### Trap J-1: The Blocking IPC Thread Trap
+**Problem:** When a developer saves an 8,000-character code file, it takes several seconds for Gemma to synthesize it into an OKF document. Originally, this ran synchronously on the main IPC listener thread, causing Python to stop reading from the Named Pipe. The 4KB kernel buffer overflowed, dropping critical telemetry events from C++.
+**Fix:** Refactored `ipc_client.py` to use `threading.Thread(target=_synthesize_and_save_file, daemon=True).start()`. This pushes heavy file synthesis into the background, allowing the IPC loop to return to `win32file.ReadFile` instantly.
+
+### Trap J-2: The Idle-Time Battery Destroyer (Lazy Evaluation)
+**Problem:** When the C++ engine detected the user was idle, Python would immediately run a massive RAG generation task (using 100% GPU for 5-10 seconds) to build an answer *before* popping up the notification window. If the user was just stretching their legs and didn't actually need help, those GPU cycles were entirely wasted, drastically hurting battery life.
+**Fix:** Implemented Lazy RAG Evaluation. `ipc_client.py` now only generates a tiny 10-token `search_query` (<100ms) and performs the KNN vector search when idle. The heavy 500-token AI answer generation is completely deferred until the user explicitly clicks "Yes, I need help" on the notification UI.
+
+### Trap J-3: The Disjointed UI Context Trap
+**Problem:** Jugnu popped a notification based on a Python file currently open on the screen. The user clicked "Yes" but typed a manual question: *"Actually, how do I configure Docker?"* The LLM tried to answer the Docker question using the Python file as context, resulting in massive hallucinations.
+**Fix:** Implemented the "Custom Problem RAG Override" in `notification.py`. If a custom problem is detected, it intercepts the workflow, discards the pre-fetched screen context, generates a fresh query for "Docker", runs a new semantic search, and answers using the new, highly relevant sources.
+
+### Trap J-4: The OCR Settle-Time Battery Drain
+**Problem:** The background `FlushWorker` woke up every 60 seconds to process the OCR screen dumps. If the user was staring at a static documentation page for 10 minutes, Jugnu re-ran the Gemma OKF Extraction on the *exact same pixels* 10 times, draining the laptop battery.
+**Fix:** Added a two-stage defensive check in `flush_worker.py`:
+1. **Time Settle Check**: If the latest screenshot timestamp is less than 30 seconds old, abort (wait for the screen to settle).
+2. **Difflib Dedup**: Used `difflib.SequenceMatcher(None, current_text, previous_text).ratio()`. If the screen hasn't changed by at least 15%, bypass Gemma inference entirely.

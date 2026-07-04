@@ -81,13 +81,7 @@ namespace Jugnu
         )";
         if(!ExecuteSQL(create_episodic_sql)) return false;
 
-        // OPTIMIZATION: Index on test_content for O(1) dedup checks In Python.
-        // Without this, every save_memory() call is a full table scan (O(N)).
-        std::string create_text_index_sql = R"(
-            CREATE INDEX IF NOT EXISTS idx_episodic_text
-            ON episodic_memories(text_content);
-        )";
-        if(!ExecuteSQL(create_text_index_sql)) return false;
+
 
         // Create the Virtual Table for the vectors (384 dimensions for e5-small)
         // Why Virtual?
@@ -112,7 +106,30 @@ namespace Jugnu
             );
         )";
         if(!ExecuteSQL(create_ocr_buffer_sql)) return false;
+        
+        // OKF-inspired structured knowledge store.
+        // Each row is a synthesized JSON knowledge document from one OCR capture.
+        // Related captures of the same topic are MERGED here, not duplicated.
 
+        std::string create_knowledge_docs_sql = R"(
+            CREATE TABLE IF NOT EXISTS knowledge_docs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic         TEXT NOT NULL,
+                source_app    TEXT,
+                doc_json      TEXT NOT NULL,
+                first_seen    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_updated  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                capture_count INTEGER DEFAULT 1
+            );
+        )";
+        if(!ExecuteSQL(create_knowledge_docs_sql)) return false;
+        // Vector index for semantic topic search (for merge detection).
+        std::string create_vec_knowledge_sql = R"(
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_knowledge USING vec0(
+                embedding float[384]
+            );
+        )";
+        if(!ExecuteSQL(create_vec_knowledge_sql)) return false;
         return true;
     }
 

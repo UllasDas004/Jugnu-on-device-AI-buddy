@@ -41,7 +41,9 @@ namespace Jugnu
             // THE PREFETCH EXTRACTOR: Grab the absolute C:\ path!
             char processPath[MAX_PATH];
             if(GetModuleFileNameExA(hProcess, NULL, processPath, MAX_PATH))
-            Jugnu::DBHandler::UpsertAppPath(finalProcessName, std::string(processPath));
+            {
+                Jugnu::DBHandler::UpsertAppPath(finalProcessName, std::string(processPath));
+            }
         }
         
         CloseHandle(hProcess);
@@ -226,7 +228,7 @@ namespace Jugnu
                 DWORD currentTick = GetTickCount(); 
                 DWORD idleTime = currentTick - lii.dwTime;
                 
-                // If the user has been idle for > 5 seconds (5000 ms) for testing
+                // If the user has been idle for > 3 minutes (180000 ms)
                 // AND they are currently staring at a coding app...
                 if (idleTime > 180000)
                 {

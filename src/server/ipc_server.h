@@ -11,7 +11,7 @@ namespace Jugnu
             // Start the background pipe listener thread
             static void Start();
 
-            // Stop the listner and safely disconnect the pipe
+            // Stop the listener and safely disconnect the pipe
             static void Stop();
 
             // Send a string message to the python client
@@ -21,7 +21,7 @@ namespace Jugnu
             // Handle to the Named Pipe allocated by the OS
             static HANDLE hPipe;
 
-            // Atomiv frag to control the while-loop in the listener thred
+            // Atomic flag to control the while-loop in the listener thread
             static bool isRunning;
             static std::atomic<bool> isClientConnected;
 

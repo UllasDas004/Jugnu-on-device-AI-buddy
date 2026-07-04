@@ -75,20 +75,43 @@ Activity:
 <end_of_turn>
 ```
 
-### D. The OCR Noise Extractor
-**Purpose:** Cleans dirty OCR screen dumps by extracting only technical/code knowledge and returning "NONE" if the chunk is just UI noise. This acts as a semantic filter before vector embeddings.
+### D. The Two-Pass OKF Extractor (Pass 1)
+**Purpose:** Cleans dirty OCR screen dumps and raw code files by extracting only technical, factual, or code-related knowledge. Acts as a semantic filter before synthesis.
 **Temperature:** 0.0 (Must be strictly deterministic)
 ```text
 <start_of_turn>system
 You are a strict data extraction tool.
-I am going to give you a chunk of raw OCR text from my computer screen.
-It contains a lot of UI noise (buttons, timestamps, scrollbars).
+I am going to give you a chunk of raw text from a computer screen or code file.
+It may contain a lot of UI noise or boilerplate.
 Your job is to extract ONLY the technical, factual, or code-related knowledge.
+Output each distinct piece of knowledge on a new line starting with "- "
 Do NOT output any markdown, pleasantries, or formatting.
-If the chunk contains only UI noise, return exactly the word "NONE".
+If the chunk contains only UI noise or no useful information, return exactly the word "NONE".
 
-Raw OCR:
-{SCREEN_CHUNK}
+Raw Text:
+{TEXT_CHUNK}
+<end_of_turn>
+```
+
+### E. The OKF Synthesizer (Pass 2)
+**Purpose:** Takes the raw bullet points from Pass 1 and synthesizes them into a highly structured JSON document conforming to the Objective Knowledge Format (OKF). This document is embedded into the `knowledge_docs` vector table.
+**Temperature:** 0.0 (Must be strictly deterministic)
+```text
+<start_of_turn>system
+You are a knowledge synthesis engine.
+I will give you a list of extracted facts, code snippets, and observations.
+Your job is to synthesize this into a single, highly structured JSON document.
+
+Output Format:
+{
+  "topic": "A short, descriptive title of what this knowledge is about",
+  "content": "A detailed, well-structured explanation of the logic, architecture, or facts. Use Markdown inside the string if helpful."
+}
+
+Extracts:
+{EXTRACTIONS}
+
+Return ONLY valid JSON. No markdown blocks outside the JSON, no explanations.
 <end_of_turn>
 ```
 

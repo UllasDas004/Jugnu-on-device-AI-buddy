@@ -44,10 +44,14 @@ Once text is successfully extracted via Tier 1 or Tier 2, it isn't automatically
 1. C++ dumps the raw, noisy text directly into the SQLite `ocr_buffer` table. This happens instantly, with zero python overhead.
 
 **Stage 2: The Flush Worker**
-1. A background Python daemon (`flush_worker.py`) wakes up every 60 seconds (but only if the laptop is plugged into AC power, to save battery).
-2. It reads chunks from the `ocr_buffer`.
-3. It passes the chunks through the Gemma **OCR Noise Extractor** prompt. If Gemma replies "NONE" (meaning it was just UI scrollbars/timestamps), the chunk is discarded.
-4. If real technical knowledge is extracted, it is converted into a 384-dimensional vector and saved to the permanent `episodic_memories` table.
-5. The processed rows are deleted from the buffer.
+1. A background Python daemon (`flush_worker.py`) wakes up every 60 seconds (but only if the laptop is plugged into AC power, using Win32 `GetSystemPowerStatus`, to save battery).
+2. It waits for the UI to settle by enforcing a hard 30-second `Settle Time` (if the latest screenshot is less than 30s old, it aborts the cycle).
+3. It reads chunks from the `ocr_buffer`.
+4. It performs a fast `difflib.SequenceMatcher` check against the previously processed screen. If the screen hasn't changed by at least 15%, it instantly discards the chunk to save GPU battery.
+5. If the screen is new, it passes the chunks through the Gemma **Two-Pass OKF Extractor**:
+   - **Pass 1:** Slices out UI noise and extracts only raw factual bullet points.
+   - **Pass 2:** Synthesizes the bullets into a structured JSON `knowledge_doc`.
+6. The OKF document is embedded (384-dimensional vector) and saved to the permanent `knowledge_docs` table for RAG.
+7. The processed rows are deleted from the buffer.
 
-*(Note: See `memory_system.md` for database schema details and `prompts_design.md` for the Noise Extractor prompt).*
+*(Note: See `memory_system.md` for database schema details and `prompts_design.md` for the Two-Pass OKF prompts).*

@@ -1,6 +1,5 @@
-from torch import true_divide
-from socket import socket
 import threading
+from socket import socket
 import win32file
 import pywintypes
 import os
@@ -14,6 +13,14 @@ from embedder import Embedder
 from flush_worker import FlushWorker
 from sentence_transformers import SentenceTransformer
 import ollama
+
+# ANSI colors for terminal logging
+_CYAN   = "\033[1;36m"
+_GREEN  = "\033[1;32m"
+_RED    = "\033[1;31m"
+_YELLOW = "\033[1;33m"
+_RESET  = "\033[0m"
+
 
 # Fix CUDA warmup crash on RTX 4050 / Turing+ with Ollama's Flash Attention PDL kernel
 os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "0")
@@ -71,7 +78,7 @@ def ensure_models_downloaded():
                 ollama.pull(model_name)
                 print(f"[INIT] Successfully downloaded {model_name}!")
             except Exception as e:
-                print(f"[FATAL] Failed to pull Ollama model: {pull_err}")
+                print(f"[FATAL] Failed to pull Ollama model: {e}")
                 print("Make sure the Ollama background service is running: 'ollama serve'")
                 sys.exit(1)
     except Exception as e:
@@ -110,11 +117,51 @@ def connect_to_pipe():
             return handle
         except pywintypes.error as e:
             if e.winerror == 2: # ERROR_FILE_NO_FOUND
-                print("Pipe not found. Is Jugni.exe running?")
+                print("Pipe not found. Is Jugnu.exe running?")
                 time.sleep(2)
             elif e.winerror == 231: # ERROR_PIPE_BUSY
                 print("Pipe is busy. Retrying...")
                 time.sleep(1)
+
+def _synthesize_and_save_file(engine, embedder, app_name, filepath, code_text):
+    """
+    Background thread: chunks a saved code file, extracts technical knowledge
+    with Gemma, synthesizes into one OKF knowledge_doc, and saves it.
+    Only runs for files under 8000 chars to avoid VRAM overruns.
+    """
+    MAX_FILE_CHARS = 8000
+    CHUNK_SIZE = 500
+
+    if len(code_text) > MAX_FILE_CHARS:
+        print(f"{_YELLOW}[OKF] File too large for synthesis ({len(code_text)} chars). Episodic-only.{_RESET}")
+        return
+    
+    from flush_worker import _chunk_text, MIN_CHUNK_WORDS
+    chunks = _chunk_text(code_text, CHUNK_SIZE)
+    all_extractions = []
+    prev_extracted = ""
+
+    for chunk in chunks:
+        if len(chunk.split()) < MIN_CHUNK_WORDS:
+            continue
+        extracted = engine.extract_ocr_chunk(chunk, prev_context=prev_extracted)
+        if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
+            all_extractions.append(extracted)
+            prev_extracted = extracted
+        else:
+            prev_extracted = chunk[:100]
+
+    if not all_extractions:
+        print(f"{_YELLOW}[OKF] No useful knowledge extracted from {os.path.basename(filepath)}.{_RESET}")
+        return
+
+    doc_json = engine.synthesize_ocr_extractions(all_extractions)
+    if doc_json:
+        saved = embedder.save_knowledge_doc(app_name, doc_json, engine)
+        if saved:
+            print(f"{_GREEN}[OKF] Knowledge doc saved from FILE_SAVED: {os.path.basename(filepath)}{_RESET}")
+        else:
+            print(f"{_YELLOW}[OKF] Synthesis failed for {os.path.basename(filepath)} — episodic only.{_RESET}")
 
 def pipe_listener_main(state, engine, embedder):
     handle = connect_to_pipe()
@@ -127,7 +174,10 @@ def pipe_listener_main(state, engine, embedder):
             # Read raw bytes from the named pipe
             result, data = win32file.ReadFile(handle, 4096)
             if result == 0:
-                buffer += data.decode("utf-8")
+                # pywin32 returns bytes from a binary pipe, but stubs declare str|bytes.
+                # This guard handles both safely.
+                chunk = data if isinstance(data, str) else data.decode("utf-8", errors="replace")
+                buffer += chunk
 
                 # Check for the delimeter we defined in C++
                 if "END_OF_MSG\n" in buffer:
@@ -165,6 +215,15 @@ def pipe_listener_main(state, engine, embedder):
                                             kwargs = {'file_path': None},
                                             daemon=True
                                         ).start()
+                                    # If it looks like a code snippet, synthesize into OKF
+                                    if text and len(text.strip()) > 100:
+                                        threading.Thread(
+                                            target=_synthesize_and_save_file,
+                                            args=(engine, embedder,
+                                                  state.current_app or 'clipboard',
+                                                  'clipboard', text),
+                                            daemon=True
+                                        ).start()
 
                                 elif event_type == "FILE_SAVED":
                                     filepath = payload.get('file')
@@ -182,15 +241,65 @@ def pipe_listener_main(state, engine, embedder):
                                                 kwargs = {'file_path': filepath},
                                                 daemon=True
                                             ).start()
+
+                                            threading.Thread(
+                                                target=_synthesize_and_save_file,
+                                                args=(engine, embedder,
+                                                      state.current_app or 'unknown',
+                                                      filepath, code_text),
+                                                daemon=True
+                                            ).start()
                                         except Exception as e:
                                             print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
-                                    current = payload.get('current_app', '').lower()
-                                    if any(v in current for v in VETO_APPS):
-                                        print("\033[90m[System] Veto app detected. Skipping.\033[0m", flush=True)
+                                    current_app = payload.get('current_app', '').lower()
+                                    
+                                    # Check VETO apps first
+                                    if any(v in current_app for v in VETO_APPS):
+                                        print(f"\033[90m[System] Veto app ({current_app}) detected. Skipping RAG.\033[0m", flush=True)
                                     elif state.was_recently_coding():
-                                        print("\n\033[1;33m[System] User may be stuck! Launching notification flow...\033[0m", flush=True)
-                                        threading.Thread(target=notification.trigger_flow, args=(state, engine, embedder), daemon=True).start()
+
+                                        # Step 1: Gemma reads screen context and generates a focused search query
+                                        # (This is a cheap, fast LLM call — just 30 tokens)
+                                        screen_context = state.generate_prompt_context(embedder=None)
+                                        search_query = engine.generate_search_query(screen_context)
+                                        print(f"{_YELLOW}[IPC] KNN Query: '{search_query}'{_RESET}")
+
+                                        # Step 2: Run KNN search ONLY (fast vector math, no GPU inference)
+                                        # We store the results and pass them to notification.
+                                        # Gemma will generate the actual answer ONLY if user clicks Y.
+                                        context_chunks = []
+                                        sources        = []
+
+                                        knowledge_results = embedder.search_knowledge_docs(search_query, limit=3)
+                                        if knowledge_results:
+                                            for doc in knowledge_results:
+                                                sources.append(doc['topic'])
+                                                context_chunks.append(
+                                                    f"[Topic: {doc['topic']} | Seen {doc['capture_count']}x]\n{doc['content']}"
+                                                )
+                                            print(f"{_GREEN}[IPC] Found {len(sources)} knowledge docs. Spawning notification...{_RESET}")
+                                        else:
+                                            memories = embedder.semantic_search(search_query, limit=3)
+                                            if memories:
+                                                context_chunks = [m["snippet"] for m in memories]
+                                                sources = ["past session memory"]
+                                                print(f"{_GREEN}[IPC] Found {len(memories)} episodic memories. Spawning notification...{_RESET}")
+                                            else:
+                                                print(f"{_YELLOW}[IPC] No memory found. Notification will use general insight.{_RESET}")
+
+                                        # Spawn the notification window — it will run Gemma AFTER user clicks Y
+                                        threading.Thread(
+                                            target=notification.trigger_flow,
+                                            args=(state, engine, embedder),
+                                            kwargs={
+                                                "search_query":  search_query,
+                                                "context_chunks": context_chunks,
+                                                "sources":        sources,
+                                                "screen_context": screen_context,
+                                            },
+                                            daemon=True
+                                        ).start()
                                     else:
                                         print("\033[90m[System] No recent coding context. Skipping.\033[0m", flush=True)
                             except json.JSONDecodeError:

@@ -1,25 +1,11 @@
-"""
-The Python-side semantic memory writer for Jugnu.
-Responsibility:
-    - Load the e5-small-v2 model to generate 384-dim text vectors.
-    - Receive text events from ipc_client.py.
-    - Write a SHORT SNIPPET + file_path into jugnu.db (not the full file).
-    - Provide semantic search for RAG context injection.
-Architecture Optimizations:
-    - Snippet-only storage: embed only first 300 chars, store filepath for full retrieval.
-    - Quality gate: skip content with fewer than 5 words (junk filter).
-    - In-memory dedup: skip if same content was embedded in last 60 seconds.
-    - DB dedup: skip if exact text snippet already exists in episodic_memories.
-    - INSERT OR IGNORE on vec_episodic: prevents UNIQUE constraint crash on retry.
-    - Lazy search: skip KNN query entirely if DB is empty (day 1 protection).
-"""
 import sqlite3
 import struct
 import time
-import sqlite3
 import sqlite_vec
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import json
+import datetime
 
 
 # ANSI colors for terminal logging
@@ -30,7 +16,7 @@ _YELLOW = "\033[1;33m"
 _RESET  = "\033[0m"
 
 # How many characters of a file to embed as its "fingerprint"
-SNIPPET_LEN = 300
+SNIPPET_LEN = 800
 
 # Minimum word count to consider content worth embedding
 MIN_WORDS = 5
@@ -151,20 +137,27 @@ class Embedder:
         try:
             cursor = self._conn.cursor()
 
-            # --- GATE 5: DB dedup - O(1) thanks to idx_episodic_text_index ---
-
-            cursor.execute(
-                "SELECT id FROM episodic_memories WHERE text_content = ? LIMIT 1;",
-                (snippet,)
-            )
-            if cursor.fetchone():
-                print(f"{_YELLOW}[Embedder] Duplicate snippet in DB, skipping.{_RESET}")
-                return False
-            
-            # --- EMBED & STORE ---
+            # --- EMBED ---
+            # We embed first so we can do semantic deduplication
             print(f"{_CYAN}[Embedder] Embedding memory for: {app_name}{_RESET}")
             vec = self._embed(snippet)
             blob = self._serialize_vector(vec)
+            # --- PHASE 2: DB Semantic Dedup ---
+            # Catch duplicates that fell out of the RAM cache (e.g. after restart)
+            # L2 distance < 0.14 means cos_sim > 0.99 (matches strict RAM cache)
+            cursor.execute("SELECT COUNT(*) FROM episodic_memories")
+            if cursor.fetchone()[0] > 0:
+                cursor.execute(
+                    """
+                    SELECT distance FROM vec_episodic 
+                    WHERE embedding MATCH ? AND k = 1
+                    """,
+                    (blob,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] < 0.14:
+                    print(f"{_YELLOW}[Embedder] DB Semantic duplicate found (dist={row[0]:.3f}), skipping.{_RESET}")
+                    return False
 
             # Insert metadata row (snippet only, not full file content)
             cursor.execute(
@@ -192,6 +185,154 @@ class Embedder:
         except Exception as e:
             print(f"{_RED}[Embedder] Unexpected error: {e}{_RESET}")
             return False
+
+    def save_knowledge_doc(self, app_name: str, doc_json: str, engine) -> bool:
+        """
+        Saves or merges a synthesized OKF knowledge document.
+        Flow:
+          1. Embed topic+content as search key
+          2. KNN search in vec_knowledge for similar existing doc
+          3a. Similar found → call engine.merge_knowledge_docs() → UPDATE row
+          3b. No match → INSERT new doc
+        """
+        try:
+            doc = json.loads(doc_json)
+        except Exception:
+            print(f"{_RED}[Embedder] Invalid JSON in save_knowledge_doc, skipping.{_RESET}")
+            return False
+        
+        topic = doc.get("topic", "")
+        content = doc.get("content", "")
+        search_text = f"{topic}. {content[:400]}"
+
+        try:
+            cursor = self._conn.cursor()
+
+            # Embed the topic + content snippet for semantic search
+            vec = self._model.encode(f"passage: {search_text}", normalize_embeddings=True)
+            blob = self._serialize_vector(vec.tolist())
+
+            # Check if vec_knowledge has anything to search
+            cursor.execute("SELECT COUNT(*) FROM knowledge_docs")
+            count = cursor.fetchone()[0]
+
+            if count > 0:
+                cursor.execute(
+                    "SELECT distance FROM vec_knowledge WHERE embedding MATCH ? AND k = 1",
+                    (blob,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] < 0.30:   # cosine sim > 0.97 - same topic
+                    # find the matching doc id via JSON
+                    cursor.execute(
+                        """
+                        SELECT kd.id, kd.doc_json
+                        FROM vec_knowledge vk
+                        INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
+                        WHERE vk.embedding MATCH ? AND k = 1
+                        ORDER BY distance ASC LIMIT 1;
+                        """,
+                        (blob,)
+                    )
+                    match = cursor.fetchone()
+                    if match:
+                        existing_id, existing_json = match
+                        print(f"{_CYAN}[Embedder] Similar knowledge doc found (id={existing_id}). Merging...{_RESET}")
+                        merged_json = engine.merge_knowledge_docs(existing_json, doc_json)
+
+                        if merged_json:
+                            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            cursor.execute(
+                                """
+                                UPDATE knowledge_docs
+                                SET doc_json=?, topic=?,
+                                last_updated=?,capture_count=capture_count+1
+                                WHERE id=?;
+                                """,
+                                (merged_json, json.loads(merged_json).get("topic", topic), now, existing_id)
+                            )
+                            # Recompute embedding for merged doc and update vec_knowledge
+                            merged_doc = json.loads(merged_json)
+                            merged_text = f"{merged_doc.get('topic','')}. {merged_doc.get('content','')[:400]}"
+                            merged_vec = self._model.encode(f"passage: {merged_text}", normalize_embeddings=True)
+                            merged_blob = self._serialize_vector(merged_vec.tolist())
+                            cursor.execute(
+                                "UPDATE vec_knowledge SET embedding=? WHERE rowid=?;",
+                                (merged_blob, existing_id)
+                            )
+
+                            self._conn.commit()
+                            print(f"{_GREEN}[Embedder] Knowledge doc #{existing_id} merged and updated.{_RESET}")
+                            return True
+            # No Match - insert fresh knowledge doc
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            cursor.execute(
+                """INSERT INTO knowledge_docs (topic, source_app, doc_json, first_seen, last_updated)
+                   VALUES (?, ?, ?, ?, ?);""",
+                (topic, app_name, doc_json, now, now)
+            )
+            rowid = cursor.lastrowid
+            cursor.execute(
+                "INSERT OR IGNORE INTO vec_knowledge(rowid, embedding) VALUES (?, ?);",
+                (rowid, blob)
+            )
+            self._conn.commit()
+            print(f"{_GREEN}[Embedder] New knowledge doc #{rowid} saved: '{topic}'{_RESET}")
+            return True
+        except Exception as e:
+            print(f"{_RED}[Embedder] save_knowledge_doc error: {e}{_RESET}")
+            self._conn.rollback()
+            return False
+            
+    
+    def search_knowledge_docs(self, query_text: str, limit: int = 3) -> list[dict]:
+        """
+        Semantic search over the OKF knowledge_docs table.
+        Returns richer context than episodic_memories — full structured JSON docs.
+        Used by the RAG pipeline when user needs help.
+        """
+
+        try:
+            cursor = self._conn.cursor()
+
+            # Lazy guard
+            cursor.execute("SELECT COUNT(*) FROM knowledge_docs")
+            if cursor.fetchone()[0] == 0:
+                return []
+            
+            query_vec = self._model.encode(f"query: {query_text}", normalize_embeddings=True)
+            query_blob = self._serialize_vector(query_vec.tolist())
+
+            cursor.execute(
+                """
+                SELECT kd.topic, kd.doc_json, kd.capture_count, kd.last_updated
+                FROM vec_knowledge vk
+                INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
+                WHERE vk.embedding MATCH ? AND k = ?
+                ORDER BY distance ASC;
+                """,
+                (query_blob, limit)
+            )
+            rows = cursor.fetchall()
+            results = []
+            
+            for topic,doc_json_str,capture_count,last_updated in rows:
+                try:
+                    doc = json.loads(doc_json_str)
+                    results.append({
+                        "topic":         doc.get("topic", topic),
+                        "tags":          doc.get("tags", []),
+                        "content":       doc.get("content", ""),
+                        "capture_count": capture_count,
+                        "last_updated":  last_updated,
+                    })
+                except Exception:
+                    continue    # SKip malformed docs silently
+            print(f"{_GREEN}[Embedder] Knowledge search: {len(results)} docs found.{_RESET}")
+            return results
+        except Exception as e:
+            print(f"{_RED}[Embedder] search_knowledge_docs error: {e}{_RESET}")
+            return []
 
     def semantic_search(self, query_text: str, limit: int = 5) -> list[dict]:
         """

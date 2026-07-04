@@ -24,7 +24,7 @@ def _start_cooldown(seconds):
 
 # ── Core: spawn a new terminal window for the interaction ─────────────
 
-def _spawn_interaction_window(context_summary):
+def _spawn_interaction_window(context_summary, sources):
     """
     Writes context to a temp file, opens a new PowerShell window running
     jugnu_interact.py, waits for it to finish, reads the result.
@@ -79,21 +79,26 @@ def _spawn_interaction_window(context_summary):
 
 # ── Main Orchestrator ─────────────────────────────────────────────────
 
-def trigger_flow(state, engine, embedder=None):
+def trigger_flow(state, engine, embedder,
+                 search_query=None, context_chunks=None,
+                 sources=None, screen_context=None):
     global is_generating
 
     if is_generating or in_cooldown():
         return
 
     # Prepare context summary
+    if sources is None:
+        sources = []
+    if context_chunks is None:
+        context_chunks = []
+
     summary = state.get_context_summary()
 
-    # Spawn the new terminal window and wait for the user to respond
-    spawn_result = _spawn_interaction_window(summary)
+    spawn_result = _spawn_interaction_window(summary, sources)
     if isinstance(spawn_result, dict):
-        # Error path
-        result = spawn_result
-        proc = None
+        result    = spawn_result
+        proc      = None
         done_file = None
     else:
         result, proc, done_file = spawn_result
@@ -105,34 +110,62 @@ def trigger_flow(state, engine, embedder=None):
         print("\033[90m[Notification] User declined. 15-min cooldown.\033[0m", flush=True)
         return
 
-    # Stage 3: Query AI
+    # ── User clicked YES — NOW run Gemma (GPU inference happens here) ──
     custom_problem = result.get("custom_problem")
-    is_generating = True
-    print("\n\033[1;36m[Notification] Querying AI...\033[0m", flush=True)
+    is_generating  = True
+    print("\n\033[1;36m[Notification] Generating answer with Gemma...\033[0m", flush=True)
     try:
-        context = state.generate_prompt_context(custom_problem=custom_problem, embedder=embedder)
-        insight = engine.generate_insight(context)
-        print("\033[1;32m[Jugnu AI Buddy] Insight generated successfully.\033[0m\n", flush=True)
-
+        if custom_problem:
+            # User described their own problem — this needs a fresh Q&A RAG search, NOT a generic insight!
+            print("\033[90m[Notification] Fetching specific knowledge for custom problem...\033[0m", flush=True)
+            fresh_query = engine.generate_search_query(custom_problem)
+            fresh_results = embedder.search_knowledge_docs(fresh_query, limit=3)
+            
+            fresh_chunks = []
+            fresh_sources = []
+            
+            if fresh_results:
+                for doc in fresh_results:
+                    fresh_sources.append(doc['topic'])
+                    fresh_chunks.append(f"[Topic: {doc['topic']}]\n{doc['content']}")
+            else:
+                # Fallback to episodic memory
+                memories = embedder.semantic_search(fresh_query, limit=3)
+                if memories:
+                    fresh_chunks = [m["snippet"] for m in memories]
+                    fresh_sources = ["past session memory"]
+                    
+            # Use the strict Q&A prompt!
+            insight = engine.answer_with_context(custom_problem, fresh_chunks, fresh_sources)
+            # Update the sources variable so it gets written to the UI done_file
+            sources = fresh_sources
+        elif context_chunks:
+            # Use pre-fetched KNN results (fetched cheaply at idle time, now fed to Gemma)
+            insight = engine.answer_with_context(search_query or "", context_chunks, sources)
+        else:
+            # No memory at all — general insight from current screen state
+            ctx = screen_context or state.generate_prompt_context(embedder=embedder)
+            insight = engine.generate_insight(ctx)
+        print("\033[1;32m[Notification] Insight ready.\033[0m", flush=True)
     except Exception as e:
         insight = f"Sorry, I couldn't generate an insight right now.\nError: {e}"
-
     finally:
         is_generating = False
 
     _start_cooldown(_COOLDOWN_YES)
 
-    # Write the insight back to the .done file so the terminal window displays it
     if done_file:
         try:
             with open(done_file, "w", encoding="utf-8") as f:
-                json.dump({"insight": insight}, f)
+                json.dump({"insight": insight, "sources": sources}, f)
         except Exception:
             pass
 
     # Also print it here in the main terminal as a backup
     print("\n\033[1;32m══════════════════════════════════════════════════════\033[0m")
     print("\033[1;32m  💡  Jugnu's Insight\033[0m")
+    if sources:
+        print(f"\033[90m  📚 Sources: {', '.join(sources)}\033[0m")
     print("\033[1;32m══════════════════════════════════════════════════════\033[0m")
     for line in insight.split("\n"):
         print(f"  {line}")

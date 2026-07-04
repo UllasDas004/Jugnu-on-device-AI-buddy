@@ -13,7 +13,7 @@ namespace Jugnu
         if(isRunning) return;
         isRunning = true;
 
-        // Creater a background worker thread.
+        // Create a background worker thread.
         // If we ran the pipe listener on the main thread, it would block the Win32 Message Loop
         // and our app would completely freeze while waiting for Python to connect.
         CreateThread(NULL, 0, PipeListnerThread, NULL, 0, NULL);
@@ -40,7 +40,7 @@ namespace Jugnu
         // We append our delimiter so the Python client knows when the JSON payload ends!
         std::string payload = message + "\nEND_OF_MSG\n";
 
-        // WriteFile pushes the yted straight into the Windows Named Pipe buffer
+        // WriteFile pushes the bytes straight into the Windows Named Pipe buffer
         BOOL success = WriteFile(
             hPipe,
             payload.c_str(),

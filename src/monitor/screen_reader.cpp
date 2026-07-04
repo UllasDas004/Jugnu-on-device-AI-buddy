@@ -109,15 +109,26 @@ namespace Jugnu
     {
         std::cout << "\033[1;36m[ScreenReader]\033[0m WinRT OCR Engine started.\n";
 
+
+        bool hasOcredWhileIdle = false;
         while(isRunning)
         {
-            // Sleep carefully to allow quick exit (check isRunning frequently)
-            // Polling every 30 seconds (30 * 1000ms)
-            for(int i=0;i<30&&isRunning;i++) Sleep(1000);
+            // Poll faster (every 2 seconds) so we can catch the exact moment they go idle
+            for(int i=0;i<2&&isRunning;i++) Sleep(1000);
             if(!isRunning) break;
 
-            // Power Optimization: Skip capturing entirely if the user is not actively at the computer
-            if(WinMonitor::IsUserIdle()) continue;  
+            // Check if user has been idle for the threshold (e.g., 30s)
+            bool isIdle = WinMonitor::IsUserIdle();
+            if(!isIdle)
+            {
+                // User is actively moving mouse/typing. Reset flag, but DON'T OCR yet.
+                hasOcredWhileIdle = false;
+                continue;
+            }
+
+            if(isIdle && hasOcredWhileIdle) continue;
+
+            hasOcredWhileIdle = true;
             
             HWND hwnd = GetForegroundWindow();
             if(!hwnd) continue;

@@ -346,3 +346,31 @@
 ### EC-O5 — The "Unprintable OCR Pixel Garbage" Trap
 **Situation:** The OCR engine sometimes interprets weird UI textures or scrollbars as ASCII control characters (like `0x1B` ESC). Sending these over the IPC pipe to Python caused `json.loads()` to throw a `JSONDecodeError: Invalid control character`.
 **Solution:** The C++ IPC layer explicitly checks if `static_cast<unsigned char>(c) < 0x20` and manually converts those raw bytes into safely escaped Unicode sequences (`\u001b`) before sending them across the pipe.
+
+---
+
+## Category 8: Python Inference Pipeline Edge Cases (Phase 4 Updates)
+
+### EC-I1 — The "SQLITE_BUSY RAG Crash" Trap
+**Situation:** The C++ engine uses a massive `BEGIN TRANSACTION` block to flush RAM to disk instantly (100,000+ inserts per second). While this lock is held, if Python tries to run a background semantic search via `embedder.py`, SQLite throws a fatal `database is locked (SQLITE_BUSY)` error and crashes the entire Python daemon.
+**Solution:** Pass `timeout=5.0` to the Python `sqlite3.connect()` calls. Instead of crashing, Python now gracefully yields and waits up to 5 seconds for C++ to finish its bulk flush.
+
+### EC-I2 — The "Flash Attention PDL" Trap
+**Situation:** `ollama` supports Flash Attention, which is a brilliant VRAM optimization. However, on consumer-grade mobile cards (like RTX 4050), requesting Flash Attention frequently caused the NVIDIA driver to crash with a Page Fault (PDL) or `cuMemAlloc` error during the first inference run.
+**Solution:** Hardcoded `"flash_attn": False` in all `ollama.chat()` calls inside `ai_engine.py`. Stability > Marginal speed gains. We also implemented a dummy 1-token `_warmup()` call to silently absorb any residual cold-start crashes.
+
+### EC-I3 — The "Pydantic API Breakage" Trap
+**Situation:** The `ollama` pip package updated its architecture, migrating from returning standard Python dictionaries to returning Pydantic model objects. Existing `response.get("message")` calls suddenly threw `AttributeError` on users with updated environments.
+**Solution:** Defensive Duck Typing. We changed the parsing logic to `hasattr(response, 'message')`. This gracefully handles BOTH the legacy dictionary API and the new Pydantic API.
+
+### EC-I4 — The "Battery Drain During Deduplication" Trap
+**Situation:** The Python `FlushWorker` wakes up every 60 seconds, grabs the `ocr_buffer`, and feeds chunks to Gemma to extract knowledge. If the user is on battery power, doing GPU inference every 60 seconds will kill the laptop in under an hour.
+**Solution:** Used Python's `ctypes` to bind directly to the native Win32 `GetSystemPowerStatus` API. The `FlushWorker` checks if `ACLineStatus == 1` before doing any work. If on battery, it aborts the cycle immediately.
+
+### EC-I5 — The "Custom Problem Override" Trap
+**Situation:** User is stuck. Jugnu pops a UI notification loaded with vector context about the `server.py` file currently on their screen. The user clicks "Yes, I need help" but types: *"Actually, how do I configure Docker?"* Jugnu tries to answer the Docker question using the `server.py` context and hallucinates badly.
+**Solution:** Implemented the "Custom Problem RAG Override" in `notification.py`. If the user types a custom question, Jugnu throws away the pre-fetched screen context, dynamically generates a brand new search query, queries the vector database for Docker info, and answers correctly.
+
+### EC-I6 — The "Context Window Confusion" Trap
+**Situation:** Feeding 4,000 characters of raw OCR UI noise directly into a 4B parameter model overwhelms the attention mechanism. Gemma hallucinates or skips crucial code blocks.
+**Solution:** Implemented a context-aware `_chunk_text()` algorithm that strictly slices OCR text into 500-character windows, snapping to natural text boundaries (`\n\n` -> `\n` -> `. `). Gemma runs sequentially over these tiny, highly focused windows, extracting flawlessly.

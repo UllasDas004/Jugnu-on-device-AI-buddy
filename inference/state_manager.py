@@ -82,24 +82,33 @@ class StateManager:
 
         if embedder:
             query = custom_problem or self.active_code_content[:200] or self.current_app
-            memories = embedder.semantic_search(query, limit = 3)
-            if memories:
-                context += "\n Relevant past context (from long-term memory):\n"
-                for i, mem in enumerate(memories, 1):
-                    snippet = mem["snippet"]
-                    file_path = mem["file_path"]
-                    
-                    # If we stored a file path, re-read the current version for full context
-                    if file_path and os.path.exists(file_path):
-                        try:
-                            with open(file_path, "r", encoding="utf-8") as f:
-                                full = f.read(800) # cap at 800 chars per past file
-                            context += f"[Memory {i}] (from {os.path.basename(file_path)}):\n```\n{full}\n```\n"
-                        except Exception:
+            # Try rich structured knowledge_docs first (OKF store)
+            knowledge_results = embedder.search_knowledge_docs(query, limit = 3)
+            if knowledge_results:
+                context += "\n Relevant knowledge from past sessions:\n"
+                for i, doc in enumerate(knowledge_results, 1):
+                    context += (
+                        f"[Knowledge {i}: {doc['topic']} "
+                        f"(seen {doc['capture_count']}x)]\n"
+                        f"{doc['content'][:600]}\n\n"
+                    )
+            else:
+                # Fallback to raw episodic memories if no structured docs yet
+                memories = embedder.semantic_search(query, limit=3)
+                if memories:
+                    context += "\n Relevant past context (from long-term memory):\n"
+                    for i, mem in enumerate(memories, 1):
+                        snippet = mem["snippet"]
+                        file_path = mem["file_path"]
+                        if file_path and os.path.exists(file_path):
+                            try:
+                                with open(file_path, "r", encoding="utf-8") as f:
+                                    full = f.read(800)
+                                context += f"[Memory {i}] (from {os.path.basename(file_path)}):\n```\n{full}\n```\n"
+                            except Exception:
+                                context += f"[Memory {i}] {snippet}\n"
+                        else:
                             context += f"[Memory {i}] {snippet}\n"
-                    else:
-                        # Clipboard memory or deleted file — use the stored snippet directly
-                        context += f"[Memory {i}] {snippet}\n"
 
         if custom_problem:
             context += f"\nThe user described their specific problem as:\n\"{custom_problem}\"\n"

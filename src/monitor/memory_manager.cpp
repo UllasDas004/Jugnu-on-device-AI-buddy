@@ -33,6 +33,7 @@ namespace Jugnu
 
         lastApp = processName;
         UpdateLRU(processName);
+        UpdateEMA(processName);
         ThrottleDistractors(processName);
     }
 
@@ -196,7 +197,7 @@ namespace Jugnu
         // Define what constitutes a "Deep Work" app
         bool isDeepWork = (currentApp == "code.exe" || currentApp == "devenv.exe" || currentApp == "pwsh.exe");
 
-        // If we are deeo working, choke the ditractors. If we switch to a distractor, restore it!
+        // If we are deep working, choke the distractors. If we switch to a distractor, restore it!
         DWORD newPriority = isDeepWork ? IDLE_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS;
 
         // Take a snapshot of every process running on the OS right now
