@@ -7,6 +7,7 @@ namespace Jugnu
     HANDLE IPCServer::hPipe = INVALID_HANDLE_VALUE;
     bool IPCServer::isRunning = false;
     std::atomic<bool> IPCServer::isClientConnected{false};
+    std::mutex IPCServer::pipeMutex;
 
     void IPCServer::Start()
     {
@@ -33,6 +34,7 @@ namespace Jugnu
 
     bool IPCServer::SendMessageToPython(const std::string& message)
     {
+        std::lock_guard<std::mutex> lock(pipeMutex);
         if(hPipe == INVALID_HANDLE_VALUE || !isClientConnected) return false;
 
         DWORD bytesWritten;

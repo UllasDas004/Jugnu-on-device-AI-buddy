@@ -49,31 +49,33 @@ graph TD
 ---
 
 ## 🚀 What It Does Right Now (Phase 4 Completed)
-Jugnu has successfully completed **Phase 4: Objective Knowledge Format & Lazy RAG Evaluation**.
+Jugnu has successfully completed **Phase 4: Open Knowledge Format & Lazy RAG Evaluation**.
 - **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
-- **Native GPU OCR Engine**: Uses MSVC and C++/WinRT to silently capture `BitBlt` screenshots directly into RAM and extract text via `Windows.Media.Ocr` on the GPU.
+- **Native GPU OCR Engine**: Uses MSVC and C++/WinRT to silently capture `BitBlt` screenshots directly into RAM and extract text via `Windows.Media.Ocr` on the GPU. Executes inside an isolated COM apartment thread to prevent blocking initialization errors.
 - **Lazy RAG Evaluation**: To save massive amounts of battery, Jugnu no longer generates 500-token answers in the background when you go idle. It performs a hyper-fast (<100ms) vector search and completely defers GPU generation until you explicitly click "Yes" on the UI notification.
 - **Battery-Aware Deduplication**: The `FlushWorker` daemon enforces a 30-second screen settle time and uses `difflib.SequenceMatcher`. If your screen hasn't changed by at least 15%, inference is bypassed entirely.
 - **Async File Synthesis**: Saving massive 8,000+ line code files pushes synthesis tasks to detached `daemon=True` background threads, preventing C++ IPC buffer overflows.
 - **Custom Problem RAG Override**: If the UI pops up based on a Python file, but you type *"Actually, how do I configure Docker?"*, Jugnu instantly discards the old context, dynamically builds a new query, and re-runs semantic search to prevent hallucination.
-- **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a 1-token `_warmup()` routine and completely disables Flash Attention to bypass CUDA initialization crashes on RTX 4050 mobile GPUs.
+- **AI Engine (Ollama)**: Automatically connects to a local `gemma4:e2b` model. Employs a full-sized `num_ctx: 2048` `_warmup()` routine to safely absorb CUDA KV-Cache reallocation crashes on RTX 4050 mobile GPUs before real queries execute.
+- **Polyglot Developer Context**: Synchronizes active Window tracking across native IDEs (`code`, `clion`) and Web Browsers (`chrome`, `msedge`) to actively detect and aid in LeetCode/HackerRank workflows.
+- **Concurrent Architecture**: SQLite is configured in WAL (Write-Ahead Logging) mode, allowing the C++ daemon to flush thousands of telemetry rows instantly while Python inference concurrently reads vectors without `SQLITE_BUSY` contention.
 
 ---
 
-## 📚 The Objective Knowledge Format (OKF)
+## 📚 The Open Knowledge Format (OKF)
 
-Jugnu leverages a hyper-structured schema inspired by Google's [Objective Knowledge Format (OKF)](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing). Instead of dumping raw, noisy OCR pixels into a vector database, Jugnu executes a **Two-Pass Synthesis Pipeline**:
+Jugnu leverages a hyper-structured schema inspired by Google's [Open Knowledge Format (OKF)](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing). Instead of dumping raw, noisy OCR pixels into a vector database, Jugnu executes a **Two-Pass Synthesis Pipeline**:
 
 1. **Pass 1 (Extractor)**: Gemma strictly slices out UI scrollbars, ads, and boilerplate, returning only factual semantic bullet points.
-2. **Pass 2 (Synthesizer)**: Gemma structures the clean bullets into a pristine JSON document (`topic`, `content`). 
+2. **Pass 2 (Synthesizer)**: Gemma structures the clean bullets into a deterministic plain-text schema (`TOPIC:`, `TAGS:`, `CONTENT:`). This completely sidesteps LLM string-escaping bugs (like unescaped C++ newlines crashing `json.loads`) while maintaining perfect programmatic extractability.
 
-These synthesized JSON documents are then indexed by `sqlite-vec` into a dual-table `knowledge_docs` and `vec_knowledge` structure. This ensures that when Jugnu searches for context, it retrieves clean, objective knowledge rather than a chaotic jumble of text.
+These structured knowledge blocks are then indexed by `sqlite-vec` into a dual-table `knowledge_docs` and `vec_knowledge` structure. This ensures that when Jugnu searches for context, it retrieves clean, objective knowledge rather than a chaotic jumble of text.
 
 ---
 
 ## 📅 Development Roadmap (Future Plans)
 
-### Phase 4 — Objective Knowledge Format & Lazy RAG (Completed)
+### Phase 4 — Open Knowledge Format & Lazy RAG (Completed)
 - [x] Complete Two-Pass OKF synthesis for pristine vector embeddings.
 - [x] Implement Lazy RAG to defer massive GPU workloads until user confirmation.
 - [x] Implement Battery-aware background task deferral (Settle times + `difflib` caching).

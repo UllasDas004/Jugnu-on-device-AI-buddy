@@ -2,6 +2,8 @@
 #include<thread>
 #include<atomic>
 #include<unordered_map>
+#include<mutex>
+#include<condition_variable>
 
 namespace Jugnu
 {
@@ -29,5 +31,8 @@ namespace Jugnu
 
         // TRAP FIX: The Batter Drain Check
         static bool IsOnBattery();
+        
+        static std::mutex _cvMutex;
+        static std::condition_variable _cv;
     };
 }

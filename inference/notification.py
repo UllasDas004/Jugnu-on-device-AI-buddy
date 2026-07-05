@@ -1,4 +1,3 @@
-from embedder import Embedder
 import threading
 import time
 import json
@@ -6,21 +5,26 @@ import os
 import subprocess
 import sys
 import tempfile
+from embedder import Embedder
 
 # ── Global state ──────────────────────────────────────────────────────
 
-is_generating = False
-_last_trigger_time = 0.0
+# P0-FIX: Use a Lock instead of a bare bool.
+# Multiple USER_IDLE daemon threads can arrive simultaneously. Without a lock,
+# both threads see is_generating=False and launch two Gemma calls → VRAM crash.
+_gen_lock = threading.Lock()
+
 _COOLDOWN_YES = 20 * 60     # 20 min after successful insight
 _COOLDOWN_NO  = 15 * 60     # 15 min after dismissal
 
+_cooldown_until = 0.0
 def in_cooldown():
-    return (time.time() - _last_trigger_time) < _COOLDOWN_YES
-
-def _start_cooldown(seconds):
-    global _last_trigger_time, _COOLDOWN_YES
-    _last_trigger_time = time.time()
-    _COOLDOWN_YES = seconds
+    return time.time() < _cooldown_until
+    
+# P1-FIX: Never mutate the constants. Update only the timestamp.
+def _start_cooldown(seconds: float):
+    global _cooldown_until
+    _cooldown_until = time.time() + seconds
 
 # ── Core: spawn a new terminal window for the interaction ─────────────
 
@@ -42,8 +46,11 @@ def _spawn_interaction_window(context_summary, sources):
 
     # Clean up any leftover files from previous runs
     for f in [state_file, result_file, done_file]:
-        if os.path.exists(f):
-            os.remove(f)
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
 
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump({"summary": context_summary}, f)
@@ -64,7 +71,13 @@ def _spawn_interaction_window(context_summary, sources):
     while not os.path.exists(result_file):
         if time.time() - start > timeout:
             print("\033[90m[Notification] Timed out waiting for user.\033[0m", flush=True)
-            proc.kill()
+            
+            # P1-FIX: Graceful shutdown first, force-kill only as last resort.
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
             return {"action": "decline", "custom_problem": None}
         time.sleep(0.3)
 
@@ -82,9 +95,14 @@ def _spawn_interaction_window(context_summary, sources):
 def trigger_flow(state, engine, embedder,
                  search_query=None, context_chunks=None,
                  sources=None, screen_context=None):
-    global is_generating
+    # P0-FIX: non-blocking acquire — if another thread is already generating, bail out.
+    if not _gen_lock.acquire(blocking=False):
+        print("\033[90m[Notification] Already generating. Skipping duplicate trigger.\033[0m")
+        return
 
-    if is_generating or in_cooldown():
+    if in_cooldown():
+        _gen_lock.release()
+        print("\033[90m[Notification] On cooldown. Skipping trigger.\033[0m")
         return
 
     # Prepare context summary
@@ -106,13 +124,13 @@ def trigger_flow(state, engine, embedder,
     action = result.get("action", "decline")
 
     if action == "decline":
+        _gen_lock.release()
         _start_cooldown(_COOLDOWN_NO)
         print("\033[90m[Notification] User declined. 15-min cooldown.\033[0m", flush=True)
         return
 
     # ── User clicked YES — NOW run Gemma (GPU inference happens here) ──
     custom_problem = result.get("custom_problem")
-    is_generating  = True
     print("\n\033[1;36m[Notification] Generating answer with Gemma...\033[0m", flush=True)
     try:
         if custom_problem:
@@ -150,7 +168,7 @@ def trigger_flow(state, engine, embedder,
     except Exception as e:
         insight = f"Sorry, I couldn't generate an insight right now.\nError: {e}"
     finally:
-        is_generating = False
+        _gen_lock.release()
 
     _start_cooldown(_COOLDOWN_YES)
 

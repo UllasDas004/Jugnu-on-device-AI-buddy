@@ -20,6 +20,9 @@ namespace Jugnu
         isRunning = false;
         if(hThread)
         {
+            // WAKE the message loop up so it can exit
+            PostThreadMessage(GetThreadId(hThread), WM_QUIT, 0, 0); 
+            // Wait for thread to gracefully exit
             WaitForSingleObject(hThread, 1000);
             CloseHandle(hThread);
             hThread = NULL;

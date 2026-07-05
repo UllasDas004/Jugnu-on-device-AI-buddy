@@ -10,6 +10,7 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <iostream>
+#include <unordered_set>
 
 using namespace winrt::Windows::Media::Ocr;
 using namespace winrt::Windows::Graphics::Imaging;
@@ -19,11 +20,11 @@ namespace Jugnu
 {
     std::atomic<bool> ScreenReader::isRunning(false);
     HANDLE ScreenReader::hThread = NULL;
+    static winrt::Windows::Media::Ocr::OcrEngine g_ocrEngine = nullptr;
 
     void ScreenReader::Start()
     {
         if(isRunning) return;
-        winrt::init_apartment();    // Initialize WinRT
         isRunning = true;
         hThread = CreateThread(NULL, 0, ReaderThread, NULL, 0, NULL);
     }
@@ -41,9 +42,21 @@ namespace Jugnu
 
     bool ScreenReader::ShouldCapture(const std::string& processName)
     {
-        return (processName == "code.exe" || processName == "devenv.exe" || 
-                processName == "chrome.exe" || processName == "msedge.exe" || 
-                processName == "Acrobat.exe");
+        // P1-FIX: Use an unordered_set for O(1) lookup and easy extension.
+        // Previously a linear chain of == comparisons — silent failure for any
+        // IDE not in this exact list (Cursor, Zed, IntelliJ, etc.)
+        static const std::unordered_set<std::string> CAPTURE_APPS = {
+            "code.exe",    // VS Code
+            "devenv.exe",  // Visual Studio
+            "chrome.exe",  // Chrome
+            "msedge.exe",  // Edge
+            "Acrobat.exe", // PDF reader
+            "cursor.exe",  // Cursor IDE
+            "idea64.exe",  // IntelliJ IDEA
+            "clion64.exe", // CLion
+            "fleet.exe",   // Fleet
+        };
+        return CAPTURE_APPS.count(processName) > 0;
     }
 
     std::wstring ScreenReader::CaptureAndOCR(HWND targetWindow)
@@ -87,13 +100,12 @@ namespace Jugnu
         auto bitmap = SoftwareBitmap::CreateCopyFromBuffer(buffer, BitmapPixelFormat::Bgra8, w, h);
 
         // 6. Initialize the Native Windows 10/11 OCR Engine
-        auto engine = OcrEngine::TryCreateFromLanguage(Language(L"en-US"));
         std::wstring resultText = L"";
 
-        if(engine)
+        if(g_ocrEngine)
         {
             // 7. Execute hardware-accelerated OCR asynchronously, but block with .get()
-            auto result = engine.RecognizeAsync(bitmap).get();
+            auto result = g_ocrEngine.RecognizeAsync(bitmap).get();
             if(result) resultText = std::wstring(result.Text());
         }
 
@@ -107,6 +119,8 @@ namespace Jugnu
 
     DWORD WINAPI ScreenReader::ReaderThread(LPVOID lpParam)
     {
+        winrt::init_apartment(); // Initialize WinRT COM apartment for THIS worker thread
+        g_ocrEngine = OcrEngine::TryCreateFromLanguage(Language(L"en-US"));
         std::cout << "\033[1;36m[ScreenReader]\033[0m WinRT OCR Engine started.\n";
 
 

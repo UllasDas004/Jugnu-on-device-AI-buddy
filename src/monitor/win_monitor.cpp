@@ -220,7 +220,9 @@ namespace Jugnu
 
         while(isRunning)
         {
-            Sleep(1000); // Check every second
+            // P2-FIX: 10-second granularity is fine for idle detection.
+            // Reduces wakeups from 86,400/day to 8,640/day.
+            Sleep(10000); // Check every 10 second
 
             LASTINPUTINFO lii;
             lii.cbSize = sizeof(LASTINPUTINFO);

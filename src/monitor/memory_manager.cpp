@@ -78,7 +78,7 @@ namespace Jugnu
         std::sort(sortedApps.begin(), sortedApps.end(),
             [](const std::pair<std::string, int>& a,const std::pair<std::string, int>& b)
             {
-                return a.second < b.second; // Descending
+                return a.second > b.second; // Descending
             }
         );
 
@@ -154,12 +154,28 @@ namespace Jugnu
         }
     }
 
+    // P2-FIX: Prevent JSON injection from window titles containing " or \.
+    // Example: window titled Say "Hello" would produce: "current_app": "Say "Hello""
+    // which is invalid JSON that crashes Python's json.loads().
+    static std::string JsonEscape(const std::string& s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if      (c == '"')  out += "\\\"";
+            else if (c == '\\') out += "\\\\";
+            else if (c == '\n') out += "\\n";
+            else if (c == '\r') out += "\\r";
+            else                out += c;
+        }
+        return out;
+    }
     std::string MemoryManager::GenerateContextJSON(const std::string& currentApp)
     {
         // We do not lock the mutex here because this is called immediately after ProcessAppSwitch
         std::string json = "{\n";
         json += "  \"type\": \"SWITCH\",\n";
-        json += "  \"current_app\": \"" + currentApp + "\",\n";
+        json += "  \"current_app\": \"" + JsonEscape(currentApp) + "\",\n";
         
         json += "  \"predicted_next\": [";
         if(markovChain.find(currentApp) != markovChain.end())
@@ -169,7 +185,7 @@ namespace Jugnu
 
             for(size_t i=0;i<sortedApps.size() && i<3;i++)
             {
-                json += "\"" + sortedApps[i].first + "\"";
+                json += "\"" + JsonEscape(sortedApps[i].first) + "\"";
                 if(i < sortedApps.size()-1 && i<2) json += ", ";
             }
 
@@ -182,7 +198,7 @@ namespace Jugnu
         bool first = true;
         for (const auto& [app, score] : emaScores) {
             if (!first) json += ", ";
-            json += "\"" + app + "\": " + std::to_string(score);
+            json += "\"" + JsonEscape(app) + "\": " + std::to_string(score);
             first = false;
         }
         json += "}\n";
@@ -194,6 +210,13 @@ namespace Jugnu
 
     void MemoryManager::ThrottleDistractors(const std::string& currentApp)
     {
+        // P1-FIX: Only snapshot the process list when the app actually changes.
+        // CreateToolhelp32Snapshot() scans 150+ processes every call — 5-20ms.
+        // Previously this ran on EVERY foreground event, causing the >1ms warnings.
+        static std::string lastThrottledFor = "";
+        if(currentApp == lastThrottledFor) return;
+        lastThrottledFor = currentApp;
+
         // Define what constitutes a "Deep Work" app
         bool isDeepWork = (currentApp == "code.exe" || currentApp == "devenv.exe" || currentApp == "pwsh.exe");
 

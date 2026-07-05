@@ -552,3 +552,253 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 **Fix:** Added a two-stage defensive check in `flush_worker.py`:
 1. **Time Settle Check**: If the latest screenshot timestamp is less than 30 seconds old, abort (wait for the screen to settle).
 2. **Difflib Dedup**: Used `difflib.SequenceMatcher(None, current_text, previous_text).ratio()`. If the screen hasn't changed by at least 15%, bypass Gemma inference entirely.
+
+
+### Trap K-1: The SQLite Exclusive Lock Freeze
+**Problem:** The C++ FlushWorker dumped massive amounts of OCR data into SQLite. Because SQLite defaults to Rollback Journals, this locked the entire DB. The Python inference pipeline, trying to query context concurrently, threw SQLITE_BUSY crashes.
+**Fix:** Executed PRAGMA journal_mode=WAL; and PRAGMA synchronous=NORMAL; upon initialization in db_handler.cpp to permit concurrent multi-threaded read/writes.
+
+### Trap K-2: The TOCTOU Notification Race Condition
+**Problem:** is_generating was a simple module-level boolean. If two OS idle events fired fractions of a second apart, both daemon threads read is_generating == False, entered the generation block, and spawned two simultaneous Gemma LLM calls, immediately crashing the GPU with an OOM error.
+**Fix:** Replaced the boolean with a standard 	hreading.Lock(), utilizing _gen_lock.acquire(blocking=False) to guarantee atomic check-and-set semantics.
+
+### Trap K-3: The Reverse Markov Prediction Sort
+**Problem:** The core prediction logic GetPredictedNextApps used a.second < b.second, which sorted probabilities *ascending*. The AI prefetcher was explicitly pre-warming RAM with the apps the user was *least* likely to open!
+**Fix:** Changed the comparator to > for descending sort to properly pre-fetch the most highly-weighted Markov edges.
+
+### Trap K-4: The Win32 hPipe Data Race
+**Problem:** The IPC listener thread reset hPipe = INVALID_HANDLE_VALUE upon client disconnect, while the main event thread read hPipe to stream JSON via WriteFile. With no mutex, the handle could be invalidated *during* a write, causing Undefined Behavior and silent memory corruption.
+**Fix:** Introduced std::mutex pipeMutex and wrapped all read/write/reset operations of the handle in a std::lock_guard.
+
+### Trap K-5: The Python Subprocess Antivirus Lock
+**Problem:** When proc.kill() forcefully terminated the interactive PowerShell window, temp files (jugnu_state.json) were left on disk. Windows Defender immediately swooped in to scan the modified files, obtaining a kernel lock. Python's cleanup routine os.remove() threw a PermissionError because of the AV lock, crashing the entire notification loop.
+**Fix:** Added a graceful proc.terminate() with timeout before kill(), and wrapped os.remove() in a 	ry...except OSError block to fail gracefully if the OS held a lock.
+
+### Trap K-6: Unbounded Cache Dictionary Leaks
+**Problem:** Dictionaries like _last_raw_by_app and _last_embedded grew infinitely as the user switched between hundreds of transient processes over weeks, causing a slow but steady RAM leak.
+**Fix:** Implemented a max-size eviction strategy utilizing Python 3.7+ insertion-ordered dicts (self.cache.pop(next(iter(self.cache)))).
+
+### Trap K-7: The Cooldown Math Math-Bug
+**Problem:** Cooldown logic computed deadlines using 	ime.time() - (_COOLDOWN_YES - seconds). When the "Decline" timeout (900s) occurred after an "Accept" timeout (1200s), the math resulted in negative offsets, causing Jugnu to endlessly skip notifications.
+**Fix:** Simplified the state machine to track an explicit absolute timestamp (_cooldown_until = time.time() + seconds).
+
+### Trap K-8: The Thread Shutdown Hang (Ghost Threads)
+**Problem:** `FileWatcher` and `ClipboardManager` threads were hanging on exit because they were blocked on synchronous OS calls (`ReadDirectoryChangesW` and `GetMessage`), preventing them from seeing the `isRunning = false` flag.
+**Fix:** Explicitly wake the blocked threads using `CancelIoEx` and `PostThreadMessage(WM_QUIT)` during the shutdown sequence before waiting on the thread handles.
+
+### Trap K-9: The Machine Learning Model Re-Initialization Grind
+**Problem:** `OcrEngine::TryCreateFromLanguage` was being called inside the 2-second polling loop, forcing Windows to reload the heavy ML model from SSD into RAM on every frame, causing CPU spikes.
+**Fix:** Shifted the initialization to a static global variable initialized exactly once in `Start()`, keeping the model hot in RAM.
+```cpp
+// In file_watcher.cpp, after building absolutePath:
+std::string escapePath = absolutePath;  // e.g. D:\coding\jugnu\inference\ai_engine.py
+size_t pos = 0;
+while((pos = escapePath.find("\\", pos)) != std::string::npos)
+{
+    escapePath.replace(pos, 1, "\\\\");  // Replace single \ with \\\\
+    pos += 2;  // CRITICAL: jump PAST the two chars just inserted, or we loop forever
+}
+std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + escapePath + "\"}";
+```
+The `pos += 2` increment is the most dangerous line. If you write `pos += 1` instead, the loop finds the `\\` it just inserted, replaces it again with `\\\\`, and enters an infinite loop that consumes all RAM.
+
+---
+
+### Trap H-2: `ReadDirectoryChangesW` Returns Relative, Not Absolute Paths
+**Symptom:** Python receives `{"file": "inference\\ai_engine.py"}` instead of the full path. `open(payload["file"])` raises `FileNotFoundError` because Python's CWD is different.
+
+**Root Cause:** `ReadDirectoryChangesW` is designed as a *watcher*, not a path resolver. The `FILE_NOTIFY_INFORMATION.FileName` field only contains the path **relative** to the directory handle `hDir`. It never knows what absolute path was originally passed to `CreateFileA`.
+
+**Fix:** Manually prepend `watchPath` before serializing:
+```cpp
+// FileName from the struct: "inference\ai_engine.py" (relative)
+// watchPath stored on Start():  "D:\coding\Placements\projects\jugnu"
+std::string absolutePath = watchPath + "\\" + filename;  // Absolute
+// Then escape and serialize...
+```
+This is why `watchPath` is stored as a class-level static variable — so the background `WatcherThread` can access it when building the payload.
+
+---
+
+### Trap H-3: PyWebView COM Thread Violation + pythonnet Recursion Crash
+**Symptom:** On every notification trigger, the terminal floods with `SyncRoot.SyncRoot.SyncRoot: maximum recursion depth exceeded` and the Python service crashes or hangs permanently.
+
+**Root Cause:** Two cascading bugs:
+1. **COM Threading:** Closing a window (`win.destroy()`) from a background thread violates Windows Single-Threaded Apartment (STA) rules. PyWebView catches this `InvalidCastException` internally and passes it to the Python `logging` module.
+2. **pythonnet Recursion (The Fatal Part):** When `logging` tries to stringify the COM exception, the `.NET` exception wrapper (`pythonnet`) inspects the object properties. It hits the `SyncRoot` property, which points to itself. Python recursively inspects `SyncRoot` until it hits the recursion limit and crashes the whole thread.
+
+**The Fix:** We cannot easily avoid cross-thread calls without a massive UI architectural rewrite. Since PyWebView safely re-dispatches the `destroy()` to the main thread internally *after* logging the error, we just need to prevent the `logging` module from ever seeing the exception:
+```python
+# Mute PyWebView so it stops feeding .NET objects to pythonnet's buggy logger
+import logging
+logging.getLogger('pywebview').setLevel(logging.CRITICAL)
+```
+**Source:** Phase 1.5 Live-Fire, pythonnet issue #1126.
+
+---
+
+### Trap H-4: `NoneType` Squiggle on `win.destroy()` — Python Type Narrowing
+**Symptom:** Pylance (the VS Code Python type checker) draws red squiggles under `win.destroy()` and `win.events.closed` saying `Object of type NoneType has no attribute destroy`. The code runs fine, but the IDE constantly shows errors.
+
+**Root Cause:** The type signature of `webview.create_window()` is `Window | None`. The function returns `None` if window creation fails (e.g. WebView2 not installed on the system). Pylance correctly interprets this: before checking for `None`, calling `.destroy()` on a potential `None` object is a type error.
+
+**The Wrong Fix:** Adding a `type: ignore` comment. This hides the problem instead of solving it.
+
+**The Correct Fix (Object-Oriented Injection Pattern):**
+Instead of relying on a Python closure to capture `win` (which Pylance rightly flags), we inject the window reference into the API object **after** creation:
+```python
+class Api:
+    def __init__(self):
+        self.window: webview.Window | None = None  # Type-safe: explicitly allows None
+    def yes(self):
+        if self.window:          # Type guard: Pylance now knows self.window is Window
+            self.window.destroy()
+
+api = Api()
+win = webview.create_window("Jugnu", html=NUDGE_HTML, js_api=api, ...)
+if win:                   # Narrows type from 'Window | None' to 'Window'
+    api.window = win      # Inject the confirmed-non-None Window into our Api
+    win.events.closed += lambda: done.set()
+```
+This pattern is called **Dependency Injection**. The Api object doesn't know or care where its window comes from — we set it from outside. Pylance is now fully satisfied because the `if win:` guard narrows the type from `Window | None` to just `Window` before assignment.
+
+---
+
+### Trap H-5: Ollama CUDA Stack Overrun (0xc0000409) on Warmup
+**Symptom:** Ollama server completely crashes with `exit status 0xc0000409: The system detected an overrun of a stack-based buffer` when evaluating the first prompt on `gemma4:e2b`.
+**Root Cause:** A known driver/CUDA mismatch issue specifically on mobile GPUs (like RTX 4050 Laptop) when `ggml_cuda_kernel_can_use_pdl` attempts to initialize the `cuda_v13` backend.
+**Fix 1:** Force CPU fallback via `$env:OLLAMA_LLM_LIBRARY="cpu"` and restart `ollama serve`.
+**Fix 2 (The Cold-Start Absorber):** Even on CPU, the first prompt can sometimes trigger a one-off initialization crash. In `ai_engine.py`, we emit a silent `_warmup()` query inside a try/except block at boot. This intentionally triggers and catches the crash gracefully, leaving the server warm and stable for real user queries.
+
+---
+
+### Trap H-6: Reasoning Models (gemma4:e2b) Returning Empty Strings
+**Symptom:** The AI returns a successful 200 OK, but the Jugnu Insight window displays a completely blank message.
+**Root Cause:** `gemma4:e2b` is a chain-of-thought reasoning model. It places its internal monologue inside a `<thought>` block. The Ollama Python library parses this into a separate `thinking` field, leaving the `content` field empty until the thought finishes. If `num_predict` is too low (e.g., 200 tokens), the model hits the limit while still thinking (`done_reason='length'`), resulting in a permanently empty `content` field.
+**Fix:** 
+1. Increase `num_predict` to 512 to give the model room to finish thinking.
+2. In `ai_engine.py`, extract both fields. If `content` is empty, fallback to returning `[Thinking]...\n` + the `thinking` string, ensuring the UI never renders a blank box.
+
+---
+
+### Trap H-7: Python `KeyboardInterrupt` Swallowed by Win32 Pipe Exception
+**Symptom:** When pressing `Ctrl+C` to gracefully shut down the Python `ipc_client.py` listener, the terminal dumps a massive traceback ending in `Normalization failed: type=error args=(109, 'ReadFile', 'The pipe has been ended.')`.
+**Root Cause:** When the user hits `Ctrl+C`, the `KeyboardInterrupt` is thrown *while* Python is blocked inside the native C extension `win32file.ReadFile()`. The interrupt forces the C extension to abort the pipe read violently, returning the Win32 `109 ERROR_BROKEN_PIPE` code. This bubbles up concurrently with the `KeyboardInterrupt`, causing `pythonnet` and the traceback printer to collide.
+**Fix:** Add an explicit `except KeyboardInterrupt:` block *below* the `pywintypes.error` block. This catches the abort signal, explicitly calls `win32file.CloseHandle(handle)` to release the kernel lock, and calls `sys.exit(0)` to shut down cleanly without traceback vomit.
+
+---
+
+### Trap H-8: The Ollama Pydantic vs Dict Breaking Change
+**Symptom:** `response.get('message', {})` crashes with an `AttributeError: 'ChatResponse' object has no attribute 'get'`.
+**Root Cause:** The newer `ollama` Python library migrated its return types from raw dictionaries (`dict`) to Pydantic objects (`ChatResponse`). Accessing fields via `.get()` fails.
+**Fix:** Use an object-aware fallback block (`if hasattr(response, 'message')`) to safely extract `content` and `thinking` via standard attribute access, while keeping the `.get()` block as a fallback for older versions of the library. Also ensure `getattr()` is paired with `or ''` to handle `None` values gracefully.
+
+---
+
+### Trap H-9: The Stale Memory API Signature Crash
+**Symptom:** The background `embedder.save_memory` thread silently crashes or saves corrupt paths when trying to embed clipboard data.
+**Root Cause:** A refactor to the `save_memory` signature changed it to accept explicit positional arguments plus a `file_path` kwarg. Code calling the old `state.active_code_file` API format passed mismatched arguments, resulting in `None` being treated as a file path during semantic RAG vectoring.
+**Fix:** Explicitly pass `kwargs={'file_path': None}` for clipboard/app telemetry, and `kwargs={'file_path': filepath}` for actual files in the IPC listener. In `state_manager.py`, if reading the physical `file_path` fails (e.g., deleted file or `None` clipboard path), safely fall back to using the raw `snippet` stored in the vector database directly, ensuring no crash occurs.
+
+---
+
+## Group I: Phase 3 OCR Dataflow Traps
+
+### Trap I-1: The "Incomplete SQL Input" Trap
+**Problem:** Defining a multi-line SQL query (like `CREATE TABLE ocr_buffer(...)`) in C++ using a raw string literal `R"()"` but missing the closing `);` inside the string. The C++ compiler ignores string contents, so it compiles perfectly, but SQLite crashes at runtime with `[DB] SQL error: incomplete input`.
+**Fix:** Always test multi-line SQL queries in a native SQLite REPL before pasting them into C++ raw string literals.
+
+### Trap I-2: The Offline Embedder IPC Tear-Down
+**Problem:** The `SentenceTransformer` defaults to checking HuggingFace (`huggingface.co`) for updated config files on boot. If the user is offline (e.g. on a flight), the Python script crashes entirely with `[Errno 11001] getaddrinfo failed`. Because the Python process dies, the Named Pipe closes, and the C++ engine deadlocks trying to write to a broken pipe.
+**Fix:** Implemented a custom `_is_online()` check using Python's `socket` library to ping port 80. If it fails, explicitly pass `local_files_only=True` to the `SentenceTransformer` constructor to bypass network calls and load from the `.cache`.
+
+### Trap I-3: The Database Loop Closure Indentation
+**Problem:** In `flush_worker.py`, the `conn.close()` statement was indented one tab too deep, placing it inside the `for chunk in chunks:` loop. The worker processed the first chunk successfully, closed the DB connection, and instantly crashed on the second chunk with `Cannot operate on a closed database`.
+**Fix:** Strictly audit Python indentation when managing DB connections across batch loops.
+
+### Trap I-4: The Stale C++ Engine Schema Mismatch
+**Problem:** We updated `db_handler.cpp` to create the new `ocr_buffer` table, but forgot to recompile `jugnu.exe`. The Python script booted up and connected to the *old* running C++ executable, instantly crashing with `sqlite3.OperationalError: no such table: ocr_buffer`.
+**Fix:** Maintain strict build discipline. Stop the C++ background daemon, run `ninja`, and restart `jugnu.exe` before testing Python scripts that rely on new C++ SQLite schemas.
+
+### Trap I-5: Unprintable OCR Pixel Garbage
+**Problem:** The WinRT OCR engine occasionally misinterprets graphical UI elements (like scrollbars) as ASCII control characters (like `0x1B` ESC). Passing these over the IPC pipe caused Python's `json.loads()` to throw a `JSONDecodeError: Invalid control character`.
+**Fix:** The C++ IPC layer explicitly checks if `static_cast<unsigned char>(c) < 0x20` and converts raw bytes into safely escaped Unicode sequences (e.g., `\u001b`) before sending them.
+
+---
+
+## Group J: Phase 4 RAG & Battery Optimizations
+
+### Trap J-1: The Blocking IPC Thread Trap
+**Problem:** When a developer saves an 8,000-character code file, it takes several seconds for Gemma to synthesize it into an OKF document. Originally, this ran synchronously on the main IPC listener thread, causing Python to stop reading from the Named Pipe. The 4KB kernel buffer overflowed, dropping critical telemetry events from C++.
+**Fix:** Refactored `ipc_client.py` to use `threading.Thread(target=_synthesize_and_save_file, daemon=True).start()`. This pushes heavy file synthesis into the background, allowing the IPC loop to return to `win32file.ReadFile` instantly.
+
+### Trap J-2: The Idle-Time Battery Destroyer (Lazy Evaluation)
+**Problem:** When the C++ engine detected the user was idle, Python would immediately run a massive RAG generation task (using 100% GPU for 5-10 seconds) to build an answer *before* popping up the notification window. If the user was just stretching their legs and didn't actually need help, those GPU cycles were entirely wasted, drastically hurting battery life.
+**Fix:** Implemented Lazy RAG Evaluation. `ipc_client.py` now only generates a tiny 10-token `search_query` (<100ms) and performs the KNN vector search when idle. The heavy 500-token AI answer generation is completely deferred until the user explicitly clicks "Yes, I need help" on the notification UI.
+
+### Trap J-3: The Disjointed UI Context Trap
+**Problem:** Jugnu popped a notification based on a Python file currently open on the screen. The user clicked "Yes" but typed a manual question: *"Actually, how do I configure Docker?"* The LLM tried to answer the Docker question using the Python file as context, resulting in massive hallucinations.
+**Fix:** Implemented the "Custom Problem RAG Override" in `notification.py`. If a custom problem is detected, it intercepts the workflow, discards the pre-fetched screen context, generates a fresh query for "Docker", runs a new semantic search, and answers using the new, highly relevant sources.
+
+### Trap J-4: The OCR Settle-Time Battery Drain
+**Problem:** The background `FlushWorker` woke up every 60 seconds to process the OCR screen dumps. If the user was staring at a static documentation page for 10 minutes, Jugnu re-ran the Gemma OKF Extraction on the *exact same pixels* 10 times, draining the laptop battery.
+**Fix:** Added a two-stage defensive check in `flush_worker.py`:
+1. **Time Settle Check**: If the latest screenshot timestamp is less than 30 seconds old, abort (wait for the screen to settle).
+2. **Difflib Dedup**: Used `difflib.SequenceMatcher(None, current_text, previous_text).ratio()`. If the screen hasn't changed by at least 15%, bypass Gemma inference entirely.
+
+
+### Trap K-1: The SQLite Exclusive Lock Freeze
+**Problem:** The C++ FlushWorker dumped massive amounts of OCR data into SQLite. Because SQLite defaults to Rollback Journals, this locked the entire DB. The Python inference pipeline, trying to query context concurrently, threw SQLITE_BUSY crashes.
+**Fix:** Executed PRAGMA journal_mode=WAL; and PRAGMA synchronous=NORMAL; upon initialization in db_handler.cpp to permit concurrent multi-threaded read/writes.
+
+### Trap K-2: The TOCTOU Notification Race Condition
+**Problem:** is_generating was a simple module-level boolean. If two OS idle events fired fractions of a second apart, both daemon threads read is_generating == False, entered the generation block, and spawned two simultaneous Gemma LLM calls, immediately crashing the GPU with an OOM error.
+**Fix:** Replaced the boolean with a standard 	hreading.Lock(), utilizing _gen_lock.acquire(blocking=False) to guarantee atomic check-and-set semantics.
+
+### Trap K-3: The Reverse Markov Prediction Sort
+**Problem:** The core prediction logic GetPredictedNextApps used a.second < b.second, which sorted probabilities *ascending*. The AI prefetcher was explicitly pre-warming RAM with the apps the user was *least* likely to open!
+**Fix:** Changed the comparator to > for descending sort to properly pre-fetch the most highly-weighted Markov edges.
+
+### Trap K-4: The Win32 hPipe Data Race
+**Problem:** The IPC listener thread reset hPipe = INVALID_HANDLE_VALUE upon client disconnect, while the main event thread read hPipe to stream JSON via WriteFile. With no mutex, the handle could be invalidated *during* a write, causing Undefined Behavior and silent memory corruption.
+**Fix:** Introduced std::mutex pipeMutex and wrapped all read/write/reset operations of the handle in a std::lock_guard.
+
+### Trap K-5: The Python Subprocess Antivirus Lock
+**Problem:** When proc.kill() forcefully terminated the interactive PowerShell window, temp files (jugnu_state.json) were left on disk. Windows Defender immediately swooped in to scan the modified files, obtaining a kernel lock. Python's cleanup routine os.remove() threw a PermissionError because of the AV lock, crashing the entire notification loop.
+**Fix:** Added a graceful proc.terminate() with timeout before kill(), and wrapped os.remove() in a 	ry...except OSError block to fail gracefully if the OS held a lock.
+
+### Trap K-6: Unbounded Cache Dictionary Leaks
+**Problem:** Dictionaries like _last_raw_by_app and _last_embedded grew infinitely as the user switched between hundreds of transient processes over weeks, causing a slow but steady RAM leak.
+**Fix:** Implemented a max-size eviction strategy utilizing Python 3.7+ insertion-ordered dicts (self.cache.pop(next(iter(self.cache)))).
+
+### Trap K-7: The Cooldown Math Math-Bug
+**Problem:** Cooldown logic computed deadlines using 	ime.time() - (_COOLDOWN_YES - seconds). When the "Decline" timeout (900s) occurred after an "Accept" timeout (1200s), the math resulted in negative offsets, causing Jugnu to endlessly skip notifications.
+**Fix:** Simplified the state machine to track an explicit absolute timestamp (_cooldown_until = time.time() + seconds).
+
+### Trap K-8: The Thread Shutdown Hang (Ghost Threads)
+**Problem:** `FileWatcher` and `ClipboardManager` threads were hanging on exit because they were blocked on synchronous OS calls (`ReadDirectoryChangesW` and `GetMessage`), preventing them from seeing the `isRunning = false` flag.
+**Fix:** Explicitly wake the blocked threads using `CancelIoEx` and `PostThreadMessage(WM_QUIT)` during the shutdown sequence before waiting on the thread handles.
+
+### Trap K-9: The Machine Learning Model Re-Initialization Grind
+**Problem:** `OcrEngine::TryCreateFromLanguage` was being called inside the 2-second polling loop, forcing Windows to reload the heavy ML model from SSD into RAM on every frame, causing CPU spikes.
+**Fix:** Shifted the initialization to a static global variable initialized exactly once in `Start()`, keeping the model hot in RAM.
+
+### Trap K-10: JSON Quotes Injection
+**Problem:** The string escape loop only escaped backslashes, ignoring double quotes. A file named `hack"ed.txt` injected a raw quote into the JSON payload, crashing the Python JSON parser.
+**Fix:** Reused the robust `EscapeJSON` switch-statement implementation to handle all RFC-compliant JSON character escapes.
+
+### Trap K-11: The 49-Day Uptime Crash (Integer Overflow)
+**Problem:** `GetTickCount()` returns a 32-bit unsigned integer that wraps to 0 after 49.7 days. If the PC wasn't restarted, the idle time calculation would underflow, producing a massive false idle time.
+**Fix:** Upgraded the API call to `GetTickCount64()`, which handles uptimes of millions of years without overflowing.
+
+### Trap K-12: WinRT COM Threading Silently Crashing OCR
+**Problem:** To prevent CPU spikes, the WinRT `OcrEngine` initialization was moved to `Start()` (main thread), while OCR execution happened in a spawned `ReaderThread`. Because WinRT objects are strictly tied to COM Thread Apartments, calling `.RecognizeAsync()` from the uninitialized worker thread threw `CO_E_NOTINITIALIZED`, silently crashing the thread instantly.
+**Fix:** Explicitly called `winrt::init_apartment()` inside the `ReaderThread` immediately before instantiating the `OcrEngine` to ensure the background thread has its own active COM apartment.
+
+### Trap K-13: The CUDA KV Cache Warmup Size Mismatch
+**Problem:** The `_warmup()` call in `ai_engine.py` was explicitly designed to absorb the RTX 4050 Ollama CUDA crash (0xc0000409). However, it passed `num_ctx: 512`, whereas real RAG queries passed `num_ctx: 2048`. The mismatched size forced Ollama to reallocate the KV Cache on the GPU during the first real query, causing the server to crash in production instead of during warmup.
+**Fix:** Matched the warmup call to `num_ctx: 2048` to guarantee the KV Cache is maximally allocated during the dummy query, safely absorbing the PDL crash.
+
+### Trap K-14: The Multiline LLM JSON Parsing Crash
+**Problem:** We instructed Gemma to output extracted technical knowledge strictly as a JSON object. However, when Gemma extracted complex LeetCode C++ snippets containing newlines and quotes, it failed to properly escape them (e.g., actual `\n` instead of `\\n`). Python's `json.loads()` immediately crashed with `JSONDecodeError: Unterminated string`.
+**Fix:** Abandoned JSON-formatted LLM output entirely. Refactored the extraction prompt to use a strict raw-text schema (`TOPIC:`, `TAGS:`, `CONTENT:`). A robust Python loop now parses the headers and safely wraps the payload into a dictionary in-code, completely immune to LLM string-escaping failures.

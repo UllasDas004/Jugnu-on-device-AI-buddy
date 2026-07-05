@@ -24,7 +24,7 @@ int main()
     // Initialize the Database first
     if(!Jugnu::DBHandler::Init())
     {
-        std::cerr<<"Failed to initialize database. Existing.\n";
+        std::cerr<<"Failed to initialize database. Exiting.\n";
         return 1;
     }
     // Initialize the windows monitor. This installs the Win32 hook

@@ -37,6 +37,13 @@ namespace Jugnu
             return false;
         }
 
+        // P0-FIX: Enable WAL mode for concurrent C++/Python access.
+        // Without this, every C++ write locks the entire file, causing Python
+        // SQLITE_BUSY even with timeout=5.0 during long flushes.
+        // NORMAL synchronous is safe with WAL and ~3x faster than FULL.
+        ExecuteSQL("PRAGMA journal_mode=WAL;");
+        ExecuteSQL("PRAGMA synchronous=NORMAL;");
+
         // Create the App Usage Log Table
         std::string create_app_log_sql = R"(
             CREATE TABLE IF NOT EXISTS app_log (

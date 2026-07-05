@@ -17,7 +17,8 @@ class AIEngine:
             ollama.chat(
                 model=self.model_name,
                 messages=[{"role": "user", "content": "hi"}],
-                options={"num_predict": 1, "num_ctx": 512, "flash_attn": False}
+                # Use exactly the same num_ctx as real calls to trigger the KV cache allocation
+                options={"num_predict": 1, "num_ctx": 2048, "flash_attn": False}
             )
             print("\033[1;32m[AIEngine] Model warm and ready!\033[0m")
         except Exception:
@@ -155,11 +156,17 @@ class AIEngine:
         except Exception:
             return screen_context[:100]
     
-    def answer_with_context(self, user_query: str, context_chunks: list[str], sources: list[str] = []) ->str:
+    def answer_with_context(self, user_query: str, context_chunks: list[str], sources: list[str] | None = None) ->str:
         """
         RAG answer function. Feeds the user query + past memories into Gemma
         and returns a context-aware answer.
         """
+
+        # P2-FIX: Never use mutable default argument. The same [] would be shared
+        # across all calls if a caller appended to it — a classic Python footgun.
+        if sources is None:
+            sources = []
+
         context_block = "\n\n---\n\n".join(context_chunks)
         # Hard cap context to avoid KV overrun
         context_block = context_block[:1500]
@@ -211,13 +218,12 @@ class AIEngine:
         {combined_raw}
         Synthesize them into ONE rich, coherent technical knowledge document.
         Remove repetition. Preserve ALL code snippets, algorithms, and technical details.
-        Output ONLY a valid JSON object with exactly these fields:
-        {{
-        "topic": "one-line topic title",
-        "tags": ["tag1", "tag2", "tag3"],
-        "content": "full markdown synthesis with code blocks if present"
-        }}
-        Output ONLY the JSON. No explanation. No markdown fences around the JSON."""
+        Output EXACTLY in this text format:
+        TOPIC: <one-line topic title>
+        TAGS: <tag1, tag2, tag3>
+        CONTENT:
+        <full markdown synthesis with code blocks if present>
+        Do NOT wrap in JSON. Do NOT output anything before TOPIC:"""
         try:
             response = ollama.chat(
                 model=self.model_name,
@@ -234,24 +240,30 @@ class AIEngine:
             if hasattr(response, 'message') and response.message:
                 raw = (response.message.content or '').strip()
 
-            # Strict JSON validation — if Gemma fails, return empty (caller falls back to raw text)
             if not raw:
                 print("\033[91m[AIEngine] Gemma returned empty synthesis\033[0m")
                 return ""
             
-            # Strip accidental markdown fences if model wraps output
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            doc = json.loads(raw.strip())
-            # Validate required fields
-            if "topic" in doc and "content" in doc:
-                if "tags" not in doc:
-                    doc["tags"] = []
+            topic = ""
+            tags = []
+            content = ""
+            
+            lines = raw.split('\n')
+            for i, line in enumerate(lines):
+                if line.startswith("TOPIC:"):
+                    topic = line.replace("TOPIC:", "").strip()
+                elif line.startswith("TAGS:"):
+                    tags_raw = line.replace("TAGS:", "").strip()
+                    tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+                elif line.startswith("CONTENT:"):
+                    content = "\n".join(lines[i+1:]).strip()
+                    break
+
+            if topic and content:
+                doc = {"topic": topic, "tags": tags, "content": content}
                 return json.dumps(doc)
             return ""
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             print(f"\033[1;31m[AIEngine] synthesize_to_okf_doc failed: {e}\033[0m")
             return ""
     
@@ -265,9 +277,13 @@ class AIEngine:
         {existing_json[:1000]}
         New information captured:
         {new_json[:800]}
-        Produce ONE merged JSON document. Keep all unique code snippets and facts from both.
-        Remove redundancy. Output ONLY valid JSON with fields: topic, tags, content.
-        No explanation. No markdown fences."""
+        Produce ONE merged document. Keep all unique code snippets and facts from both. Remove redundancy.
+        Output EXACTLY in this text format:
+        TOPIC: <one-line topic title>
+        TAGS: <tag1, tag2, tag3>
+        CONTENT:
+        <full markdown synthesis with code blocks if present>
+        Do NOT wrap in JSON. Do NOT output anything before TOPIC:"""
 
         try:
             response = ollama.chat(
@@ -284,14 +300,27 @@ class AIEngine:
             raw = ""
             if hasattr(response, 'message') and response.message:
                 raw = (response.message.content or '').strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            doc = json.loads(raw.strip())
-            if "topic" in doc and "content" in doc:
+                
+            topic = ""
+            tags = []
+            content = ""
+            
+            lines = raw.split('\n')
+            for i, line in enumerate(lines):
+                if line.startswith("TOPIC:"):
+                    topic = line.replace("TOPIC:", "").strip()
+                elif line.startswith("TAGS:"):
+                    tags_raw = line.replace("TAGS:", "").strip()
+                    tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+                elif line.startswith("CONTENT:"):
+                    content = "\n".join(lines[i+1:]).strip()
+                    break
+
+            if topic and content:
+                doc = {"topic": topic, "tags": tags, "content": content}
                 return json.dumps(doc)
             return ""
+
         except Exception as e:
             print(f"\033[1;31m[AIEngine] merge_knowledge_docs failed: {e}\033[0m")
             return ""

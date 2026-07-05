@@ -15,6 +15,7 @@ namespace Jugnu
         private:
             static std::atomic<bool> isRunning;
             static HANDLE hThread;
+            static HANDLE hDir;
             static std::string watchPath;
             static DWORD WINAPI WatcherThread(LPVOID lpParam);
     };

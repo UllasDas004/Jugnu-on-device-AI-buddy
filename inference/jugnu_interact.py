@@ -52,7 +52,7 @@ def main():
 
     context_summary = state.get("summary", "No context available.")
 
-    result = {"action": "cancel", "custom_problem": None}
+    result = {"action": "cancel", "custom_problem": ""}
 
     # ── Stage 1: Nudge ─────────────────────────────────────────────────
     _print_box("🧠  Jugnu — Your AI Coding Buddy", [
@@ -120,7 +120,17 @@ def _write_and_exit(result, path):
         print("\033[90m  [Waiting for AI response...]\033[0m", flush=True)
         import time
         marker_path = path + ".done"
+
+        # P2-FIX: Add a timeout so this window doesn't hang forever if
+        # notification.py crashes mid-generation and never writes the done file.
+        deadline = time.time() + 180  # 3 minute hard limit
+
         while not os.path.exists(marker_path):
+            if time.time() > deadline:
+                print("\n  \033[1;31m[Error] Timed out waiting for AI response. The engine may have crashed.\033[0m")
+                print("  You can close this window.")
+                input()
+                return
             time.sleep(0.3)
         # Read and display the insight
         with open(marker_path, "r", encoding="utf-8") as f:

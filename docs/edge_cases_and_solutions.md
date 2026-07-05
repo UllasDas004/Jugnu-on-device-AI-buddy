@@ -374,3 +374,46 @@
 ### EC-I6 — The "Context Window Confusion" Trap
 **Situation:** Feeding 4,000 characters of raw OCR UI noise directly into a 4B parameter model overwhelms the attention mechanism. Gemma hallucinates or skips crucial code blocks.
 **Solution:** Implemented a context-aware `_chunk_text()` algorithm that strictly slices OCR text into 500-character windows, snapping to natural text boundaries (`\n\n` -> `\n` -> `. `). Gemma runs sequentially over these tiny, highly focused windows, extracting flawlessly.
+
+
+### Edge Case 10: Process Snapshot CPU Spikes
+**Scenario:** Jugnu uses CreateToolhelp32Snapshot to get a list of all processes on the machine to throttle distractors (like Spotify). Originally, this was called on *every* EVENT_SYSTEM_FOREGROUND trigger.
+**Problem:** If the user dragged a window across monitors or Alt-Tabbed rapidly, generating 20 events per second, Jugnu forced the OS to generate 20 kernel snapshots per second. This spiked CPU usage and induced micro-stutters.
+**Solution:** A static guard lastThrottledFor was added to ensure the snapshot is ONLY taken when the active application *changes*, cutting kernel calls by 99%.
+
+
+
+### Edge Case 10: Process Snapshot CPU Spikes
+**Scenario:** Jugnu uses CreateToolhelp32Snapshot to get a list of all processes on the machine to throttle distractors (like Spotify). Originally, this was called on *every* EVENT_SYSTEM_FOREGROUND trigger.
+**Problem:** If the user dragged a window across monitors or Alt-Tabbed rapidly, generating 20 events per second, Jugnu forced the OS to generate 20 kernel snapshots per second. This spiked CPU usage and induced micro-stutters.
+**Solution:** A static guard lastThrottledFor was added to ensure the snapshot is ONLY taken when the active application *changes*, cutting kernel calls by 99%.
+
+### Edge Case 11: Unescaped JSON String Injection
+**Scenario:** App names are injected into the JSON payload string sent to Python.
+**Problem:** A user opens a file named Say "Hello".txt. The manual C++ string concatenation payload = "{\"app\": \"" + title + "\"}" resulted in an unescaped double-quote inside the JSON value, permanently breaking Python's json.loads().
+**Solution:** Enforced strict RFC-compliant JSON sanitization (EscapeJSON) on all strings before concatenation, converting " to \".
+
+### Edge Case 12: Infinite PowerShell Hangs
+**Scenario:** The jugnu_interact.py script waits for a .done marker file to know when LLM generation finishes.
+**Problem:** If the AI backend crashes, the file is never created. The script loops 	ime.sleep(0.3) indefinitely, stranding a zombie PowerShell window on the user's desktop that requires Task Manager to close.
+**Solution:** Implemented a strict explicit timeout counter. If 180 seconds elapse, the script prints an error and terminates itself.
+
+### Edge Case 13: The 49-Day Uptime Integer Overflow
+**Scenario:** A user leaves their PC running continuously without a reboot for 50 days.
+**Problem:** `GetTickCount()` returns a 32-bit unsigned integer representing milliseconds since boot. At 49.7 days, this integer overflows and wraps back to zero. Subtracting the `LASTINPUTINFO` timestamp from an overflowed tick count results in a massive integer underflow, falsely triggering an endless loop of stuck timer events.
+**Solution:** Migrated the system to `GetTickCount64()`, which utilizes a 64-bit integer that takes 584 million years to overflow.
+
+### Edge Case 14: Ghost Thread Shutdown Hangs
+**Scenario:** The user closes the Jugnu application while a background thread is waiting for a file save (`ReadDirectoryChangesW`) or a clipboard copy (`GetMessage`).
+**Problem:** Setting `isRunning = false` is insufficient because the background threads are hard-blocked inside the Windows kernel. The application hangs in the background indefinitely ("Ghost Process").
+**Solution:** Implemented explicit thread-waking maneuvers in the `Stop()` methods. The main thread now issues `CancelIoEx()` to wake the file watcher, and `PostThreadMessage(WM_QUIT)` to wake the clipboard listener, guaranteeing clean shutdowns.
+
+### Edge Case 15: The Unescaped File Path Quotes
+**Scenario:** A user names their code file with a double quote, e.g., `test"file.py`.
+**Problem:** The original IPC JSON escaper only handled backslashes. Injecting `test"file.py` into `{"file": "..."}` broke the JSON syntax, instantly crashing the Python IPC decoder.
+**Solution:** Replaced the ad-hoc string replacer with a robust `EscapeJSON` utility that strictly sanitizes quotes and invisible control characters.
+
+### Edge Case 16: The Polyglot IDE Blindspot
+**Scenario:** A developer is actively practicing dynamic programming algorithms on LeetCode using Chrome (`chrome.exe`).
+**Problem:** The native C++ engine's `CAPTURE_APPS` list properly whitelisted `chrome.exe` and captured OCR perfectly. However, the Python pipeline evaluated user intent via a strict `CODING_APPS` whitelist that originally only contained traditional desktop IDEs (`code`, `clion`, `pycharm`). When the `USER_IDLE` event fired, Python concluded "Chrome is not a coding app", discarded the OCR context, and refused to spawn the AI helper.
+**Solution:** Synchronized the Python `CODING_APPS` list with the C++ `CAPTURE_APPS` whitelist. Adding `chrome`, `msedge`, and `firefox` allows the system to recognize web-based developer workflows (LeetCode, HackerRank, documentation) as valid coding contexts that warrant proactive AI nudges.

@@ -20,7 +20,7 @@ class StateManager:
         self.last_coding_app_time = time.time()
 
     def was_recently_coding(self, within_minutes = 15):
-        """Retruns True if user was in a coding app within the last N minutes."""
+        """Returns True if user was in a coding app within the last N minutes."""
         if not self.last_coding_app:
             return False
         elapsed = time.time() - self.last_coding_app_time

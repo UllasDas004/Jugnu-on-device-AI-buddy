@@ -6,6 +6,7 @@ namespace Jugnu
 {
     std::atomic<bool> FileWatcher::isRunning{false};
     HANDLE FileWatcher::hThread = NULL;
+    HANDLE FileWatcher::hDir = INVALID_HANDLE_VALUE;
     std::string FileWatcher::watchPath = "";
 
     void FileWatcher::Start(const std::string& directoryToWatch)
@@ -19,6 +20,7 @@ namespace Jugnu
     void FileWatcher::Stop()
     {
         isRunning = false;
+        if(hDir != INVALID_HANDLE_VALUE) CancelIoEx(hDir, NULL); // Wakes the sleeping ReadDirectoryChangesW call
         if(hThread)
         {
             WaitForSingleObject(hThread, 1000); // Wait for thread to gracefully exit
@@ -27,12 +29,31 @@ namespace Jugnu
         }
     }
 
+    static std::string EscapeJSON(const std::string& input)
+    {
+        std::string output;
+        for(char c : input)
+        {
+            if(c == '"') output += "\\\"";
+            else if(c == '\\') output += "\\\\";
+            else if(c == '\b') output += "\\b";
+            else if(c == '\f') output += "\\f";
+            else if(c == '\n') output += "\\n";
+            else if(c == '\r') output += "\\r";
+            else if(c == '\t') output += "\\t";
+            else if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[7]; snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c)); output += buf;
+            } else { output += c; }
+        }
+        return output;
+    }
+
     DWORD WINAPI FileWatcher::WatcherThread(LPVOID lpParam)
     {
         std::cout<<"\033[1;35m[GhostWriter]\033[0m Watching directory: \033[4m" << watchPath << "\033[0m\n";
 
         // Open a handle to the directory we want to monitor
-        HANDLE hDir = CreateFileA(
+        hDir = CreateFileA(
             watchPath.c_str(),
             FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -87,13 +108,7 @@ namespace Jugnu
                             std::cout << "\033[1;35m[GhostWriter]\033[0m Detected change in: \033[4m" << absolutePath << "\033[0m\n";
                             std::cout << "\033[1;35m[GhostWriter]\033[0m User saved: \033[3m" << filename << "\033[0m. Sending to Python...\n";
 
-                            std::string escapePath = absolutePath;
-                            size_t pos = 0;
-                            while((pos = escapePath.find("\\", pos)) != std::string::npos)
-                            {
-                                escapePath.replace(pos, 1, "\\\\");
-                                pos += 2;
-                            }
+                            std::string escapePath = EscapeJSON(absolutePath);
     
                             // Send the file change event to Python!
                             std::string payload = "{\"type\": \"FILE_SAVED\", \"file\": \"" + escapePath + "\"}";

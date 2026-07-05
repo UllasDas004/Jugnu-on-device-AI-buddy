@@ -40,8 +40,11 @@ class Embedder:
         # We must check if we're online, otherwise HF throws getaddrinfo failed.
         import socket
         try:
-            socket.setdefaulttimeout(3)
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+            # P2-FIX: Use context manager so the socket FD is always closed.
+            # Previously leaked an OS file descriptor on every startup.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+                _s.settimeout(3)
+                _s.connect(("8.8.8.8", 53))
             is_online = True
         except Exception:
             is_online = False
@@ -131,6 +134,12 @@ class Embedder:
         if snippet == last_snippet and (now - last_time) < 60.6:
             print(f"{_YELLOW}[Embedder] Throttled duplicate from {app_name}.{_RESET}")
             return False
+
+        # P2-FIX: Cap cache size — evict oldest entry if over limit.
+        MAX_EMBED_CACHE = 20
+        if len(self._last_embedded) >= MAX_EMBED_CACHE:
+            self._last_embedded.pop(next(iter(self._last_embedded)))
+
         self._last_embedded[app_name] = (snippet, now)
 
 

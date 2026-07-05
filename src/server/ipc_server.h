@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <string>
 #include <atomic>
+#include <mutex>
 
 namespace Jugnu
 {
@@ -24,6 +25,8 @@ namespace Jugnu
             // Atomic flag to control the while-loop in the listener thread
             static bool isRunning;
             static std::atomic<bool> isClientConnected;
+
+            static std::mutex pipeMutex;
 
             // The background worker thread that blocks until python connects
             static DWORD WINAPI PipeListnerThread(LPVOID lpParam); // what is LPVOID? -> data type, void pointer (generic pointer)

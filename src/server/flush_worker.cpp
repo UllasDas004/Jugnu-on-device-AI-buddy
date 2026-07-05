@@ -9,6 +9,8 @@ namespace Jugnu
 {
     std::atomic<bool> FlushWorker::isRunning(false);
     std::thread FlushWorker::workerThread;
+    std::mutex FlushWorker::_cvMutex;
+    std::condition_variable FlushWorker::_cv;
 
     void FlushWorker::Start()
     {
@@ -30,6 +32,7 @@ namespace Jugnu
 
         // Safely stop the thread
         isRunning = false;
+        _cv.notify_all();  // P2-FIX: Wake the sleeping thread immediately
         // Check if thread is joinable and then join it
         if(workerThread.joinable()) workerThread.join();
     }
@@ -48,9 +51,11 @@ namespace Jugnu
         // Infinite loop that only breaks when Stop() is called
         while(isRunning)
         {
-            // PRODUCTION PATCH: Sleep for 30 minutes (1800 seconds) in 1-second chunks so it can stop cleanly
-            for(int i=0; i<1800 && isRunning; i++) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            // P2-FIX: Use a condition variable instead of 1800 x 1-sec sleep.
+            // Stop() can now wake this thread instantly instead of waiting up to 1s.
+            {
+                std::unique_lock<std::mutex> lk(_cvMutex);
+                _cv.wait_for(lk, std::chrono::minutes(30), [&]{ return !isRunning.load(); });
             }
 
             if(!isRunning) break;

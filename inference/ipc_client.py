@@ -29,8 +29,10 @@ def _is_online() -> bool:
     """Quick connectivity check - try to reach Ollama's update endpoint."""
     import socket
     try:
-        socket.setdefaulttimeout(3)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+        # P2-FIX: Context manager closes the socket FD immediately after check.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.settimeout(3)
+            _s.connect(("8.8.8.8", 53))
         return True
     except Exception:
         return False
@@ -91,7 +93,8 @@ def ensure_models_downloaded():
 PIPE_NAME = r"\\.\pipe\jugnu_ipc"
 
 CODING_APPS = ["code", "ide", "antigravity", "pwsh", "terminal",
-               "devenv", "vim", "nvim", "fleet", "clion", "pycharm"]
+               "devenv", "vim", "nvim", "fleet", "clion", "pycharm",
+               "chrome", "msedge", "firefox", "cursor", "idea", "acrobat"]
 OS_NOISE    = ["explorer", "shellexperiencehost", "searchapp",
                "startmenuexperiencehost", "applicationframehost",
                "textinputhost"]

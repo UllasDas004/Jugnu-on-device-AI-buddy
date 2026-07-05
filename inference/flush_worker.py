@@ -189,7 +189,12 @@ class FlushWorker:
             # --- PHASE 1: Pre-Gemma OCR Deduplication ---
             if not hasattr(self, '_last_raw_by_app'):
                 self._last_raw_by_app = {}
-
+            # P1-FIX: Cap cache size to prevent unbounded memory growth.
+            # OCR blobs are ~2000 chars each; 20 entries = ~40KB max.
+            MAX_CACHE = 20
+            if len(self._last_raw_by_app) > MAX_CACHE:
+                self._last_raw_by_app.pop(next(iter(self._last_raw_by_app)))
+                
             last_raw = self._last_raw_by_app.get(app_name, "")
             # Calculate how similar this OCR dump is to the last one we saw
             similarity = difflib.SequenceMatcher(None, raw_text, last_raw).ratio()
