@@ -8,22 +8,35 @@ class AIEngine:
 
     def _warmup(self):
         """
-        Ollama's first cold-start always crashes with a CUDA error on this machine.
-        The second call works perfectly. We fire a silent dummy request at startup
-        so the crash happens here (invisible to user) and not during a real nudge.
+        Ollama's first cold-start can crash with a CUDA error (0xc0000409) on RTX 4050
+        if Flash Attention is auto-enabled by the server. We fire a dummy request so the
+        crash happens here (invisible to user) and the server recovers before real queries.
+        Retries up to 3 times in case the server needs a moment to recover.
+
+        IMPORTANT: ollama serve must be started with OLLAMA_FLASH_ATTENTION=0.
+        In PowerShell: $env:OLLAMA_FLASH_ATTENTION=0; ollama serve
         """
+        import os
+        if not os.environ.get("OLLAMA_FLASH_ATTENTION"):
+            print("\033[1;33m[AIEngine] WARNING: OLLAMA_FLASH_ATTENTION env var not set!\033[0m")
+            print("\033[1;33m[AIEngine] Start Ollama with: $env:OLLAMA_FLASH_ATTENTION=0; ollama serve\033[0m")
+
         print("\033[90m[AIEngine] Warming up model (first call may take a moment)...\033[0m")
-        try:
-            ollama.chat(
-                model=self.model_name,
-                messages=[{"role": "user", "content": "hi"}],
-                # Use exactly the same num_ctx as real calls to trigger the KV cache allocation
-                options={"num_predict": 1, "num_ctx": 2048, "flash_attn": False}
-            )
-            print("\033[1;32m[AIEngine] Model warm and ready!\033[0m")
-        except Exception:
-            # First call crashes — that's expected. Ollama recovers automatically.
-            print("\033[90m[AIEngine] Cold-start done (first call reset is normal). Model ready for next query.\033[0m")
+        for attempt in range(3):
+            try:
+                ollama.chat(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": "hi"}],
+                    options={"num_predict": 1, "num_ctx": 2048, "flash_attn": False}
+                )
+                print("\033[1;32m[AIEngine] Model warm and ready!\033[0m")
+                return  # Success — exit immediately
+            except Exception:
+                if attempt < 2:
+                    print(f"\033[90m[AIEngine] Cold-start attempt {attempt+1}/3 failed (normal). Retrying...\033[0m")
+                    import time; time.sleep(3)  # Give Ollama time to recover
+                else:
+                    print("\033[90m[AIEngine] Cold-start done (first call reset is normal). Model ready for next query.\033[0m")
 
     def generate_insight(self, context_str):
         # Hard-truncate context to prevent KV-cache overrun (caused the 0xc0000409 crash)
@@ -112,7 +125,8 @@ class AIEngine:
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
-                    "num_predict": 300,
+                    "num_ctx": 4096,
+                    "num_predict": 1500,
                     "temperature": 0.1,   # near-deterministic extraction
                     "flash_attn": False,
                 }
@@ -148,7 +162,7 @@ class AIEngine:
                 model = self.model_name,
                 messages = [{"role": "user", "content": prompt}],
                 think = False,
-                options = {"num_predict": 30, "temperature": 0.1, "flash_attn": False}
+                options = {"num_ctx": 2048, "num_predict": 30, "temperature": 0.1, "flash_attn": False}
             )
             if hasattr(response, 'message') and response.message:
                 return (response.message.content or '').strip()
@@ -212,26 +226,37 @@ class AIEngine:
         """
 
         combined_raw = "\n\n---\n\n".join(extractions)
-        combined_raw = combined_raw[:2000]  # Hard cap for context window
-        prompt = f"""You are a technical knowledge synthesizer for a developer AI.
-        You have these extracted fragments from a single screen capture:
+        combined_raw = combined_raw[:15000]  # Hard cap for context window
+        prompt = f"""You are a strict technical knowledge organizer.
+        You are given raw screen text or extracted fragments from a developer's screen.
+        Your ONLY job is to organize this text into the structured sections below.
+        
+        CRITICAL RULES:
+        1. DO NOT summarize, paraphrase, or pass judgement on the code.
+        2. You MUST copy the ENTIRE code block EXACTLY character-for-character into the CODE section. Do not truncate it.
+        3. Copy the problem statement directly into the CONTEXT section.
+        
+        RAW TEXT TO ORGANIZE:
         {combined_raw}
-        Synthesize them into ONE rich, coherent technical knowledge document.
-        Remove repetition. Preserve ALL code snippets, algorithms, and technical details.
-        Output EXACTLY in this text format:
-        TOPIC: <one-line topic title>
+        
+        Output EXACTLY in this format (use NONE for any section with no content):
+        TOPIC: <one-line title — if LeetCode problem, prefix with "LeetCode: ">
         TAGS: <tag1, tag2, tag3>
-        CONTENT:
-        <full markdown synthesis with code blocks if present>
-        Do NOT wrap in JSON. Do NOT output anything before TOPIC:"""
+        CONTEXT: <The problem statement, OR context of the codebase>
+        IMPLEMENTATION: <The technical approach, algorithm, or architecture>
+        CODE:
+        <exact code block if present, else NONE>
+        NOTES: <Constraints, edge cases, hints, or UI notes>
+        
+        Do NOT output anything before TOPIC:"""
         try:
             response = ollama.chat(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
-                    "num_ctx": 2048,
-                    "num_predict": 600,
+                    "num_ctx": 4096,
+                    "num_predict": 2048,
                     "temperature": 0.1,
                     "flash_attn": False,
                 }
@@ -246,25 +271,63 @@ class AIEngine:
             
             topic = ""
             tags = []
-            content = ""
+            context_text, implementation, code, notes = "", "", "", ""
             
+            # Use a dictionary instead of nonlocal variables so Pylance stays happy
+            sections = {
+                "CONTEXT": [],
+                "IMPLEMENTATION": [],
+                "CODE": [],
+                "NOTES": []
+            }
+
             lines = raw.split('\n')
-            for i, line in enumerate(lines):
+            current_section = None
+            section_lines = []
+
+
+            for line in lines:
                 if line.startswith("TOPIC:"):
+                    current_section = None
                     topic = line.replace("TOPIC:", "").strip()
                 elif line.startswith("TAGS:"):
-                    tags_raw = line.replace("TAGS:", "").strip()
-                    tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
-                elif line.startswith("CONTENT:"):
-                    content = "\n".join(lines[i+1:]).strip()
-                    break
-
+                    current_section = None
+                    tags = [t.strip() for t in line.replace("TAGS:", "").split(',') if t.strip()]
+                elif line.startswith("CONTEXT:"):
+                    current_section = "CONTEXT"
+                elif line.startswith("IMPLEMENTATION:"):
+                    current_section = "IMPLEMENTATION"
+                elif line.startswith("CODE:"):
+                    current_section = "CODE"
+                elif line.startswith("NOTES:"):
+                    current_section = "NOTES"
+                elif current_section:
+                    sections[current_section].append(line)
+            # Build final content block so vector search still works normally
+            content_parts = []
+            
+            ctx_text = "\n".join(sections["CONTEXT"]).strip()
+            if ctx_text and ctx_text != "NONE":
+                content_parts.append(f"CONTEXT:\n{ctx_text}")
+                
+            imp_text = "\n".join(sections["IMPLEMENTATION"]).strip()
+            if imp_text and imp_text != "NONE":
+                content_parts.append(f"IMPLEMENTATION:\n{imp_text}")
+                
+            code_text = "\n".join(sections["CODE"]).strip()
+            if code_text and code_text != "NONE":
+                content_parts.append(f"CODE:\n```\n{code_text}\n```")
+                
+            notes_text = "\n".join(sections["NOTES"]).strip()
+            if notes_text and notes_text != "NONE":
+                content_parts.append(f"NOTES:\n{notes_text}")
+            content = "\n\n".join(content_parts)
             if topic and content:
                 doc = {"topic": topic, "tags": tags, "content": content}
                 return json.dumps(doc)
             return ""
         except Exception as e:
-            print(f"\033[1;31m[AIEngine] synthesize_to_okf_doc failed: {e}\033[0m")
+            print(f"\033[1;31m[AIEngine] synthesize_ocr_extractions failed: {e}\033[0m")
             return ""
     
     def merge_knowledge_docs(self, existing_json: str, new_json: str) -> str:

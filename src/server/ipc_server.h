@@ -30,5 +30,8 @@ namespace Jugnu
 
             // The background worker thread that blocks until python connects
             static DWORD WINAPI PipeListnerThread(LPVOID lpParam); // what is LPVOID? -> data type, void pointer (generic pointer)
+
+            static HANDLE hConnectEvent;  // OS signals this when Python connects or disconnects
+            static HANDLE hStopEvent;     // We signal this manually when Stop() is called
     };
 }

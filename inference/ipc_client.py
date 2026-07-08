@@ -1,6 +1,7 @@
 import threading
 from socket import socket
 import win32file
+import win32pipe
 import pywintypes
 import os
 import sys
@@ -166,15 +167,28 @@ def _synthesize_and_save_file(engine, embedder, app_name, filepath, code_text):
         else:
             print(f"{_YELLOW}[OKF] Synthesis failed for {os.path.basename(filepath)} — episodic only.{_RESET}")
 
-def pipe_listener_main(state, engine, embedder):
-    handle = connect_to_pipe()
+# Global stop flag — set by main thread on Ctrl+C, read by reader daemon
+_stop_event = threading.Event()
+
+def _pipe_reader_daemon(handle, state, engine, embedder):
+    """
+    Runs in a daemon thread. Uses PeekNamedPipe to avoid blocking
+    so the main thread remains free to catch KeyboardInterrupt.
+    """
     buffer = ""
-
-
-    print("[Python] Listening for events from C++...\n")
-    while True:
+    while not _stop_event.is_set():
         try:
-            # Read raw bytes from the named pipe
+            # PeekNamedPipe is non-blocking: returns instantly with bytes_available.
+            # This is the key fix — we NEVER block inside a kernel call without a way out.
+            _, bytes_available, _ = win32pipe.PeekNamedPipe(handle, 0)
+
+            if bytes_available == 0:
+                # No data yet — sleep briefly and yield back to Python scheduler
+                # This tiny sleep is what lets the main thread catch KeyboardInterrupt
+                time.sleep(0.05)
+                continue
+
+            # Data IS available — safe to call ReadFile, it will return immediately
             result, data = win32file.ReadFile(handle, 4096)
             if result == 0:
                 # pywin32 returns bytes from a binary pipe, but stubs declare str|bytes.
@@ -211,20 +225,16 @@ def pipe_listener_main(state, engine, embedder):
                                     # Save to semantic memory if it's substantial text
                                     if text and len(text.strip()) > 20:
                                         threading.Thread(
-                                            target = embedder.save_memory,
-                                            args = (state.current_app or 'unknown',
-                                                    state.current_app or 'clipboard',
-                                                    text),
-                                            kwargs = {'file_path': None},
+                                            target=embedder.save_memory,
+                                            args=(state.current_app or 'unknown', state.current_app or 'clipboard', text),
+                                            kwargs={'file_path': None},
                                             daemon=True
                                         ).start()
                                     # If it looks like a code snippet, synthesize into OKF
                                     if text and len(text.strip()) > 100:
                                         threading.Thread(
                                             target=_synthesize_and_save_file,
-                                            args=(engine, embedder,
-                                                  state.current_app or 'clipboard',
-                                                  'clipboard', text),
+                                            args=(engine, embedder, state.current_app or 'clipboard', 'clipboard', text),
                                             daemon=True
                                         ).start()
 
@@ -237,19 +247,15 @@ def pipe_listener_main(state, engine, embedder):
                                             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                                                 code_text = f.read()
                                             threading.Thread(
-                                                target = embedder.save_memory,
-                                                args = (state.current_app or 'unknown',
-                                                        state.current_app or 'unknown',
-                                                        code_text),
-                                                kwargs = {'file_path': filepath},
+                                                target=embedder.save_memory,
+                                                args=(state.current_app or 'unknown', state.current_app or 'unknown', code_text),
+                                                kwargs={'file_path': filepath},
                                                 daemon=True
                                             ).start()
 
                                             threading.Thread(
                                                 target=_synthesize_and_save_file,
-                                                args=(engine, embedder,
-                                                      state.current_app or 'unknown',
-                                                      filepath, code_text),
+                                                args=(engine, embedder, state.current_app or 'unknown', filepath, code_text),
                                                 daemon=True
                                             ).start()
                                         except Exception as e:
@@ -272,8 +278,7 @@ def pipe_listener_main(state, engine, embedder):
                                         # We store the results and pass them to notification.
                                         # Gemma will generate the actual answer ONLY if user clicks Y.
                                         context_chunks = []
-                                        sources        = []
-
+                                        sources = []
                                         knowledge_results = embedder.search_knowledge_docs(search_query, limit=3)
                                         if knowledge_results:
                                             for doc in knowledge_results:
@@ -296,9 +301,9 @@ def pipe_listener_main(state, engine, embedder):
                                             target=notification.trigger_flow,
                                             args=(state, engine, embedder),
                                             kwargs={
-                                                "search_query":  search_query,
+                                                "search_query": search_query,
                                                 "context_chunks": context_chunks,
-                                                "sources":        sources,
+                                                "sources": sources,
                                                 "screen_context": screen_context,
                                             },
                                             daemon=True
@@ -312,20 +317,40 @@ def pipe_listener_main(state, engine, embedder):
                     buffer = messages[-1]
 
         except pywintypes.error as e:
-            if e.winerror == 109: # ERROR_BROKEN_PIPE
+            if e.winerror == 109:  # ERROR_BROKEN_PIPE
                 print("\n[Python] C++ engine disconnected. Reconnecting...", flush=True)
                 win32file.CloseHandle(handle)
+                if _stop_event.is_set():
+                    return
                 handle = connect_to_pipe()
             else:
                 print(f"[Python] Pipe read error: {e}", flush=True)
-                break
-        except KeyboardInterrupt:
-            print("\n[Python] KeyboardInterrupt received. Shutting down gracefully...", flush=True)
-            win32file.CloseHandle(handle)
-            sys.exit(0)
+                return
         except Exception as e:
-            print(f"\n[Python] Unexpected error: {e}", flush=True)
-            break
+            print(f"\n[Python] Unexpected error in reader: {e}", flush=True)
+            return
+
+
+def pipe_listener_main(state, engine, embedder):
+    handle = connect_to_pipe()
+    print("[Python] Listening for events from C++...\n")
+
+    reader = threading.Thread(
+        target=_pipe_reader_daemon,
+        args=(handle, state, engine, embedder),
+        daemon=True  # Dies automatically if main thread exits
+    )
+    reader.start()
+
+    # Main thread stays free — its only job is to catch KeyboardInterrupt
+    try:
+        while reader.is_alive():
+            reader.join(timeout=0.5)  # Wakes every 500ms to check for signals
+    except KeyboardInterrupt:
+        print("\n[Python] KeyboardInterrupt received. Shutting down gracefully...", flush=True)
+        _stop_event.set()       # Signal daemon to exit its loop cleanly
+        win32file.CloseHandle(handle)
+        sys.exit(0)
 
 if __name__ == "__main__":
     ensure_models_downloaded()

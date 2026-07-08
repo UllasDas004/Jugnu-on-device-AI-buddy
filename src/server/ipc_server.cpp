@@ -8,11 +8,25 @@ namespace Jugnu
     bool IPCServer::isRunning = false;
     std::atomic<bool> IPCServer::isClientConnected{false};
     std::mutex IPCServer::pipeMutex;
+    HANDLE IPCServer::hConnectEvent = INVALID_HANDLE_VALUE;
+    HANDLE IPCServer::hStopEvent = INVALID_HANDLE_VALUE;
 
     void IPCServer::Start()
     {
         if(isRunning) return;
         isRunning = true;
+
+        // Create synchronization events
+        // hConnectEvent: Python signals this to indicate connection/disconnection
+        hConnectEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        
+        // hStopEvent: C++ signals this to tell the thread to shut down
+        hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        // NULL → default security
+        // TRUE → "manual reset" (we have to manually reset it after it fires)
+        // FALSE → starts in "not signaled" state
+        // NULL → no name needed
+
 
         // Create a background worker thread.
         // If we ran the pipe listener on the main thread, it would block the Win32 Message Loop
@@ -25,10 +39,21 @@ namespace Jugnu
         isRunning = false;
         if(hPipe != INVALID_HANDLE_VALUE)
         {
+            if(hStopEvent) SetEvent(hStopEvent); // Wake up WaitForMultipleObjects
             // Disconnect and close the handle to free OS resources
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
             hPipe = INVALID_HANDLE_VALUE;
+            if(hConnectEvent)
+            {
+                CloseHandle(hConnectEvent);
+                hConnectEvent = NULL;
+            }
+            if(hStopEvent)
+            {
+                CloseHandle(hStopEvent);
+                hStopEvent = NULL;
+            }
         }
     }
 
@@ -71,7 +96,7 @@ namespace Jugnu
             // It is significantly faster and more secure than a localhost HTTP server.
             hPipe = CreateNamedPipeA(
                 "\\\\.\\pipe\\jugnu_ipc",                       // The exact name Python will look for
-                PIPE_ACCESS_DUPLEX,                             // Two-way communication (Read/Write)
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,      // FILE_FLAG_OVERLAPPED -> This single flag tells the OS: "This pipe will use asynchronous I/O. Don't block my thread when I call ReadFile or ConnectNamedPipe on it."
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, // Block until data arrives
                 1,                                             // Max instances (only 1 python script allowed)
                 4096,                                           // Output buffer size (4KB)
@@ -88,31 +113,69 @@ namespace Jugnu
             }
             std::cout<<"\033[1;33m[IPCServer]\033[0m Waiting for Python Inference Service to connect...\n";
 
-            // ConnectNamedPipe blocks this background thread until inference.py runs
-            BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+            OVERLAPPED ol = {0};
+            ol.hEvent = hConnectEvent;
+            ResetEvent(hConnectEvent);
 
-            if(connected)
+            ConnectNamedPipe(hPipe, &ol); // Returns immediately in overlapped mode
+            DWORD connectErr = GetLastError();
+
+            if (connectErr == ERROR_PIPE_CONNECTED)
             {
-                std::cout<<"\033[1;33m[IPCServer]\033[0m \033[1;32mPython connected successfully! IPC bridge active.\033[0m\n";
-                isClientConnected = true;
-
-                // Python is a read-only consumer of events. We just monitor pipe health here.
-                while(isRunning && isClientConnected)
-                {
-                    // Check pipe health: if Python disconnects, WriteFile will fail and
-                    // set isClientConnected = false, which will break this loop naturally.
-                    Sleep(100);
-                }
-
-                isClientConnected = false;
-                std::cout<<"\033[1;33m[IPCServer]\033[0m Python disconnected. Restarting pipe...\n";
+                // Fast-connect race: Python was already waiting before we called ConnectNamedPipe.
+                // The OS won't auto-signal hConnectEvent in this case, so we skip the wait entirely.
+                SetEvent(hConnectEvent);
+            }
+            else if (connectErr != ERROR_IO_PENDING)
+            {
+                // Unexpected error — recreate the pipe
+                std::cerr << "\033[1;33m[IPCServer]\033[0m ConnectNamedPipe failed. Error: " << connectErr << "\n";
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
+                hPipe = INVALID_HANDLE_VALUE;
+                continue;
             }
 
-            // Cleanup before the loop restarts to accept a new connection
+            // Block until EITHER Python connects (hConnectEvent) OR we are shutting down (hStopEvent)
+            // events[0] = hStopEvent  → WAIT_OBJECT_0 + 0 → we are shutting down
+            // events[1] = hConnectEvent → WAIT_OBJECT_0 + 1 → Python connected
+            HANDLE events[2] = {hStopEvent, hConnectEvent};
+            DWORD waitResult = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+
+            if (waitResult == WAIT_OBJECT_0) break; // hStopEvent (index 0) fired → shutdown
+
+            // hConnectEvent (index 1) fired → Python connected!
+            isClientConnected = true;
+            std::cout << "\033[1;33m[IPCServer]\033[0m \033[1;32mPython connected successfully! IPC bridge active.\033[0m\n";
+
+            // ---- Health-check phase: arm a zero-byte async ReadFile ----
+            // The OS will signal hConnectEvent the moment the pipe breaks (Python exits).
+            // We don't need to poll at all — zero CPU usage while Python is alive.
+            OVERLAPPED olRead = {0};
+            olRead.hEvent = hConnectEvent;
+            ResetEvent(hConnectEvent);
+
+            DWORD bytesRead = 0;
+            ReadFile(hPipe, NULL, 0, &bytesRead, &olRead); // Returns immediately (overlapped)
+
+            // Block until EITHER pipe breaks (hConnectEvent) OR shutdown (hStopEvent)
+            // Reuse events[] — swap order so hConnectEvent is index 0 this time
+            events[0] = hConnectEvent;
+            events[1] = hStopEvent;
+            waitResult = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+
+            if (waitResult == WAIT_OBJECT_0 + 1) break; // hStopEvent (index 1) fired → shutdown
+
+            // hConnectEvent fired → pipe broke, Python disconnected
+            std::cout << "\033[1;33m[IPCServer]\033[0m Python disconnected. Restarting pipe...\n";
+            isClientConnected = false;
+
+            // Cleanup before the outer loop restarts to accept a new connection
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
             hPipe = INVALID_HANDLE_VALUE;
         }
         return 0;
+
     }
 } // namespace Jugnu

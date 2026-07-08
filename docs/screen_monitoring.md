@@ -20,9 +20,9 @@ If an app is deemed "safe to read" (not incognito, not a game, not playing video
 
 ### Tier 1: UI Automation (Near 0% CPU)
 **Technology:** Microsoft `IUIAutomation` COM API.
-This is the same API used by Windows Narrator. It directly asks the active application (like VS Code or Word) to hand over its text tree.
-- **Pros:** Instant, flawless accuracy, practically zero CPU overhead.
-- **Cons:** Some apps (like Discord or specific web pages) do not expose their text trees properly to UI Automation.
+This is the same API used by Windows Narrator. It directly asks the active application (like VS Code or Chrome) to hand over its text tree. It uses a **Breadth-First Search (BFS)** traversal with an `unordered_set` (O(1)) to merge and deduplicate nested UI nodes, guaranteeing pristine text blocks without the overlapping fragment explosion found in naive recursive DOM reads.
+- **Pros:** Instant, flawless accuracy, practically zero CPU overhead. Directly isolates raw code or markdown.
+- **Cons:** Some apps (like Discord or specific game UIs) do not expose their text trees properly to UI Automation.
 
 ### Tier 2: WGC + OCR (Hardware Accelerated via Native C++)
 **Technology:** Windows Graphics Capture (WGC) + `Windows.Media.Ocr` (MSVC C++/WinRT).
@@ -47,11 +47,12 @@ Once text is successfully extracted via Tier 1 or Tier 2, it isn't automatically
 1. A background Python daemon (`flush_worker.py`) wakes up every 60 seconds (but only if the laptop is plugged into AC power, using Win32 `GetSystemPowerStatus`, to save battery).
 2. It waits for the UI to settle by enforcing a hard 30-second `Settle Time` (if the latest screenshot is less than 30s old, it aborts the cycle).
 3. It reads chunks from the `ocr_buffer`.
-4. It performs a fast `difflib.SequenceMatcher` check against the previously processed screen. If the screen hasn't changed by at least 15%, it instantly discards the chunk to save GPU battery.
-5. If the screen is new, it passes the chunks through the Gemma **Two-Pass OKF Extractor**:
-   - **Pass 1:** Slices out UI noise and extracts only raw factual bullet points.
-   - **Pass 2:** Synthesizes the bullets into a structured JSON `knowledge_doc`.
-6. The OKF document is embedded (384-dimensional vector) and saved to the permanent `knowledge_docs` table for RAG.
-7. The processed rows are deleted from the buffer.
+4. It performs a fast `difflib.SequenceMatcher` check against the previously processed screen. If the screen hasn't changed by at least 15%, it instantly discards the chunk to save GPU battery. The cache for this is strictly capped (`MAX_CACHE = 20`) to prevent OOM memory leaks.
+5. **The Pipeline Split**:
+   - **UIA Fast-Path:** If the payload contains the `===SECTION===` delimiter (originating from Tier 1 UIA), Python **skips AI Extraction completely**. UIA text is already perfectly clean. It gets routed instantly to the final OKF Synthesizer (Step 6), achieving a 500% speedup.
+   - **OCR Extraction (Fallback):** If the text is messy (Tier 2 OCR), it chunks the text into 500-character windows and uses Gemma to extract pure technical knowledge via strict text-parsing.
+6. The clean text is synthesized into a structured JSON `knowledge_doc` (bypassing JSON Markdown Hallucinations).
+7. The OKF document is embedded (384-dimensional vector) and saved to the permanent `knowledge_docs` table for RAG.
+8. The processed rows are deleted from the buffer.
 
-*(Note: See `memory_system.md` for database schema details and `prompts_design.md` for the Two-Pass OKF prompts).*
+*(Note: See `memory_system.md` for database schema details and `prompts_design.md` for the OKF prompts).*

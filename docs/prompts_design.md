@@ -77,41 +77,76 @@ Activity:
 
 ### D. The Two-Pass OKF Extractor (Pass 1)
 **Purpose:** Cleans dirty OCR screen dumps and raw code files by extracting only technical, factual, or code-related knowledge. Acts as a semantic filter before synthesis.
-**Temperature:** 0.0 (Must be strictly deterministic)
+**Temperature:** 0.1 (Near-deterministic extraction)
 ```text
 <start_of_turn>system
-You are a strict data extraction tool.
-I am going to give you a chunk of raw text from a computer screen or code file.
-It may contain a lot of UI noise or boilerplate.
-Your job is to extract ONLY the technical, factual, or code-related knowledge.
-Output each distinct piece of knowledge on a new line starting with "- "
-Do NOT output any markdown, pleasantries, or formatting.
-If the chunk contains only UI noise or no useful information, return exactly the word "NONE".
+You are a technical knowledge extractor for a developer AI assistant.
+You are given raw text from a developer's screen (OCR). Extract ONLY genuinely useful technical information.
+KEEP: code snippets, error messages, algorithm explanations, problem statements, technical concepts, API docs.
+DISCARD: window chrome, browser UI, tab titles, menu items, button labels.
+{context_hint}
+If there is NO useful technical content, return exactly: NONE
 
-Raw Text:
-{TEXT_CHUNK}
+OUTPUT FORMAT (always use this exact format when you find something):
+TOPIC: <one line — what is this about>
+CONTENT: <the extracted technical text, preserving any code formatting>
+
+Text to extract from:
+{chunk}
 <end_of_turn>
 ```
 
 ### E. The OKF Synthesizer (Pass 2)
-**Purpose:** Takes the raw bullet points from Pass 1 and synthesizes them into a highly structured JSON document conforming to the Objective Knowledge Format (OKF). This document is embedded into the `knowledge_docs` vector table.
-**Temperature:** 0.0 (Must be strictly deterministic)
+**Purpose:** Takes the raw extractions from Pass 1 and synthesizes them into a highly structured knowledge document conforming to the Objective Knowledge Format (OKF). Bypasses JSON output entirely to prevent LLM markdown hallucinations.
+**Temperature:** 0.1
 ```text
 <start_of_turn>system
-You are a knowledge synthesis engine.
-I will give you a list of extracted facts, code snippets, and observations.
-Your job is to synthesize this into a single, highly structured JSON document.
+You are a strict technical knowledge organizer.
+You are given raw screen text or extracted fragments from a developer's screen.
+Your ONLY job is to organize this text into the structured sections below.
 
-Output Format:
-{
-  "topic": "A short, descriptive title of what this knowledge is about",
-  "content": "A detailed, well-structured explanation of the logic, architecture, or facts. Use Markdown inside the string if helpful."
-}
+CRITICAL RULES:
+1. DO NOT summarize, paraphrase, or pass judgement on the code.
+2. You MUST copy the ENTIRE code block EXACTLY character-for-character into the CODE section. Do not truncate it.
+3. Copy the problem statement directly into the CONTEXT section.
 
-Extracts:
-{EXTRACTIONS}
+RAW TEXT TO ORGANIZE:
+{combined_raw}
 
-Return ONLY valid JSON. No markdown blocks outside the JSON, no explanations.
+Output EXACTLY in this format (use NONE for any section with no content):
+TOPIC: <one-line title — if LeetCode problem, prefix with "LeetCode: ">
+TAGS: <tag1, tag2, tag3>
+CONTEXT: <The problem statement, OR context of the codebase>
+IMPLEMENTATION: <The technical approach, algorithm, or architecture>
+CODE:
+<exact code block if present, else NONE>
+NOTES: <Constraints, edge cases, hints, or UI notes>
+
+Do NOT output anything before TOPIC:
+<end_of_turn>
+```
+
+### F. The OKF Merger
+**Purpose:** Merges an existing knowledge document with new information on the same topic, removing redundancy while keeping all unique code snippets and facts.
+**Temperature:** 0.1
+```text
+<start_of_turn>system
+You are merging two knowledge documents about the same topic.
+
+Existing document:
+{existing_json[:1000]}
+
+New information captured:
+{new_json[:800]}
+
+Produce ONE merged document. Keep all unique code snippets and facts from both. Remove redundancy.
+Output EXACTLY in this text format:
+TOPIC: <one-line topic title>
+TAGS: <tag1, tag2, tag3>
+CONTENT:
+<full markdown synthesis with code blocks if present>
+
+Do NOT wrap in JSON. Do NOT output anything before TOPIC:
 <end_of_turn>
 ```
 

@@ -207,32 +207,62 @@ class FlushWorker:
             self._last_raw_by_app[app_name] = raw_text
             # --------------------------------------------
 
-            # Chunk and extract — collect ALL extractions from this ONE OCR into a list
-            chunks = _chunk_text(raw_text, CHUNK_SIZE)
-            all_extractions = []
-            prev_extracted = ""
+            # --- PHASE 2: Splitting & Noise Filtering (UIA vs OCR) ---
+            is_uia_text = "===SECTION===" in raw_text
 
-            for chunk in chunks:
-                total_chunks += 1
-
-                # GATE: Skip obviously short UI noise before touching Gemma
-                if len(chunk.split()) < MIN_CHUNK_WORDS:
-                    continue
-
-                # Pass prev_extracted so Gemma knows what it was extracting before
-                extracted = self._engine.extract_ocr_chunk(chunk, prev_context = prev_extracted)
-
-                if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
-                    print(f"\n{_YELLOW}--- GEMMA EXTRACTED KNOWLEDGE ---{_RESET}")
-                    print(f"{_GREEN}{extracted}{_RESET}")
-                    print(f"{_YELLOW}---------------------------------{_RESET}\n")
+            if is_uia_text:
+                raw_sections = [s.strip() for s in raw_text.split("===SECTION===") if s.strip()]
+                chunks = []
+                
+                # THE PYTHON NOISE FILTER
+                for i, sec in enumerate(raw_sections):
+                    lines = sec.splitlines()
+                    if not lines: continue
                     
-                    all_extractions.append(extracted)
-                    prev_extracted = extracted
-                else:
-                    prev_extracted = chunk[:100] if chunk else ""
+                    print(f"{_CYAN}[FlushWorker] UIA Section {i+1}/{len(raw_sections)} - Length: {len(sec)} chars. Preview: {sec[:100].replace(chr(10), ' ')}...{_RESET}")
+                    
+                    # Optional: Heuristic to drop lists (commented out per your request)
+                    # avg_len = sum(len(l) for l in lines) / len(lines)
+                    # if len(lines) > 15 and avg_len < 40:
+                    #     continue
+                    
+                    if len(sec) > 4000:
+                        chunks.extend(_chunk_text(sec, 4000))
+                    else:
+                        chunks.append(sec)
+                        
+                # UIA text is already clean! Skip the Phase 3 "extractor" AI completely.
+                # Just pass the raw sections straight to the final synthesizer.
+                all_extractions = chunks
+                total_chunks += len(chunks)
+                
+            else:
+                # Fallback for old OCR: text is messy, so we MUST chunk it...
+                chunks = _chunk_text(raw_text, CHUNK_SIZE)
+                
+                # --- PHASE 3: AI Extraction (OCR Only) ---
+                all_extractions = []
+                prev_extracted = ""
 
-            # --- Final Synthesis Pass (ONE call per OCR) ---
+                for chunk in chunks:
+                    total_chunks += 1
+                    # GATE: Skip obviously short UI noise before touching Gemma
+                    if len(chunk.split()) < MIN_CHUNK_WORDS:
+                        continue
+
+                    print(f"  [Gemma] Extracting chunk {len(all_extractions)+1}/{len(chunks)}...")
+                    extracted = self._engine.extract_ocr_chunk(chunk, prev_context=prev_extracted)
+
+                    if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
+                        print(f"\n{_YELLOW}--- GEMMA EXTRACTED KNOWLEDGE ---{_RESET}")
+                        print(f"{_GREEN}{extracted}{_RESET}")
+                        print(f"{_YELLOW}---------------------------------{_RESET}\n")
+                        all_extractions.append(extracted)
+                        prev_extracted = extracted
+                    else:
+                        prev_extracted = chunk[:100] if chunk else ""
+
+            # --- PHASE 4: Final Synthesis Pass (ONE call per OCR) ---
             if all_extractions:
                 print(f"\n{_CYAN}  [Gemma] Synthesizing {len(all_extractions)} extractions into knowledge doc...{_RESET}")
                 

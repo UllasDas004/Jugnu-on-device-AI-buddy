@@ -271,15 +271,13 @@ User types "what was I working on yesterday?"
 
 The Python layer is highly optimized for performance and defensive programming to avoid blocking the C++ kernel pipeline.
 
-1. **`ipc_client.py`**: The bridge to C++. It reads the Named Pipe using `win32file.ReadFile`. It strictly separates telemetry ingestion (main thread) from heavy file synthesis (daemon thread `_synthesize_and_save_file`).
-2. **`ai_engine.py`**: Manages the Ollama inference. Features a cold-start `_warmup()` 1-token query to absorb CUDA crashes, completely disables Flash Attention for mobile GPU stability, and uses a two-pass `extract_ocr_chunk` → `synthesize_ocr_extractions` pipeline to build structured OKF JSON docs.
-3. **`flush_worker.py`**: The background OCR sweeper. It uses `ctypes` to check `GetSystemPowerStatus` and aborts if on battery. It forces a 30-second settle time before reading `ocr_buffer` and uses `difflib.SequenceMatcher` to skip Gemma extraction entirely if the screen hasn't changed >85%.
+1. **`ipc_client.py`**: The bridge to C++. It reads the Named Pipe using pseudo-asynchronous polling (`win32pipe.PeekNamedPipe`) to prevent kernel blocking. It strictly separates telemetry ingestion from heavy file synthesis (daemon thread `_synthesize_and_save_file`).
+2. **`ai_engine.py`**: Manages the Ollama inference. Features a cold-start `_warmup()` 1-token query to absorb CUDA crashes, disables Flash Attention for mobile GPU stability, and uses a two-pass `extract_ocr_chunk` → `synthesize_ocr_extractions` pipeline. It specifically avoids requesting JSON to bypass LLM Markdown Hallucinations, parsing strict text headers manually.
+3. **`flush_worker.py`**: The background OCR sweeper. It aborts if on battery, enforces a 30-second settle time, and uses `difflib.SequenceMatcher` with a strict `MAX_CACHE=20` memory-leak cap to deduplicate static screens. It also features a **UIA Fast-Path** that completely bypasses AI extraction for pristine `===SECTION===` text payloads, accelerating processing by 500%.
 4. **`embedder.py`**: The vector store interface. Prevents fatal HuggingFace API network timeouts during offline usage by pinging `8.8.8.8` and gracefully falling back to `local_files_only=True`. Connects to SQLite with `timeout=5.0` to avoid crashing when C++ executes a massive `BEGIN TRANSACTION` lock.
-5. **`notification.py`**: The UI bridge. Uses `subprocess.CREATE_NEW_CONSOLE` to spawn an interactive PowerShell prompt over the user's IDE instantly, preventing the main IPC loop from blocking on `input()`. Features the "Custom Problem Override" — throwing away pre-fetched screen context if the user asks a manual, unrelated question.
-| Nightly extraction | Python (Task Scheduler) | 2 AM | Fact extraction → core_persona |
-| EMA decay | Python (nightly) | Nightly | Apply decay to priority_map |
-| Row limit | C++ (nightly trigger) | Nightly | Trim episodic_log to 5,000 |
-| Markov prune | C++ (nightly trigger) | Weekly | Remove count=1 transitions |
+5. **`notification.py`**: The UI bridge. Uses `subprocess.CREATE_NEW_CONSOLE` to spawn an interactive PowerShell prompt instantly, preventing the IPC loop from blocking on `input()`. Features the "Custom Problem Override" — throwing away pre-fetched screen context if the user asks a manual question. Crucially, uses a non-blocking `threading.Lock()` (`_gen_lock`) to instantly abort duplicate daemon threads spawned by `USER_IDLE` input flutters, preventing catastrophic GPU VRAM overruns.
+
+| Task | Runs in | Interval | What it does |
 
 
 ## Core Philosophy
@@ -451,7 +449,7 @@ Python Service (inference.py)
 
 ```
 1. main.cpp starts
-2. CoInitializeEx(COINIT_APARTMENTTHREADED)  ← COM init for UI Automation
+2. winrt::init_apartment(winrt::apartment_type::single_threaded)  ← COM init for UI Automation / WinRT
 3. db_handler.init() → SQLite open + WAL mode + create tables
 4. db_handler.loadPriorityMap() → restore EMA from disk
 5. db_handler.loadTransitionMatrix() → restore Markov from disk

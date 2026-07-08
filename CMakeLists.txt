@@ -36,6 +36,7 @@ target_link_libraries(Jugnu PRIVATE
     Advapi32    # For process information
     Psapi       # For reading process names (GetModuleBaseName)
     windowsapp  # WinRT runtime (Windows.Media.Ocr, etc.)
+    UIAutomationCore    # Windows UI Automation — reads live text from Chrome, VS Code, etc.
 )
 
 # Add this if sqlite-vec fails to compile with MSVC

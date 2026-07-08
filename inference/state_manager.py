@@ -80,6 +80,26 @@ class StateManager:
         if self.clipboard_content:
             context += f"Clipboard: {self.clipboard_content[:300]}\n"
 
+        # Fetch the LIVE screen text from the UIA buffer!
+        try:
+            import sqlite3
+            conn = sqlite3.connect("jugnu.db", timeout=0.5)
+            row = conn.execute(
+                "SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1", 
+                (self.current_app,)
+            ).fetchone()
+            conn.close()
+            
+            if row and row[0]:
+                uia_text = row[0]
+                # Clean up the SECTION separators for the prompt
+                uia_text = uia_text.replace("===SECTION===", "\n")
+                if len(uia_text) > 4000:
+                    uia_text = uia_text[:4000] + "\n...[truncated]"
+                context += f"\nLive Screen Text:\n```\n{uia_text.strip()}\n```\n"
+        except Exception as e:
+            print(f"[StateManager] DB read error: {e}")
+
         if embedder:
             query = custom_problem or self.active_code_content[:200] or self.current_app
             # Try rich structured knowledge_docs first (OKF store)

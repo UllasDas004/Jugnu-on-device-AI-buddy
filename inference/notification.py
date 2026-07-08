@@ -142,16 +142,23 @@ def trigger_flow(state, engine, embedder,
             fresh_chunks = []
             fresh_sources = []
             
+            # 1. Always inject the current screen context so the AI knows what you're working on right now!
+            ctx = screen_context or state.generate_prompt_context(embedder=embedder)
+            if ctx:
+                fresh_chunks.append(f"[CURRENT SCREEN / RECENT WORK]\n{ctx}")
+                fresh_sources.append("Current Screen")
+            
+            # 2. Add historical knowledge from the vector database
             if fresh_results:
                 for doc in fresh_results:
                     fresh_sources.append(doc['topic'])
-                    fresh_chunks.append(f"[Topic: {doc['topic']}]\n{doc['content']}")
+                    fresh_chunks.append(f"[PAST KNOWLEDGE: {doc['topic']}]\n{doc['content']}")
             else:
                 # Fallback to episodic memory
                 memories = embedder.semantic_search(fresh_query, limit=3)
                 if memories:
-                    fresh_chunks = [m["snippet"] for m in memories]
-                    fresh_sources = ["past session memory"]
+                    fresh_chunks.extend([m["snippet"] for m in memories])
+                    fresh_sources.append("past session memory")
                     
             # Use the strict Q&A prompt!
             insight = engine.answer_with_context(custom_problem, fresh_chunks, fresh_sources)
