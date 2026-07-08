@@ -27,7 +27,7 @@ graph TD
     end
 
     subgraph "Named Pipe IPC"
-        AppSwitch -->|JSON Stream (Overlapped I/O)| Pipe((jugnu_ipc))
+        AppSwitch -->|JSON Stream - Overlapped I/O| Pipe((jugnu_ipc))
         FileMonitor -->|JSON Stream| Pipe
         ClipTracker -->|JSON Stream| Pipe
         TextCapture -->|Direct SQL Dump / IPC| OCRBuffer[(ocr_buffer DB)]
