@@ -19,6 +19,10 @@ class StateManager:
         self.last_coding_app = app_name
         self.last_coding_app_time = time.time()
 
+    def get_last_coding_app(self) -> str:
+        """Returns the last meaningful coding app, or empty string if none."""
+        return self.last_coding_app
+
     def was_recently_coding(self, within_minutes = 15):
         """Returns True if user was in a coding app within the last N minutes."""
         if not self.last_coding_app:

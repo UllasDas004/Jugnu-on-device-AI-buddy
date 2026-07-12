@@ -181,10 +181,13 @@ class FlushWorker:
         print(f"{_CYAN}[FlushWorker] Processing {len(rows)} buffered OCR rows...{_RESET}")
 
         ids_to_delete   = []
+        ids_failed      = []
         useful_saved    = 0
         total_chunks    = 0
         for row_id, app_name, raw_text in rows:
-            ids_to_delete.append(row_id)
+            # NOTE: We do NOT pre-queue for deletion here.
+            # A row is only deleted if it is successfully synthesized.
+            # Failed rows stay in ocr_buffer and are retried next cycle.
 
             # --- PHASE 1: Pre-Gemma OCR Deduplication ---
             if not hasattr(self, '_last_raw_by_app'):
@@ -262,41 +265,55 @@ class FlushWorker:
                     else:
                         prev_extracted = chunk[:100] if chunk else ""
 
-            # --- PHASE 4: Final Synthesis Pass (ONE call per OCR) ---
+            # --- PHASE 4: Final Synthesis Pass (ONE call per section per OCR) ---
             if all_extractions:
                 print(f"\n{_CYAN}  [Gemma] Synthesizing {len(all_extractions)} extractions into knowledge doc...{_RESET}")
-                
-                # Always save raw joined text to episodic_memories (the log)
+
+                # Always save raw joined text to episodic_memories (the raw log)
                 combined = "\n\n".join(all_extractions)
-                saved = self._embedder.save_memory(
+                self._embedder.save_memory(
                     app_name=app_name,
                     window_title=app_name,
                     text_content=combined,
                     file_path=None
                 )
 
-                # Try to produce a structured OKF JSON knowledge doc
-                doc_json = self._engine.synthesize_ocr_extractions(all_extractions)
+                # synthesize_ocr_extractions now returns a LIST of docs (one per UIA section)
+                doc_jsons = self._engine.synthesize_ocr_extractions(all_extractions)
 
-                if doc_json:
-                    print(f"\n{_YELLOW}━━━ SYNTHESIZED KNOWLEDGE DOC ━━━{_RESET}")
-                    import json
-                    doc = json.loads(doc_json)
-                    print(f"{_GREEN}TOPIC: {doc.get('topic','')}{_RESET}")
-                    print(f"{_CYAN}TAGS:  {', '.join(doc.get('tags', []))}{_RESET}")
-                    print(f"{_GREEN}{doc.get('content','')[:300]}...{_RESET}")
-                    print(f"{_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{_RESET}\n")
-                    saved = self._embedder.save_knowledge_doc(app_name, doc_json, self._engine)
+                if doc_jsons:
+                    any_saved = False
+                    for doc_json in doc_jsons:
+                        import json
+                        doc = json.loads(doc_json)
+                        print(f"\n{_YELLOW}━━━ SYNTHESIZED KNOWLEDGE DOC ━━━{_RESET}")
+                        print(f"{_GREEN}TOPIC: {doc.get('topic','')}{_RESET}")
+                        print(f"{_CYAN}TAGS:  {', '.join(doc.get('tags', []))}{_RESET}")
+                        print(f"{_GREEN}{doc.get('content','')[:300]}...{_RESET}")
+                        print(f"{_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{_RESET}\n")
 
-                    if saved:
-                        useful_saved += 1
-                        print(f"{_GREEN}[FlushWorker] Saved 1 combined memory from {len(all_extractions)} chunks.{_RESET}")
+                        saved = self._embedder.save_knowledge_doc(app_name, doc_json, self._engine)
+                        if saved:
+                            useful_saved += 1
+                            any_saved = True
+                            print(f"{_GREEN}[FlushWorker] Saved knowledge doc: '{doc.get('topic','')}'.{_RESET}")
+                        else:
+                            # Embedder returned False = semantic duplicate already in DB.
+                            # The knowledge is already there — still safe to delete the raw row.
+                            print(f"{_YELLOW}[FlushWorker] Doc '{doc.get('topic','')}' already in DB (duplicate). Row will be cleared.{_RESET}")
+
+                    # Always delete the row after synthesis ran — even if all were duplicates.
+                    # Leaving it in means infinite reprocessing of the same screen capture.
+                    if row_id not in ids_to_delete:
+                        ids_to_delete.append(row_id)
                 else:
-                    # JSON synthesis failed — raw text already saved to episodic_memories above
-                    print(f"{_YELLOW}  [FlushWorker] Synthesis failed — raw text saved to episodic_memories only.{_RESET}")
+                    # All sections failed synthesis — raw text already in episodic_memories
+                    print(f"{_YELLOW}  [FlushWorker] All sections failed synthesis — raw text saved to episodic_memories only.{_RESET}")
+                    ids_to_delete.append(row_id)
                     useful_saved += 1
             else:
                 print(f"{_YELLOW}  No useful content found in this OCR.{_RESET}")
+                ids_to_delete.append(row_id)  # No content = junk row, safe to delete
                 
         # DELETE: Clean up all rows just processed
         if ids_to_delete:

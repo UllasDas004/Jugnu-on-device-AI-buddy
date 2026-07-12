@@ -11,6 +11,7 @@ namespace Jugnu
     std::atomic<bool> WinMonitor::isRunning{false};
     HANDLE WinMonitor::hStuckThread = NULL;
     std::string WinMonitor::currentForegroundProcess = "";
+    std::string WinMonitor::lastMeaningfulApp = "";
 
     std::string WinMonitor::GetWindowTextString(HWND hwnd)
     {
@@ -96,7 +97,7 @@ namespace Jugnu
 
 
         if (ownPid == windowPid) {
-            std::cout << "[Debug] Ignored because ownPid == windowPid\n";
+            std::cout << "\033[90m[Debug] Ignored because ownPid == windowPid\033[0m\n";
             return;
         }
 
@@ -110,13 +111,16 @@ namespace Jugnu
         // If a window stole focus while the user was away, ignore it!
         if(IsUserIdle())
         {
-            std::cout << "[WinMonitor] Ignored Ghost Popup: User is AFK.\n";
+            std::cout << "\033[1;36m[WinMonitor]\033[0m Ignored Ghost Popup: User is AFK.\n";
             return;
         }
         
         // SAVE TO THE DATABASE
         Jugnu::DBHandler::LogAppSwitch(processName, windowTitle);
         Jugnu::MemoryManager::ProcessAppSwitch(processName, windowTitle);
+
+        // All filters passed — this is a real user-focused app. Safe to use in idle payload.
+        lastMeaningfulApp = processName;
 
         // GENERATE JSON AND BROADCAST TO PYTHON
         std::string payload = Jugnu::MemoryManager::GenerateContextJSON(processName);
@@ -237,7 +241,10 @@ namespace Jugnu
                     if (!hasTriggered)
                     {
                         std::cout << "\n\033[1;31m[StuckTimer]\033[0m User has been idle for 3 min. Notifying Python...\n";
-                        std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + currentForegroundProcess + "\"}";
+                        // Use lastMeaningfulApp (set AFTER all filters) not currentForegroundProcess
+                        // (set BEFORE filters, so Explorer.EXE poisons it on every taskbar hover)
+                        const std::string& idleApp = lastMeaningfulApp.empty() ? currentForegroundProcess : lastMeaningfulApp;
+                        std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + idleApp + "\"}";
                         Jugnu::IPCServer::SendMessageToPython(idlePayload);
                         hasTriggered = true; // Prevent spamming
                     }

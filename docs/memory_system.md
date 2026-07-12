@@ -22,6 +22,7 @@ The memory system is a three-tier architecture:
 ├─────────────────────────────────────────────────────────────────┤
 │  TIER 0: In-RAM (Hot — Instant access, 30-min flush)            │
 │  EMA priority_map: {"code.exe": 0.89, "chrome.exe": 0.73}      │
+│  Dynamic Governor: Throttles apps where 0 < EMA < 0.25          │
 │  Markov transitions: {"code|chrome|Morning" -> "chrome": 14}    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -184,3 +185,20 @@ The Markov Chain and EMA maps live in C++ RAM (`std::unordered_map`). A backgrou
 thread wakes every 30 minutes, takes a mutex lock, and calls `FlushMarkovEdges()`
 to persist them to SQLite. On next boot, `loadPriorityMap()` and `loadTransitionMatrix()`
 restore the full learned state. Maximum data loss on a crash = 30 minutes.
+
+---
+
+## 6. The Dynamic Process Priority Governor
+
+Instead of relying on hardcoded arrays of "distracting" apps (like Spotify, Discord, etc.), Jugnu uses the hot **EMA `priority_map`** to dynamically manage system resources during Deep Work sessions.
+
+### How it Works:
+When Jugnu detects a transition into a "Deep Work" state (high EMA app is foregrounded and the system identifies coding/studying intent), the `MemoryManager::ThrottleDistractors()` function runs.
+
+1. It iterates over all running OS processes.
+2. It queries the RAM `emaScores` map for each process.
+3. If an app has an EMA score that is **strictly greater than 0.0** but **below the `DISTRACTOR_THRESHOLD` (e.g. 0.25)**, Jugnu identifies it as a distractor app (e.g., an app you switch to rarely, but is currently running in the background consuming CPU).
+4. Jugnu issues a Win32 `SetPriorityClass` call to downgrade the process to `IDLE_PRIORITY_CLASS`, effectively choking it out from stealing CPU cycles from the compiler/LLM.
+
+**Why `> 0.0`?** 
+Unknown system services (like `svchost.exe` or `csrss.exe`) have a score of `0.0` because Jugnu has never seen the user explicitly switch to them. By only throttling apps with a score `> 0.0`, Jugnu ensures it never accidentally chokes critical Windows OS services, creating a perfectly safe, self-training governor.

@@ -22,7 +22,7 @@ namespace Jugnu
 
         // Create and launch the background thread
         workerThread = std::thread(RunLoop);
-        std::cout << "[FlushWorker] Background Consolidator Thread Started.\n";
+        std::cout << "\033[1;34m[FlushWorker]\033[0m Background Consolidator Thread Started.\n";
     }
 
     void FlushWorker::Stop()
@@ -63,30 +63,39 @@ namespace Jugnu
             // TRAP FIX: Battery Drain Check
             if(IsOnBattery())
             {
-                std::cout << "[FlushWorker] Laptop is on battery. Skipping heavy SQL flush to save power.\n";
+                std::cout << "\033[1;34m[FlushWorker]\033[0m Laptop is on battery. Skipping heavy SQL flush to save power.\n";
                 continue; // Skip to next loop iteration
             }
             
             FlushToDatabase();
         }
+
+        // TRAP FIX: C++ Destructor Protection
+        // When the program exits, this code ensures the database is closed
+        // and the thread is joined, preventing the "Windows is closing this app" crash.
+        std::cout << "\033[1;34m[FlushWorker]\033[0m System shutdown detected. Cleaning up...\n";
+        
+        // 1. Final flush of any remaining edges
+        FlushToDatabase();
     }
 
     void FlushWorker::FlushToDatabase()
     {
-        std::cout << "[FlushWorker] Waking up. Consolidating Markov scores to SQLite...\n";
+        std::cout << "\033[1;34m[FlushWorker]\033[0m Waking up. Consolidating Markov scores to SQLite...\n";
 
         // 1. Extract and clear the RAM matrix
         auto edges = Jugnu::MemoryManager::ExtractAndClearMarkovChain();
 
-        if(!edges.empty())
-        {
-            // 2. Push edge counts into the permanent SQL table
-            Jugnu::DBHandler::FlushMarkovEdges(edges);
-        }
+        if(!edges.empty()) Jugnu::DBHandler::FlushMarkovEdges(edges);
+
+        // 2. Flush EMA Priority Scores
+        auto scores = Jugnu::MemoryManager::GetEMAScores();
+        if(!scores.empty()) Jugnu::DBHandler::FlushEMAScores(scores);
+
 
         // 3. Delete the raw logs to save space
         Jugnu::DBHandler::ClearAppLogs();
 
-        std::cout << "[FlushWorker] Memory Flush Complete. Going back to sleep.\n\n";
+        std::cout << "\033[1;34m[FlushWorker]\033[0m Memory Flush Complete. Going back to sleep.\n\n";
     }
 }

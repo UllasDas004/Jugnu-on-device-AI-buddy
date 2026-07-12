@@ -7,7 +7,34 @@
 #include "db/db_handler.h"
 #include "monitor/clipboard_manager.h"
 #include "monitor/screen_reader.h"
+#include "monitor/memory_manager.h"
 
+
+BOOL WINAPI ConsoleHandler(DWORD signal)
+{
+    if(signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT)
+    {
+        std::cout << "\n\033[1;31m[System]\033[0m Emergency Shutdown Trap Triggered!\n";
+        
+        // Execute the exact same cleanup sequence to guarantee RAM flush
+        Jugnu::WinMonitor::Cleanup();
+        Jugnu::IPCServer::Stop();
+
+        // Because of our change in Step 1, this Stop() command will now completely 
+        // block the main thread until the final database flush is finished!
+        Jugnu::FlushWorker::Stop(); 
+        
+        Jugnu::FileWatcher::Stop();
+        Jugnu::ClipboardManager::Stop();
+        Jugnu::ScreenReader::Stop();
+        Jugnu::MemoryManager::Stop();
+        Jugnu::DBHandler::Cleanup();
+        
+        std::cout << "\033[1;32m[System]\033[0m Graceful exit complete. Goodbye!\n";
+        ExitProcess(0);
+    }
+    return true;
+}
 
 int main()
 {
@@ -21,12 +48,19 @@ int main()
     std::cout << "\033[1;36m       Jugnu C++ Engine Skeleton      \033[0m\n";
     std::cout << "\033[1;36m======================================\033[0m\n\n";
 
+    // Register our custom signal handler to trap Ctrl+C
+    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+    
     // Initialize the Database first
     if(!Jugnu::DBHandler::Init())
     {
         std::cerr<<"Failed to initialize database. Exiting.\n";
         return 1;
     }
+
+    // Initialize the Memory Manager (loads Markov history from DB)
+    Jugnu::MemoryManager::Init();
+
     // Initialize the windows monitor. This installs the Win32 hook
     // so the OS starts notifying us whenever the user switches apps.
     Jugnu::WinMonitor::Init();
@@ -77,6 +111,8 @@ int main()
     Jugnu::ClipboardManager::Stop();
     // Clean up Screen Reader
     Jugnu::ScreenReader::Stop();
+    // Stop the memory manager
+    Jugnu::MemoryManager::Stop();
     // Clean up DB
     Jugnu::DBHandler::Cleanup();
 

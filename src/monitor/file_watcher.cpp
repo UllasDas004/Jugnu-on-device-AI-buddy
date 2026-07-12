@@ -15,6 +15,8 @@ namespace Jugnu
         watchPath = directoryToWatch;
         isRunning = true;
         hThread = CreateThread(NULL, 0, WatcherThread, NULL, 0, NULL);
+
+        std::cout << "\033[1;35m[GhostWriter]\033[0m Watching directory: \033[4m" << watchPath << "\033[0m\n";
     }
 
     void FileWatcher::Stop()
@@ -27,6 +29,8 @@ namespace Jugnu
             CloseHandle(hThread);
             hThread = NULL;
         }
+
+        std::cout << "\033[1;35m[GhostWriter]\033[0m Stopped.\n";
     }
 
     static std::string EscapeJSON(const std::string& input)

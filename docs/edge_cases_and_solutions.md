@@ -443,3 +443,23 @@
 **Scenario:** Extracting text from Chrome or VS Code using `IUIAutomation`.
 **Problem:** Naive recursive DOM traversal caused nested UI elements to print their text multiple times (e.g., reading a `div`'s innerText and then reading its child `span`'s innerText). This exploded the text payload size, flooding the IPC pipe and destroying the LLM context window.
 **Solution:** Implemented a Breadth-First Search (BFS) traversal utilizing a `std::unordered_set<std::wstring>` (O(1) lookup) to strictly deduplicate text strings on the fly. Guaranteed pristine, non-overlapping text extraction.
+
+---
+
+## Category 9: RAG and Priority Governor Edge Cases (Phase 4.5 Updates)
+
+### EC-R1 — The "Explorer Poisoning" Problem
+**Situation:** User is coding in Chrome, their mouse hovers over the Windows Taskbar for a split second, and then they go idle. The `USER_IDLE` event triggers, but the active window is captured as `Explorer.EXE`. Jugnu tries to generate RAG context for the Windows shell instead of the actual coding problem.
+**Solution:** A dual-layer fix: 
+1. **C++ Layer:** Introduced `lastMeaningfulApp`. We track the foreground process, but only assign it to `lastMeaningfulApp` *after* all OS/Transient filters pass. The stuck timer uses this safe variable for the idle payload.
+2. **Python Layer:** If `USER_IDLE` arrives with an OS noise app (or empty string), Python falls back to `state.get_last_coding_app()` and updates `state.current_app` so that the live OCR DB query fetches the correct screen text.
+
+### EC-R2 — The "Greedy Problem Statement" Problem
+**Situation:** When generating a Knowledge Doc from a massive screen capture (like LeetCode), the UIA splits the screen into multiple sections. The AI Engine was designed to use a "best-wins" strategy — evaluating all sections and keeping only the single longest extraction.
+**Problem:** The LeetCode problem statement was longer than the user's C++ code snippet. The best-wins strategy ruthlessly discarded the user's actual code because it was shorter, making Jugnu blind to their solution.
+**Solution:** Changed `synthesize_ocr_extractions` to return a `list[str]`. *Every* section that produces valid structured knowledge is preserved as a separate JSON doc, ensuring both the problem context and the code are captured.
+
+### EC-R3 — The "Truncated JSON Merge" Trap
+**Situation:** The `Embedder` prevents duplicate entries by running a cosine similarity check. If two docs share a topic (`dist < 0.30`), it merges them using the LLM.
+**Problem:** The merge prompt brutally truncated the existing JSON doc to `1000` characters to save tokens. If the existing doc was a long problem statement, the JSON was abruptly sliced in half (`{"content": "Output...`), causing Gemma to completely hallucinate or drop the corrupted data during the merge.
+**Solution:** Increased the merge prompt truncation limits to `4000` characters to comfortably fit full JSON representations, and doubled the inference context window (`num_ctx = 8192`) to guarantee the LLM has enough memory to digest both full documents.

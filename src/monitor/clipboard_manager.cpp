@@ -13,6 +13,8 @@ namespace Jugnu
         if(isRunning) return;
         isRunning = true;
         hThread = CreateThread(NULL, 0, ClipboardThread, NULL, 0, NULL);
+
+        std::cout << "\033[1;36m[Clipboard]\033[0m Hooked into OS Clipboard updates.\n";
     }
 
     void ClipboardManager::Stop()
@@ -27,6 +29,8 @@ namespace Jugnu
             CloseHandle(hThread);
             hThread = NULL;
         }
+
+        std::cout << "\033[1;36m[Clipboard]\033[0m Stopped.\n";
     }
 
     DWORD WINAPI ClipboardManager::ClipboardThread(LPVOID lpParam)

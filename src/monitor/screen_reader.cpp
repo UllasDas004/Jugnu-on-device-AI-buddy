@@ -34,6 +34,8 @@ namespace Jugnu
         if(isRunning) return;
         isRunning = true;
         hThread = CreateThread(NULL, 0, ReaderThread, NULL, 0, NULL);
+
+        std::cout << "\033[1;32m[ScreenReader]\033[0m Started.\n";
     }
 
     void ScreenReader::Stop()
@@ -45,6 +47,8 @@ namespace Jugnu
             CloseHandle(hThread);
             hThread = NULL;
         }
+
+        std::cout << "\033[1;32m[ScreenReader]\033[0m Stopped.\n";
     }
 
     bool ScreenReader::ShouldCapture(const std::string& processName)

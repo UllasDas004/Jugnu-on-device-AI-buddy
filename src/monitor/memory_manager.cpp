@@ -8,6 +8,7 @@ namespace Jugnu
     std::mutex MemoryManager::memMutex;
     std::string MemoryManager::lastApp = "";
     std::unordered_map<std::string, std::unordered_map<std::string, int>> MemoryManager::markovChain;
+    std::unordered_map<std::string, std::unordered_map<std::string, int>> MemoryManager::historicalMarkovChain;
     std::list<std::string> MemoryManager::lruList;
     std::unordered_map<std::string, std::list<std::string>::iterator> MemoryManager::lruMap;
     std::unordered_map<std::string, float> MemoryManager::emaScores;
@@ -15,6 +16,25 @@ namespace Jugnu
     void MemoryManager::Init()
     {
         std::cout << "\033[35m[Memory]\033[0m Memory Manager Initialized.\n";
+
+        // Load history from DB into RAM for O(1) predictions
+        historicalMarkovChain = Jugnu::DBHandler::LoadMarkovEdges();
+        std::cout << "\033[35m[Memory]\033[0m Loaded " << historicalMarkovChain.size() << " historical Markov states.\n";
+
+        // Load priority scores from DB
+        emaScores = Jugnu::DBHandler::LoadEMAScores();
+        std::cout << "\033[35m[Memory]\033[0m Loaded " << emaScores.size() << " App Priorities.\n";
+    }
+    
+    void MemoryManager::Stop()
+    {
+        std::lock_guard<std::mutex> lock(memMutex);
+        markovChain.clear();
+        historicalMarkovChain.clear();
+        lruList.clear();
+        lruMap.clear();
+        emaScores.clear();
+        std::cout << "\033[35m[Memory]\033[0m Memory Manager shut down.\n";
     }
     
     
@@ -67,12 +87,32 @@ namespace Jugnu
         std::lock_guard<std::mutex> lock(memMutex);
         std::vector<std::string> predictions;
 
-        if(lastApp.empty() || markovChain.find(lastApp) == markovChain.end()) return predictions;
+        bool inSession = markovChain.find(lastApp) != markovChain.end();
+        bool inHistory = historicalMarkovChain.find(lastApp) != historicalMarkovChain.end();
+
+        if(lastApp.empty() || (!inSession && !inHistory)) return predictions;
+
+        // Combine counts from History Map + 30-min Session Map
+        std::unordered_map<std::string, int> combinedEdges;
+
+        // 1. Weight the Past (History) Higher! (to prevent reset on short breaks)
+        if(inHistory)
+        {
+            for(const auto& edge : historicalMarkovChain[lastApp])
+            combinedEdges[edge.first] += edge.second;
+        }
+
+        // 2. Add the Current Session Count
+        if(inSession)
+        {
+            for(const auto& edge : markovChain[lastApp])
+            combinedEdges[edge.first] += edge.second;
+        }
 
         // Sort the next apps by frequency count
         std::vector<std::pair<std::string, int>> sortedApps(
-            markovChain[lastApp].begin(),
-            markovChain[lastApp].end()
+            combinedEdges.begin(),
+            combinedEdges.end()
         );
 
         std::sort(sortedApps.begin(), sortedApps.end(),
@@ -93,6 +133,13 @@ namespace Jugnu
 
         // Copy the current map
         auto edges = markovChain;
+
+        // Absorb the 30-min buffer into our permanent RAM history so we don't forget it!
+        for (const auto& sourceNode : markovChain)
+        {
+            for (const auto& targetNode : sourceNode.second)
+                historicalMarkovChain[sourceNode.first][targetNode.first] += targetNode.second;
+        }
 
         // CRITICAL: Clear RAM ONLY AFTER copy to prevent data loss
         markovChain.clear();
@@ -217,13 +264,23 @@ namespace Jugnu
         if(currentApp == lastThrottledFor) return;
         lastThrottledFor = currentApp;
 
+        // --- FULLY DYNAMIC: No hardcoded names. Pure EMA data. ---
+        // Thresholds (tune these after a week of real usage data)
+        constexpr float DEEP_WORK_THRESHOLD  = 0.6f;  // "I use this app intensely and stay in it"
+        constexpr float DISTRACTOR_THRESHOLD  = 0.2f;  // "This process is running but I rarely focus on it"
+        // Is the CURRENT focused app a deep work app? Let the EMA score decide!
+        float currentScore = 0.0f;
+        auto it = emaScores.find(currentApp);
+        if(it != emaScores.end()) currentScore = it->second;
+
         // Define what constitutes a "Deep Work" app
-        bool isDeepWork = (currentApp == "code.exe" || currentApp == "devenv.exe" || currentApp == "pwsh.exe");
+        bool isDeepWork = (currentScore >= DEEP_WORK_THRESHOLD);
 
-        // If we are deep working, choke the distractors. If we switch to a distractor, restore it!
-        DWORD newPriority = isDeepWork ? IDLE_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS;
+        if(isDeepWork)
+        std::cout << "\033[33m[Governor]\033[0m Deep Work detected on " << currentApp 
+                      << " (EMA=" << currentScore << "). Throttling distractors...\n";
 
-        // Take a snapshot of every process running on the OS right now
+        // Scan ALL running processes and let EMA scores decide who to throttle
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if(hSnapshot == INVALID_HANDLE_VALUE) return;
 
@@ -235,21 +292,51 @@ namespace Jugnu
             do
             {
                 std::string exeName = pe32.szExeFile;
-                // Add your common distactors here
-                if(exeName == "Discord.exe" || exeName == "Spotify.exe" || exeName == "slack.exe")
+                // Skip ourselves, system processes, and the current focused app
+                if(exeName == currentApp || exeName == "System" || 
+                   exeName == "svchost.exe" || exeName == "explorer.exe") continue;
+
+                float score = 0.0f;
+                auto scoreIt = emaScores.find(exeName);
+                if(scoreIt != emaScores.end()) score = scoreIt->second;
+
+                // Only act on apps we have actually SEEN before (score > 0)
+                // Unknown background processes (score == 0) are left alone entirely
+
+                if(score == 0.0f) continue;
+                // A "distractor" is an app you rarely switch to (low EMA) but is running
+                bool isDistractor = (score < DISTRACTOR_THRESHOLD);
+
+                DWORD newPriority;
+                if(isDeepWork && isDistractor) newPriority = IDLE_PRIORITY_CLASS;
+                else newPriority = NORMAL_PRIORITY_CLASS;
+                
+                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
+                if(hProcess)
                 {
-                    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
-                    if(hProcess)
+                    DWORD currentPriority = GetPriorityClass(hProcess);
+                    // Only set if it actually needs to change (avoid redundant syscalls!)
+                    if(currentPriority != newPriority)
                     {
                         SetPriorityClass(hProcess, newPriority);
-                        CloseHandle(hProcess);
-
-                        if(isDeepWork) std::cout << "\033[33m[Governor]\033[0m Throttled CPU Priority for " << exeName << " to save cache.\n";
-                        else std::cout << "\033[33m[Governor]\033[0m Restored CPU Priority for " << exeName << ".\n";
+                        if(isDeepWork && isDistractor)
+                            std::cout << "\033[33m[Governor]\033[0m Throttled " << exeName 
+                                      << " (EMA=" << score << ")\n";
+                        else
+                            std::cout << "\033[33m[Governor]\033[0m Restored  " << exeName 
+                                      << " (EMA=" << score << ")\n";
                     }
+                    CloseHandle(hProcess);
                 }
             } while(Process32Next(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
+    }
+
+    std::unordered_map<std::string, float> MemoryManager::GetEMAScores()
+    {
+        std::lock_guard<std::mutex> lock(memMutex);
+        // Returns a copy of the scores. We DO NOT clear them, because EMA is a lifetime rolling average!
+        return emaScores; 
     }
 } // namespace Jugnu

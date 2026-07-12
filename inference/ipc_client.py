@@ -261,10 +261,27 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         except Exception as e:
                                             print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
-                                    current_app = payload.get('current_app', '').lower()
-                                    
-                                    # Check VETO apps first
-                                    if any(v in current_app for v in VETO_APPS):
+                                    current_app = payload.get('current_app', '')
+                                    current_app_lower = current_app.lower()
+
+                                    # FIX: If idle fired while Explorer/Shell is foreground
+                                    # (e.g., user alt-tabbed to desktop), use the last
+                                    # meaningful coding app instead of OS noise.
+                                    if any(n in current_app_lower for n in OS_NOISE) or current_app_lower == "":
+                                        fallback = state.get_last_coding_app()
+                                        if fallback:
+                                            print(f"\033[90m[System] Idle on OS shell ({current_app}). Using last coding context: {fallback}\033[0m")
+                                            current_app = fallback
+                                            current_app_lower = fallback.lower()
+                                            # CRITICAL: update state so generate_prompt_context
+                                            # queries the correct app's live OCR data from DB!
+                                            state.current_app = fallback
+                                        else:
+                                            print("\033[90m[System] Idle on OS shell with no prior coding context. Skipping.\033[0m")
+                                            continue  # type: ignore[misc]
+
+                                    # Check VETO apps
+                                    if any(v in current_app_lower for v in VETO_APPS):
                                         print(f"\033[90m[System] Veto app ({current_app}) detected. Skipping RAG.\033[0m", flush=True)
                                     elif state.was_recently_coding():
 

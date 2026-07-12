@@ -845,7 +845,47 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 **Result:**
 | Metric | PeekNamedPipe (K-15 fix) | Overlapped I/O (K-16) |
 |---|---|---|
-| CPU while idle | Wakes 10x/sec | 0% |
-| Kernel calls/day | 864,000 | ~0 |
 | Disconnect latency | 100ms max | <1ms |
 | Clean shutdown | Eventually | Instant |
+
+---
+
+## Group L: Phase 4.5 — Governor, OCR Synthesis & RAG Context
+
+### Trap L-1: Process Governor Hardcoded Array Bypass
+**Problem:** The process governor (`MemoryManager::ThrottleDistractors`) relied on a hardcoded string array (`DISTRACTOR_APPS`) to target and throttle processes like Spotify during deep work. However, the system's core intelligence (`EMA scores`) tracked process priorities dynamically. As the user installed new apps (e.g., Discord, WhatsApp desktop), the C++ engine ignored them because they weren't explicitly hardcoded, leaking CPU cycles during deep coding sessions.
+**Fix:** Removed the hardcoded array entirely. Modified the `ThrottleDistractors` function to query the dynamic `emaScores` hash map. Apps with an EMA score strictly greater than `0.0` but below a `DISTRACTOR_THRESHOLD` (e.g., `< 0.25`) are now dynamically identified and throttled. Unknown background processes (`score == 0.0`) are left untouched, ensuring safe OS operation while creating a true "Self-Training Governor."
+
+### Trap L-2: Llama-Server CUDA Stack Overflow on Massive Contexts
+**Problem:** A UIA screen capture of a full IDE or browser window can easily exceed 20,000 characters. When this raw string was fed directly into `Gemma` via the Ollama API, the internal `llama-server` process suffered a fatal `0xc0000409` (Stack Buffer Overrun) CUDA error and crashed.
+**Fix:** Implemented Section-Wise Synthesis. `flush_worker.py` now explicitly chunks massive UIA returns using the `===SECTION===` delimiters. Each section is capped at `3000` characters and passed to the LLM individually. This keeps the prompt safely within the `4096` token context window, completely eliminating the stack overflow crashes.
+
+### Trap L-3: The Greedy Extraction Logic (Code Loss)
+**Problem:** After moving to Section-Wise Synthesis, the AI Engine was configured to use a "best-wins" selection strategy: it generated JSON for each section, but only returned the longest output to `flush_worker.py`. On LeetCode, the section containing the problem statement generated a larger output than the section containing the user's C++ code snippet. The AI Engine ruthlessly discarded the code snippet, blinding Jugnu to the user's actual work.
+**Fix:** Removed the best-wins logic. `synthesize_ocr_extractions` now returns a `list[str]` containing *all* valid JSON outputs from every section. `flush_worker.py` loops over this list and commits every valid knowledge doc to the database, ensuring no semantic context is lost.
+
+### Trap L-4: Destructive JSON Truncation During Merges
+**Problem:** To prevent database bloat, `save_knowledge_doc` checks the vector database for existing docs with a cosine similarity `< 0.30`. If it finds a match, it calls `merge_knowledge_docs` via the LLM. However, the merge prompt aggressively truncated the `existing_json` payload to `1000` characters to save tokens. This literally sliced the JSON string in half, feeding broken syntax (e.g., `{"content": "abc...`) to the LLM, which caused it to hallucinate or drop the data entirely.
+**Fix:** Increased the string truncation limits to `4000` characters to accommodate full JSON payloads, and doubled the `num_ctx` to `8192` tokens for the merge API call to ensure the LLM has enough memory to digest both full documents simultaneously.
+
+### Trap L-5: Explorer.EXE Poisoning the Idle Context
+**Problem:** If the user is coding, but hovers their mouse over the Windows Taskbar immediately before going AFK, the `USER_IDLE` event triggers with `Explorer.EXE` as the current foreground process. When Python receives this, it generates an empty KNN search query (because Explorer has no coding context) and fails to fetch relevant RAG documents.
+**Fix:** 
+1. In `win_monitor.cpp`, introduced `lastMeaningfulApp`. This string is only updated *after* the Explorer/OS transient filters pass. The idle timer uses this variable instead of the raw active window.
+2. In `ipc_client.py`, if an OS noise app bypasses C++, we fallback to `state.get_last_coding_app()`. Crucially, we also set `state.current_app = fallback` so that subsequent DB queries (`generate_prompt_context`) fetch the correct live OCR data.
+
+### Trap L-6: Infinite Re-Synthesis Loop on Duplicates
+**Problem:** The `flush_worker.py` clears processed rows from the `ocr_buffer` by checking if `save_knowledge_doc` returned `True`. However, if the LLM successfully synthesized docs, but the Embedder identified them as semantic duplicates and skipped saving them, `save_knowledge_doc` returns `False`. Because of this, the `row_id` was never appended to the deletion queue, causing the same OCR row to be re-processed by the LLM every 60 seconds infinitely.
+**Fix:** Restructured the deletion logic. The `row_id` is now explicitly appended to the deletion queue as long as the synthesis phase ran (whether the docs were saved, merged, or discarded as duplicates), ensuring raw staging rows are always purged after one attempt.
+
+### Trap L-7: The Markov Amnesia Trap (Boot Initialization)
+**Problem:** The C++ `MemoryManager` tracked Markov transitions and EMA priorities in lightning-fast RAM `std::unordered_map`s. However, during initialization, the C++ engine failed to `SELECT` and load the historical data from the SQLite database. Every time Jugnu was restarted, the RAM maps initialized empty, completely erasing all long-term learned behavioral patterns and treating every day as Day 1.
+**Fix:** Implemented `DBHandler::LoadMarkovChain()` and `DBHandler::LoadEMAScores()` to properly hydrate the RAM maps at startup before the `WinMonitor` hooks attach, ensuring continuity of learned intelligence.
+
+### Trap L-8: The Ghost Flusher Deadlock
+**Problem:** The `MemoryManager` was supposed to dump the hot RAM state (EMA and Markov chains) to SQLite every 30 minutes to prevent data loss on a crash. However, the background flush loop was silently hanging because it attempted to take an exclusive database `std::mutex` lock that was already held by the active `WinMonitor` thread writing a rapid stream of `app_switch` events.
+**Fix:** SQLite WAL mode natively handles concurrent writers and readers, but the C++ application-level `std::mutex` was unnecessarily blocking threads. Refactored the locking strategy in `MemoryManager` to use highly granular, map-specific `std::shared_mutex` for RAM protection (allowing multiple readers/one writer for the maps) while letting SQLite handle its own internal locking for disk writes.
+
+### Trap L-9: The Unhandled Exception Data Vaporization
+**Problem:** Even with the 30-minute background flush, if the C++ engine crashed (e.g., due to an access violation or unhandled exception) at minute 29, nearly half an hour of learned Markov transitions and EMA scores would be permanently vaporized from RAM.
+**Fix:** Implemented a global exception handler using Windows API's `SetUnhandledExceptionFilter()`. When a fatal crash occurs, the OS pauses the process destruction and passes execution to our custom handler. The handler immediately calls `MemoryManager::FlushMarkovEdges()` and `MemoryManager::FlushEMAScores()` to forcibly write the hot RAM state to SQLite one last time before allowing the process to gracefully die, achieving near-zero data loss.

@@ -55,6 +55,15 @@ namespace Jugnu
         )";
         if(!ExecuteSQL(create_app_log_sql)) return false;
 
+        // Create the App Priorities Table
+        std::string create_priorities_sql = R"(
+            CREATE TABLE IF NOT EXISTS app_priorities(
+                process_name TEXT PRIMARY KEY,
+                ema_score REAL NOT NULL
+            );
+        )";
+        if(!ExecuteSQL(create_priorities_sql)) return false;
+
         // Create the Markov Edges Table
         std::string create_markov_edges_sql = R"(
             CREATE TABLE IF NOT EXISTS markov_edges(
@@ -146,7 +155,7 @@ namespace Jugnu
         {
             sqlite3_close(db);
             db = nullptr;
-            std::cout<<"[DB] SQLite Database Closed.\n";
+            std::cout<<"\033[1;33m[DB]\033[0m SQLite Database Closed.\n";
         }
     }
 
@@ -181,6 +190,28 @@ namespace Jugnu
             return false;
         }
         return true;
+    }
+    
+    std::unordered_map<std::string, std::unordered_map<std::string, int>> DBHandler::LoadMarkovEdges()
+    {
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> edges;
+        if(!db) return edges;
+
+        std::string sql = "SELECT source_app, target_app, transition_count FROM markov_edges;";
+        sqlite3_stmt* stmt;
+
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            while(sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                std::string source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                std::string target = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                int count = sqlite3_column_int(stmt, 2);
+                edges[source][target] = count;
+            }
+            sqlite3_finalize(stmt);
+        }
+        return edges;
     }
 
     bool DBHandler::FlushMarkovEdges(const std::unordered_map<std::string, std::unordered_map<std::string,int>>& edges)
@@ -228,8 +259,58 @@ namespace Jugnu
     {
         if(!db) return false;
 
-        std::cout << "[DB] Clearing raw app logs...\n";
+        std::cout << "\033[1;33m[DB]\033[0m Clearing raw app logs...\n";
         return ExecuteSQL("DELETE FROM app_log;");
+    }
+
+    std::unordered_map<std::string, float> DBHandler::LoadEMAScores()
+    {
+        std::unordered_map<std::string, float> scores;
+        if(!db) return scores;
+
+        std::string sql = "SELECT process_name, ema_score FROM app_priorities;";
+        sqlite3_stmt* stmt;
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            while(sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                std::string process = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                float score = static_cast<float>(sqlite3_column_double(stmt, 1));
+                scores[process] = score;
+            }
+            sqlite3_finalize(stmt);
+        }
+        return scores;
+    }
+
+    bool DBHandler::FlushEMAScores(const std::unordered_map<std::string, float>& scores)
+    {
+        if(!db) return false;
+        ExecuteSQL("BEGIN TRANSACTION;");
+
+        // UPSERT the scores. If the app exists, update its score. If not, insert it.
+        std::string sql = R"(
+            INSERT INTO app_priorities (process_name, ema_score) VALUES (?, ?) 
+            ON CONFLICT(process_name) DO UPDATE SET ema_score = excluded.ema_score;
+        )";
+
+        sqlite3_stmt* stmt;
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        {
+            ExecuteSQL("ROLLBACK;");
+            return false;
+        }
+
+        for(const auto& [process, score] : scores)
+        {
+            sqlite3_bind_text(stmt, 1, process.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(stmt, 2, score);
+            sqlite3_step(stmt);
+            sqlite3_reset(stmt);
+        }
+        sqlite3_finalize(stmt);
+        ExecuteSQL("COMMIT;");
+        return true;
     }
 
     bool DBHandler::UpsertAppPath(const std::string& processName, const std::string& absolutePath)

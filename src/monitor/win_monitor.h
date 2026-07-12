@@ -31,7 +31,8 @@ namespace Jugnu
         
         static std::atomic<bool> isRunning;
         static HANDLE hStuckThread;
-        static std::string currentForegroundProcess;
+        static std::string currentForegroundProcess;  // Raw — updated BEFORE filters (not safe for idle payload)
+        static std::string lastMeaningfulApp;          // Safe — updated AFTER all filters pass
         static DWORD WINAPI StuckTimerThread(LPVOID lpParam);
         
         // The callback function that Windows OS calls whenever an event occurs

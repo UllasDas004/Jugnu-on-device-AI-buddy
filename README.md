@@ -49,7 +49,10 @@ graph TD
 ---
 
 ## 🚀 What It Does Right Now (Phase 5 Completed)
-Jugnu has successfully completed **Phase 5: UIA Fast-Path & IPC Hardening**.
+Jugnu has successfully completed **Phase 4.5 & 5: Dynamic Governor & IPC Hardening**.
+- **Dynamic Process Governor**: Uses an Exponential Moving Average (EMA) map to intelligently throttle background distractor apps during deep work sessions, completely eliminating hardcoded process lists and protecting critical OS services.
+- **Section-Wise RAG Synthesis**: Hardened the Python OCR pipeline against CUDA stack overflows by processing massive 20,000-character screen captures in bounded chunks. Guarantees long problem statements and short code snippets are both successfully captured and merged into the vector database.
+- **Resilient Memory Persistence**: SQLite Write-Ahead Logging (WAL) handles concurrent database locks, while a custom `SetUnhandledExceptionFilter` guarantees the last 30 minutes of learned RAM state is forcibly flushed to disk before any fatal process crashes.
 - **The C++ GhostWriter**: Deep Win32 hooks actively track Window switching, idle time, and File Saves with zero OS bloat.
 - **UIA Fast-Path & OCR Engine**: For known text-heavy apps (VS Code, Chrome), Jugnu instantly traverses the accessibility DOM via `IUIAutomation` for 100% pristine text extraction, bypassing heavy GPU workloads. For other apps, it silently falls back to capturing `BitBlt` screenshots and extracting text via `Windows.Media.Ocr` on the GPU.
 - **Non-Blocking IPC**: Uses Asynchronous Overlapped I/O with `WaitForMultipleObjects` to stream JSON telemetry and `===SECTION===` UIA blocks over Named Pipes without ever deadlocking the C++ engine.

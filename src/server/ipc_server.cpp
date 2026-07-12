@@ -55,6 +55,8 @@ namespace Jugnu
                 hStopEvent = NULL;
             }
         }
+
+        std::cout << "\033[1;33m[IPCServer]\033[0m Stopped.\n";
     }
 
     bool IPCServer::SendMessageToPython(const std::string& message)
@@ -100,9 +102,9 @@ namespace Jugnu
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, // Block until data arrives
                 1,                                             // Max instances (only 1 python script allowed)
                 4096,                                           // Output buffer size (4KB)
-            4096,                                           // Input buffer size (4KB)
-            0,                                              // Default timeout
-            NULL                                            // Default security attributes
+                4096,                                           // Input buffer size (4KB)
+                0,                                              // Default timeout
+                NULL                                            // Default security attributes
             );
 
             if(hPipe == INVALID_HANDLE_VALUE)
