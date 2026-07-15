@@ -1,5 +1,9 @@
 import ollama
+from torch._dynamo import source
+import ollama
 import json
+import os
+import re
 
 class AIEngine:
     def __init__(self):
@@ -40,7 +44,7 @@ class AIEngine:
 
     def generate_insight(self, context_str):
         # Hard-truncate context to prevent KV-cache overrun (caused the 0xc0000409 crash)
-        context_str = context_str[:1200]
+        context_str = context_str[:3000]
 
         prompt = f"""You are Jugnu, a senior technical AI assistant.
         The developer might be stuck or pausing to think. Here is their current OS and editor context:
@@ -183,7 +187,7 @@ class AIEngine:
 
         context_block = "\n\n---\n\n".join(context_chunks)
         # Hard cap context to avoid KV overrun
-        context_block = context_block[:1500]
+        context_block = context_block[:6000]
 
         source_hint = ""
         if sources:
@@ -206,7 +210,7 @@ class AIEngine:
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
-                    "num_ctx": 2048,
+                    "num_ctx": 4096,
                     "num_predict": 300,
                     "flash_attn": False,
                 }
@@ -218,141 +222,38 @@ class AIEngine:
         except Exception as e:
             return f"Ollama error: {e}"
 
-    def synthesize_ocr_extractions(self, extractions: list[str]) -> list[str]:
+    def extract_section(self, text: str, control_type: str) -> dict | None:
         """
-        Section-wise synthesis: process each UIA section independently with
-        a safe character cap, then return ALL valid results as a list.
-        Each rich section becomes its own knowledge doc — nothing gets thrown away.
-        Prevents llama-server stack/context overflow when UIA captures large buffers.
+        Extracts structured knowledge from ONE UIA section (Document or Text type).
+        Returns: {content, tags, mini_summary} or None.
         """
-        MAX_SECTION_CHARS = 3000  # Safe for 4096 token ctx with system prompt overhead
-
-        all_docs: list[str] = []  # Collect ALL valid sections
-
-        for i, section in enumerate(extractions):
-            section = section[:MAX_SECTION_CHARS]
-
-            prompt = f"""You are a strict technical knowledge organizer.
-You are given raw screen text from a developer's screen.
-Your ONLY job is to organize this text into the structured sections below.
-
-CRITICAL RULES:
-1. DO NOT summarize, paraphrase, or pass judgement on the code.
-2. Copy the ENTIRE code block EXACTLY character-for-character into the CODE section.
-3. Copy the problem statement directly into the CONTEXT section.
-
-RAW TEXT TO ORGANIZE:
-{section}
-
-Output EXACTLY in this format (use NONE for any section with no content):
-TOPIC: <one-line title — if LeetCode problem, prefix with "LeetCode: ">
-TAGS: <tag1, tag2, tag3>
-CONTEXT: <The problem statement, OR context of the codebase>
-IMPLEMENTATION: <The technical approach, algorithm, or architecture>
-CODE:
-<exact code block if present, else NONE>
-NOTES: <Constraints, edge cases, hints, or UI notes>
-
-Do NOT output anything before TOPIC:"""
-
-            try:
-                print(f"\033[35m[Gemma]\033[0m Synthesizing section {i+1}/{len(extractions)}...")
-                response = ollama.chat(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    think=False,
-                    options={
-                        "num_ctx": 4096,
-                        "num_predict": 1024,   # Synthesis output doesn't need 2048 tokens
-                        "temperature": 0.1,
-                        "flash_attn": False,
-                    }
-                )
-                raw = ""
-                if hasattr(response, 'message') and response.message:
-                    raw = (response.message.content or '').strip()
-
-                if not raw:
-                    print(f"\033[91m[AIEngine] Gemma returned empty for section {i+1}\033[0m")
-                    continue
-
-                # Parse the structured response
-                topic = ""
-                tags = []
-                sections = {"CONTEXT": [], "IMPLEMENTATION": [], "CODE": [], "NOTES": []}
-                current_section = None
-
-                for line in raw.split('\n'):
-                    if line.startswith("TOPIC:"):
-                        current_section = None
-                        topic = line.replace("TOPIC:", "").strip()
-                    elif line.startswith("TAGS:"):
-                        current_section = None
-                        tags = [t.strip() for t in line.replace("TAGS:", "").split(',') if t.strip()]
-                    elif line.startswith("CONTEXT:"):        current_section = "CONTEXT"
-                    elif line.startswith("IMPLEMENTATION:"): current_section = "IMPLEMENTATION"
-                    elif line.startswith("CODE:"):           current_section = "CODE"
-                    elif line.startswith("NOTES:"):          current_section = "NOTES"
-                    elif current_section:
-                        sections[current_section].append(line)
-
-                content_parts = []
-                ctx_text = "\n".join(sections["CONTEXT"]).strip()
-                if ctx_text and ctx_text != "NONE":
-                    content_parts.append(f"CONTEXT:\n{ctx_text}")
-
-                imp_text = "\n".join(sections["IMPLEMENTATION"]).strip()
-                if imp_text and imp_text != "NONE":
-                    content_parts.append(f"IMPLEMENTATION:\n{imp_text}")
-
-                code_text = "\n".join(sections["CODE"]).strip()
-                if code_text and code_text != "NONE":
-                    content_parts.append(f"CODE:\n```\n{code_text}\n```")
-
-                notes_text = "\n".join(sections["NOTES"]).strip()
-                if notes_text and notes_text != "NONE":
-                    content_parts.append(f"NOTES:\n{notes_text}")
-
-                content = "\n\n".join(content_parts)
-
-                # Collect ALL sections that have real content — not just the best one
-                if topic and content:
-                    all_docs.append(json.dumps({"topic": topic, "tags": tags, "content": content}))
-                    print(f"\033[32m[Gemma] Successfully synthesized section {i+1} ('{topic}')\033[0m")
-
-
-            except Exception as e:
-                print(f"\033[1;31m[AIEngine] Section {i+1} synthesis failed: {e}\033[0m")
-                continue  # One bad section doesn't kill the entire batch
-
-        return all_docs
-    
-    def merge_knowledge_docs(self, existing_json: str, new_json: str) -> str:
+        prompt = f"""
+            You are extracting technical knowledge from a developer's screen.
+            This text is from a {control_type} UI element.
+            CRITICAL: You are an EXTRACTOR ONLY. Copy content VERBATIM. Do NOT generate or infer anything.
+            If the text has no useful technical content (UI labels, dates, navigation links), output: NONE
+            
+            Extract:
+            TOPIC: One line — what is this about? (e.g. "Find the Number of Subsequences With Equal GCD")
+            TAGS: 3-6 semantic tags (comma separated).
+            NOTES: Any hints, constraints, or edge cases. If none, leave blank.
+            CONTENT:
+            <Copy the relevant explanatory technical text (problem statements, docs) verbatim. Skip UI chrome.>
+            
+            RAW TEXT:
+            {text}
+            
+            Output TOPIC, TAGS, NOTES, then CONTENT. Nothing else. If nothing useful, output: NONE
         """
-        Merges an existing knowledge doc with a new synthesis from the same topic.
-        Returns the merged JSON string, or empty string on failure.
-        """
-        prompt = f"""You are merging two knowledge documents about the same topic.
-        Existing document:
-        {existing_json[:4000]}
-        New information captured:
-        {new_json[:4000]}
-        Produce ONE merged document. Keep all unique code snippets and facts from both. Remove redundancy.
-        Output EXACTLY in this text format:
-        TOPIC: <one-line topic title>
-        TAGS: <tag1, tag2, tag3>
-        CONTENT:
-        <full markdown synthesis with code blocks if present>
-        Do NOT wrap in JSON. Do NOT output anything before TOPIC:"""
-
         try:
+            print(f"\033[35m[Gemma]\033[0m Extracting {control_type} section ({len(text)} chars)...")
             response = ollama.chat(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
-                    "num_ctx": 8192,
-                    "num_predict": 2048,
+                    "num_ctx": 4096,
+                    "num_predict": 1200,
                     "temperature": 0.1,
                     "flash_attn": False,
                 }
@@ -360,27 +261,83 @@ Do NOT output anything before TOPIC:"""
             raw = ""
             if hasattr(response, 'message') and response.message:
                 raw = (response.message.content or '').strip()
-                
-            topic = ""
-            tags = []
-            content = ""
+            if not raw or raw.upper() == "NONE":
+                return None
             
-            lines = raw.split('\n')
-            for i, line in enumerate(lines):
+            tags = []
+            topic = ""
+            notes = ""
+            content = ""
+            mode = None
+
+            for line in raw.split('\n'):
                 if line.startswith("TOPIC:"):
                     topic = line.replace("TOPIC:", "").strip()
                 elif line.startswith("TAGS:"):
-                    tags_raw = line.replace("TAGS:", "").strip()
-                    tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+                    tags = [t.strip().lower() for t in line.replace("TAGS:", "").split(',') if t.strip()]
+                elif line.startswith("NOTES:"): 
+                    notes = line.replace("NOTES:", "").strip()
+                    mode = "notes"
                 elif line.startswith("CONTENT:"):
-                    content = "\n".join(lines[i+1:]).strip()
-                    break
-
-            if topic and content:
-                doc = {"topic": topic, "tags": tags, "content": content}
-                return json.dumps(doc)
-            return ""
-
+                    mode = "content"
+                elif mode == "notes":
+                    notes += "\n" + line
+                elif mode == "content":
+                    content += "\n" + line
+            
+            content, notes = content.strip(), notes.strip()
+            if not content or content.upper() == "NONE":
+                return None
+                
+            return {"content": content, "tags": tags, "notes": notes, "topic": topic}
         except Exception as e:
-            print(f"\033[1;31m[AIEngine] merge_knowledge_docs failed: {e}\033[0m")
-            return ""
+            print(f"\033[1;31m[AIEngine] extract_section failed: {e}\033[0m")
+            return None
+
+    def combine_sections(self, extractions: list[dict], file_path: str | None = None) -> dict | None:
+        """
+        Combines per-section extractions into one unified knowledge doc.
+        Pure Python — zero LLM calls, zero CUDA risk.
+        """
+        valid = [e for e in extractions if e and e.get("content")]
+
+        if not valid:
+            return None
+        
+        # Deduplicated semantic tags, ordered by first appearance
+        all_tags = list(dict.fromkeys(tag for e in valid for tag in e.get("tags", [])))
+
+        # Join content sections
+        combined_content = "\n\n".join(e["content"] for e in valid if not e.get("verbatim") and e.get("content"))
+
+        # Join code sections
+        combined_code = "\n\n".join(e["content"] for e in valid if e.get("verbatim") and e.get("content"))
+
+        # Join notes sections
+        combined_notes = "\n\n".join(e.get("notes", "") for e in valid if e.get("notes"))
+
+        non_verbatim = [e for e in valid if not e.get("verbatim")]
+        topic = non_verbatim[0].get("topic", "Captured session") if non_verbatim else valid[0].get("topic", "Captured session")
+        # Fast semantic anchor summary
+        summary = self.generate_summary(topic, combined_content, combined_code)
+        return {
+            "topic": topic, "tags": all_tags, "notes": combined_notes, 
+            "content": combined_content, "code_snippet": combined_code, 
+            "summary": summary, "file_path": file_path,
+            "source_type": "ide" if file_path else "browser",
+        }
+    
+    def generate_summary(self, topic: str, content: str, code: str) -> str:
+        prompt = f"Write a 1-2 sentence plain prose summary of this developer task.\nTOPIC: {topic}\nCONTENT: {content[:1000]}\nCODE: {code[:1000]}\nOutput ONLY the summary sentences."
+        try:
+            response = ollama.chat(
+                model=self.model_name, messages=[{"role": "user", "content": prompt}], think=False,
+                options={"num_ctx": 2048, "num_predict": 100, "temperature": 0.2, "flash_attn": False}
+            )
+            if hasattr(response, 'message') and response.message:
+                return (response.message.content or '').strip()
+        except Exception:
+            pass
+        return topic
+
+    

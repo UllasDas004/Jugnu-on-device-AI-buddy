@@ -56,15 +56,19 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
    - `embedding float[384]`: Binary blob of IEEE 754 single-precision floats.
    - Searched using `WHERE embedding MATCH ? AND k = ?` KNN syntax.
 
-3. **`knowledge_docs`** (The OKF Vault)
+4. **`knowledge_docs`** (The OKF Vault)
    Stores highly structured, LLM-synthesized Objective Knowledge Format (OKF) documents extracted from raw code files and screens.
    - `id`: Primary key.
-   - `topic`: A short, descriptive title (e.g., "Dependency Injection in Python").
-   - `content`: The detailed, structured JSON/Markdown synthesis.
-   - `capture_count`: Incremented if the same knowledge is detected again, proving importance.
+   - `topic`: A short, descriptive title.
+   - `summary`: A 1-2 sentence semantic anchor for vector embedding.
+   - `content`: Deduplicated explanatory text and concepts.
+   - `code_snippet`: Pristine, merged verbatim code blocks.
+   - `notes`: Constraints and hints.
+   - `tags`: JSON array of semantic tags (e.g., ["Python", "LeetCode"]).
+   - `capture_count`: Incremented if the same knowledge is detected again.
 
-4. **`vec_knowledge`** (The OKF Vector Index — VIRTUAL TABLE)
-   The `sqlite-vec` index for `knowledge_docs`, enabling RAG against deep technical synthesized knowledge rather than just raw episodes.
+5. **`vec_knowledge`** (The OKF Vector Index — VIRTUAL TABLE)
+   The `sqlite-vec` index for `knowledge_docs`. **Crucially**, it only embeds the `topic` and `summary` columns. This prevents the `e5-small-v2` embedding model from being confused by raw code symbols while retaining fast, accurate semantic search.
 
 5. **`markov_edges`** (The Markov Chain)
    Stores O(1) app switching behaviour for prediction.
@@ -76,54 +80,39 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
 
 ---
 
-## 2. The Phase 2 RAG Write Pipeline (Implemented)
+## 2. The Phase 3 OKF Write Pipeline (Zero-IPC)
 
-### Why Python Writes Directly to SQLite (The Boundary Decision)
+### The Great IPC Bottleneck (Why we changed)
+Originally, C++ streamed massive OCR text blobs to Python via Named Pipes. This caused the Python background daemon to block for hundreds of milliseconds parsing JSON strings, leading to dropped telemetry events and severe lag. 
 
-When choosing how to store vectors, we had two options:
-
-| Option | Method | Problem |
-|---|---|---|
-| A | Python sends vector over Named Pipe to C++ | Pushes 1.5KB binary blobs over a text protocol. Messy and fragile. |
-| B | Python writes directly to SQLite | Clean. SQLite WAL handles concurrent C++ + Python access safely. |
-
-**We chose Option B.** SQLite's WAL (Write-Ahead Logging) mode allows Python and C++
-to hold simultaneous connections without corruption. Python connects with `timeout=5.0`
-so it waits safely if C++ is mid-transaction.
+### The New Producer-Consumer Architecture
+We transitioned to a **Zero-IPC** approach for heavy data:
+1. **Producer:** C++ instantly dumps raw, noisy text into the `ocr_buffer` table using native SQLite C APIs (ultra-fast, asynchronous).
+2. **Consumer:** Python's `FlushWorker` daemon wakes up every 60 seconds (only on AC power) and chews through the buffer at its own pace without blocking the main event loop.
 
 ### The Full Event Flow
 
 ```
-C++ detects CLIPBOARD copy, FILE_SAVED, or runs OCR_SCREEN via WinRT GPU
-    | JSON over Named Pipe (lightweight text)
-ipc_client.py receives the event
-    | spawns a daemon Thread so the pipe never blocks
-embedder.save_memory(app, title, text) runs in background
-    | runs e5-small ONNX on the text (CPU inference, ~20ms)
-float[384] vector produced
-    | packed into raw bytes via struct.pack('<384f')
-BEGIN TRANSACTION
-    INSERT into episodic_memories -> gets rowid
-    INSERT into vec_episodic at same rowid
-COMMIT
-    | memory is now permanently searchable
-```
+[C++ WinRT Capture] → Native SQLite Insert → [ocr_buffer]
+      (Zero IPC overhead, Python daemon remains unblocked)
 
-### The Two-Table Vector Design
+[Python FlushWorker (Wakes every 60s)]
+  ├─ 1. Prunes rows > 10 mins old (saves GPU)
+  ├─ 2. Deduplication check (>85% similar? Skip entirely)
+  ├─ 3. UIA JSON Routing:
+  │      ├─ Type 'Edit' → Bypasses Gemma! Flagged verbatim. Heuristically tags language.
+  │      └─ Type 'Document' → Sent to Gemma for strict TOPIC/CONTENT extraction
+  └─ 4. combine_sections(): Pure Python fusion (deduplicates tags/code mathematically)
 
-The vector and the metadata are stored in separate tables on purpose:
+[AI Engine]
+  └─ generate_summary(): Generates a 1-2 sentence prose anchor
 
-- `episodic_memories` — stores human-readable text for the nightly Gemma extraction job.
-- `vec_episodic` — stores binary vectors for fast cosine KNN lookup.
-- They are linked by sharing the same `rowid`.
-
-When C++ searches for context, it JOINs both tables:
-```sql
-SELECT m.text_content
-FROM vec_episodic v
-INNER JOIN episodic_memories m ON v.rowid = m.id
-WHERE v.embedding MATCH ? AND k = 5
-ORDER BY distance ASC;
+[Embedder]
+  ├─ embeds ONLY the prose summary (massively improved e5-small-v2 accuracy)
+  ├─ Checks `vec_knowledge` for duplicates (similarity > 97%)
+  │      ├─ If Duplicate: Merges Code (keeps longest), Merges Paragraphs, deduplicates tags
+  │      └─ If New: Inserts into knowledge_docs and vec_knowledge
+  └─ DELETES row from ocr_buffer
 ```
 
 ### e5-small Prefix Strategy (Asymmetric Search)
@@ -135,10 +124,10 @@ The e5-small-v2 model uses **asymmetric** search:
 Using the wrong prefix makes cosine similarity return garbage. We enforce this:
 
 ```python
-# Storage (in Embedder.save_memory):
-prefixed = f"passage: {text}"
+# Storage (in Embedder.save_knowledge_doc):
+prefixed = f"passage: {topic}. {summary}"
 
-# Search (in Embedder.semantic_search):
+# Search (in Embedder.search_knowledge_docs):
 query_prefixed = f"query: {query_text}"
 ```
 

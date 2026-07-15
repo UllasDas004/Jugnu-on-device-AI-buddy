@@ -96,11 +96,6 @@ PIPE_NAME = r"\\.\pipe\jugnu_ipc"
 CODING_APPS = ["code", "ide", "antigravity", "pwsh", "terminal",
                "devenv", "vim", "nvim", "fleet", "clion", "pycharm",
                "chrome", "msedge", "firefox", "cursor", "idea", "acrobat"]
-OS_NOISE    = ["explorer", "shellexperiencehost", "searchapp",
-               "startmenuexperiencehost", "applicationframehost",
-               "textinputhost"]
-VETO_APPS   = ["netflix", "vlc", "steam", "spotify", "discord",
-               "zoom", "ms-teams", "teams", "slack", "whatsapp"]
 
 def connect_to_pipe():
     print(f"[Python] Attempting to connect to {PIPE_NAME}...")
@@ -129,43 +124,35 @@ def connect_to_pipe():
 
 def _synthesize_and_save_file(engine, embedder, app_name, filepath, code_text):
     """
-    Background thread: chunks a saved code file, extracts technical knowledge
-    with Gemma, synthesizes into one OKF knowledge_doc, and saves it.
-    Only runs for files under 8000 chars to avoid VRAM overruns.
+    Background thread: treats a saved code file as a verbatim code snippet,
+    wraps it in a pseudo-extraction, and saves it via the new column-split pipeline.
+    Only runs for files under 20000 chars to avoid VRAM overruns.
     """
-    MAX_FILE_CHARS = 8000
-    CHUNK_SIZE = 500
+    MAX_FILE_CHARS = 20000
 
     if len(code_text) > MAX_FILE_CHARS:
-        print(f"{_YELLOW}[OKF] File too large for synthesis ({len(code_text)} chars). Episodic-only.{_RESET}")
-        return
-    
-    from flush_worker import _chunk_text, MIN_CHUNK_WORDS
-    chunks = _chunk_text(code_text, CHUNK_SIZE)
-    all_extractions = []
-    prev_extracted = ""
-
-    for chunk in chunks:
-        if len(chunk.split()) < MIN_CHUNK_WORDS:
-            continue
-        extracted = engine.extract_ocr_chunk(chunk, prev_context=prev_extracted)
-        if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
-            all_extractions.append(extracted)
-            prev_extracted = extracted
-        else:
-            prev_extracted = chunk[:100]
-
-    if not all_extractions:
-        print(f"{_YELLOW}[OKF] No useful knowledge extracted from {os.path.basename(filepath)}.{_RESET}")
+        print(f"{_YELLOW}[OKF] File too large ({len(code_text)} chars). Episodic-only.{_RESET}")
         return
 
-    doc_json = engine.synthesize_ocr_extractions(all_extractions)
-    if doc_json:
-        saved = embedder.save_knowledge_doc(app_name, doc_json, engine)
+    if not code_text.strip():
+        return
+
+    # Treat the whole file as a verbatim code snippet — no Gemma extraction needed for code files
+    filename = os.path.basename(filepath) if filepath else "clipboard"
+    pseudo_ext = {
+        "content":  code_text,
+        "tags":     ["code", os.path.splitext(filename)[1].lstrip(".") or "unknown"],
+        "notes":    "",
+        "topic":    filename,
+        "verbatim": True,
+    }
+    doc = engine.combine_sections([pseudo_ext], file_path=filepath)
+    if doc:
+        saved = embedder.save_knowledge_doc(app_name, doc, engine)
         if saved:
-            print(f"{_GREEN}[OKF] Knowledge doc saved from FILE_SAVED: {os.path.basename(filepath)}{_RESET}")
+            print(f"{_GREEN}[OKF] Knowledge doc saved from FILE_SAVED: {filename}{_RESET}")
         else:
-            print(f"{_YELLOW}[OKF] Synthesis failed for {os.path.basename(filepath)} — episodic only.{_RESET}")
+            print(f"{_YELLOW}[OKF] Save failed for {filename} — episodic only.{_RESET}")
 
 # Global stop flag — set by main thread on Ctrl+C, read by reader daemon
 _stop_event = threading.Event()
@@ -216,9 +203,10 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                 if event_type == 'SWITCH':
                                     app = payload.get('current_app', '')
                                     state.update_switch(app, payload.get('predicted_next', []))
-                                    if not any(n in app.lower() for n in OS_NOISE):
-                                        if any(c in app.lower() for c in CODING_APPS):
-                                            state.set_last_coding_app(app)
+                                    
+                                    # Since C++ now strictly filters for whitelisted Deep Work apps,
+                                    # every SWITCH event is guaranteed to be a coding app.
+                                    state.set_last_coding_app(app)
                                 elif event_type == 'CLIPBOARD':
                                     text = payload.get('text', '')
                                     state.update_clipboard(text)
@@ -261,29 +249,11 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         except Exception as e:
                                             print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
-                                    current_app = payload.get('current_app', '')
-                                    current_app_lower = current_app.lower()
+                                    
 
-                                    # FIX: If idle fired while Explorer/Shell is foreground
-                                    # (e.g., user alt-tabbed to desktop), use the last
-                                    # meaningful coding app instead of OS noise.
-                                    if any(n in current_app_lower for n in OS_NOISE) or current_app_lower == "":
-                                        fallback = state.get_last_coding_app()
-                                        if fallback:
-                                            print(f"\033[90m[System] Idle on OS shell ({current_app}). Using last coding context: {fallback}\033[0m")
-                                            current_app = fallback
-                                            current_app_lower = fallback.lower()
-                                            # CRITICAL: update state so generate_prompt_context
-                                            # queries the correct app's live OCR data from DB!
-                                            state.current_app = fallback
-                                        else:
-                                            print("\033[90m[System] Idle on OS shell with no prior coding context. Skipping.\033[0m")
-                                            continue  # type: ignore[misc]
-
-                                    # Check VETO apps
-                                    if any(v in current_app_lower for v in VETO_APPS):
-                                        print(f"\033[90m[System] Veto app ({current_app}) detected. Skipping RAG.\033[0m", flush=True)
-                                    elif state.was_recently_coding():
+                                    # C++ ensures we only receive IDLE events for whitelisted Deep Work apps,
+                                    # using 'lastMeaningfulApp' as the target. So we can proceed directly.
+                                    if state.was_recently_coding():
 
                                         # Step 1: Gemma reads screen context and generates a focused search query
                                         # (This is a cheap, fast LLM call — just 30 tokens)
@@ -298,6 +268,11 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         sources = []
                                         knowledge_results = embedder.search_knowledge_docs(search_query, limit=3)
                                         if knowledge_results:
+                                            # Add current screen as first chunk (so Gemma sees what's visible right now)
+                                            if screen_context:
+                                                context_chunks.insert(0, f"[CURRENT SCREEN]\n{screen_context}")
+                                                sources.insert(0, "Current Screen")
+                                                
                                             for doc in knowledge_results:
                                                 sources.append(doc['topic'])
                                                 context_chunks.append(
@@ -334,11 +309,13 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                     buffer = messages[-1]
 
         except pywintypes.error as e:
-            if e.winerror == 109:  # ERROR_BROKEN_PIPE
+            if e.winerror == 109 or e.winerror == 233:  # ERROR_BROKEN_PIPE or ERROR_PIPE_NOT_CONNECTED
                 print("\n[Python] C++ engine disconnected. Reconnecting...", flush=True)
                 win32file.CloseHandle(handle)
                 if _stop_event.is_set():
                     return
+                # Prevent tight loops if C++ is completely dead
+                time.sleep(1)
                 handle = connect_to_pipe()
             else:
                 print(f"[Python] Pipe read error: {e}", flush=True)
@@ -374,7 +351,7 @@ if __name__ == "__main__":
     state = StateManager()
     engine = AIEngine()
     embedder = Embedder()
-    flush_worker = FlushWorker(embedder, engine)
+    flush_worker = FlushWorker(embedder, engine, state=state)
     flush_worker.start()
 
     # Python is now a pure headless AI backend.

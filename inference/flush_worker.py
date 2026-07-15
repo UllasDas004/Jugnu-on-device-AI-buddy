@@ -15,12 +15,14 @@ Why chunking?
     Feeding the whole blob at once confuses the extractor.
 """
 
+from typing import Type
 import difflib
 import sqlite3
 import threading
 import time
 import ctypes
 import re
+import json
 
 _CYAN   = "\033[1;36m"
 _GREEN  = "\033[1;32m"
@@ -111,6 +113,25 @@ def _chunk_text(text: str, size: int) -> list[str]:
 
     return [c for c in chunks if c] # filter empty
 
+# ── Code Detector ────────────────────────────────────────────────────────
+def _detect_code_tags(code: str) -> list[str]:
+    """Heuristic language detection from code. No LLM needed."""
+    tags = []
+    if any(k in code for k in ["#include", "vector<", "std::", "->", "endl", "::"]):
+        tags.append("C++")
+    elif any(k in code for k in ["def ", "import ", "elif ", "print(", "lambda "]):
+        tags.append("Python")
+    elif any(k in code for k in ["public class", "ArrayList", "System.out", "@Override"]):
+        tags.append("Java")
+    elif any(k in code for k in ["func ", "package ", "fmt.Print", ":= "]):
+        tags.append("Go")
+    elif any(k in code for k in ["fn ", "let mut ", "impl ", "use std"]):
+        tags.append("Rust")
+    if "Solution" in code and any(k in code for k in ["nums", "target", "node", "root"]):
+        tags.append("LeetCode")
+    if "dp[" in code or "memo" in code.lower():
+        tags.append("dynamic-programming")
+    return tags or ["code"]
 
 # ── FlushWorker Class ────────────────────────────────────────────────────────
 
@@ -120,9 +141,10 @@ class FlushWorker:
     and saves clean knowledge to the vector database.
     """
 
-    def __init__(self, embedder, engine):
+    def __init__(self, embedder, engine, state=None):
         self._embedder = embedder
         self._engine   = engine
+        self._state    = state  # StateManager ref — used to cache latest screen text
         self._thread   = threading.Thread(
             target=self._run,
             daemon=True,       # dies automatically when main thread exits
@@ -188,120 +210,204 @@ class FlushWorker:
             # NOTE: We do NOT pre-queue for deletion here.
             # A row is only deleted if it is successfully synthesized.
             # Failed rows stay in ocr_buffer and are retried next cycle.
-
-            # --- PHASE 1: Pre-Gemma OCR Deduplication ---
-            if not hasattr(self, '_last_raw_by_app'):
-                self._last_raw_by_app = {}
-            # P1-FIX: Cap cache size to prevent unbounded memory growth.
-            # OCR blobs are ~2000 chars each; 20 entries = ~40KB max.
-            MAX_CACHE = 20
-            if len(self._last_raw_by_app) > MAX_CACHE:
-                self._last_raw_by_app.pop(next(iter(self._last_raw_by_app)))
-                
-            last_raw = self._last_raw_by_app.get(app_name, "")
-            # Calculate how similar this OCR dump is to the last one we saw
-            similarity = difflib.SequenceMatcher(None, raw_text, last_raw).ratio()
-
-            if similarity > 0.85:
-                print(f"{_YELLOW}[FlushWorker] Screen for {app_name} is {similarity*100:.1f}% unchanged. Skipping AI extraction.{_RESET}")
-                continue # Skip the Gemma extraction entirely!
-
-            # Update cache with the new screen state
-            self._last_raw_by_app[app_name] = raw_text
-            # --------------------------------------------
-
-            # --- PHASE 2: Splitting & Noise Filtering (UIA vs OCR) ---
-            is_uia_text = "===SECTION===" in raw_text
-
-            if is_uia_text:
-                raw_sections = [s.strip() for s in raw_text.split("===SECTION===") if s.strip()]
-                chunks = []
-                
-                # THE PYTHON NOISE FILTER
-                for i, sec in enumerate(raw_sections):
-                    lines = sec.splitlines()
-                    if not lines: continue
+            try:
+                # --- PHASE 1: Pre-Gemma OCR Deduplication ---
+                if not hasattr(self, '_last_raw_by_app'):
+                    self._last_raw_by_app = {}
+                # P1-FIX: Cap cache size to prevent unbounded memory growth.
+                # OCR blobs are ~2000 chars each; 20 entries = ~40KB max.
+                MAX_CACHE = 20
+                if len(self._last_raw_by_app) > MAX_CACHE:
+                    self._last_raw_by_app.pop(next(iter(self._last_raw_by_app)))
                     
-                    print(f"{_CYAN}[FlushWorker] UIA Section {i+1}/{len(raw_sections)} - Length: {len(sec)} chars. Preview: {sec[:100].replace(chr(10), ' ')}...{_RESET}")
-                    
-                    # Optional: Heuristic to drop lists (commented out per your request)
-                    # avg_len = sum(len(l) for l in lines) / len(lines)
-                    # if len(lines) > 15 and avg_len < 40:
-                    #     continue
-                    
-                    if len(sec) > 4000:
-                        chunks.extend(_chunk_text(sec, 4000))
+                last_raw = self._last_raw_by_app.get(app_name, "")
+                # Calculate how similar this OCR dump is to the last one we saw
+                similarity = difflib.SequenceMatcher(None, raw_text, last_raw).ratio()
+
+                if similarity > 0.85:
+                    print(f"{_YELLOW}[FlushWorker] Screen for {app_name} is {similarity*100:.1f}% unchanged. Skipping AI extraction.{_RESET}")
+                    continue # Skip the Gemma extraction entirely!
+
+                # Update cache with the new screen state
+                self._last_raw_by_app[app_name] = raw_text
+                # Notify StateManager so it can answer context queries even after
+                # this row is deleted from ocr_buffer.
+                if self._state:
+                    self._state.update_screen_text(app_name, raw_text)
+                # --------------------------------------------
+
+                # ── DEBUG: Show raw UIA text in terminal ──────────────────────
+                print(f"\033[90m{'─'*60}\033[0m")
+                print(f"\033[90m[DEBUG] Raw UIA for {app_name} ({len(raw_text)} chars):\033[0m")
+                print(f"\033[90m{raw_text[:600]}{'...(truncated)' if len(raw_text) > 600 else ''}\033[0m")
+                print(f"\033[90m{'─'*60}\033[0m")
+                # ─────────────────────────────────────────────────────────────
+
+                # --- PHASE 2: Parse and route by UIA format ---
+
+                # Detect IDE source by checking app_name and the raw_text for a file path hint
+                # screen_reader.cpp prepends "FILE_PATH: <path>\n" for IDE captures
+                file_path = None
+                ide_apps = {"code.exe", "devenv.exe", "clion64.exe", "idea64.exe", "pycharm64.exe",
+                "rider64.exe", "webstorm64.exe", "sublime_text.exe", "notepad++.exe"}
+
+                if app_name.lower() in ide_apps:
+                    fp_match = re.search(r'FILE_PATH:\s*(.+)', raw_text)
+                    if fp_match:
+                        file_path = fp_match.group(1).strip()
                     else:
-                        chunks.append(sec)
+                        file_path = app_name  # Placeholder so source_type becomes 'ide'
+
+                # Try new structured JSON format (post-UIA-boundary fix)
+                structured_sections = None
+                try:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, list) and parsed:
+                        structured_sections = parsed
+                except (ValueError, TypeError):
+                    pass
+
+                VERBATIM_TYPES = {"Edit"}
+                CONTENT_TYPES  = {"Document", "Text"}
+
+
+                if structured_sections is not None:
+                    # ── NEW: Structured JSON from C++ with control type metadata ─────
+                    print(f"{_CYAN}[FlushWorker] Structured UIA: {len(structured_sections)} sections{_RESET}")
+                    for i, sec in enumerate(structured_sections):
+                        stype = sec.get('type', '?')
+                        sname = sec.get('name', '')
+                        stext = sec.get('text', '')
+                        print(f"\033[90m  [{i+1}] type={stype} | name='{sname[:40]}' | {len(stext)} chars | preview: {repr(stext[:80])}\033[0m")
+                    section_extractions = []
+                    
+                    for sec in structured_sections:
+                        ctrl_type = sec.get("type", "Unknown")
+                        sec_text = sec.get("text", "").strip()
+                        sec_name = sec.get("name", "")
+
+                        if not sec_text:
+                            continue
+
+                        total_chunks += 1
+
+                        if ctrl_type in VERBATIM_TYPES:
+                            # Heuristic to filter out URL bars (Chrome/Edge Omnibox is type 'Edit')
+                            if "://" in sec_text[:20] or sec_text.startswith("www.") or "leetcode.com" in sec_text[:30] or "github.com" in sec_text[:30] or (len(sec_text.split()) == 1 and "." in sec_text):
+                                print(f"\033[90m[FlushWorker] Skipping Edit control (looks like a URL): {sec_text[:50]}\033[0m")
+                                continue
+
+                            lang_tags = _detect_code_tags(sec_text)
+                            section_extractions.append({
+                                "content":      sec_text,
+                                "tags":         lang_tags,
+                                "mini_summary": f"Code from {sec_name or 'editor'}",
+                                "verbatim":     True,
+                            })
                         
-                # UIA text is already clean! Skip the Phase 3 "extractor" AI completely.
-                # Just pass the raw sections straight to the final synthesizer.
-                all_extractions = chunks
-                total_chunks += len(chunks)
-                
-            else:
-                # Fallback for old OCR: text is messy, so we MUST chunk it...
-                chunks = _chunk_text(raw_text, CHUNK_SIZE)
-                
-                # --- PHASE 3: AI Extraction (OCR Only) ---
-                all_extractions = []
-                prev_extracted = ""
+                            print(f"{_CYAN}[FlushWorker] Edit ({len(sec_text)} chars) → verbatim [{', '.join(lang_tags)}]{_RESET}")
 
-                for chunk in chunks:
-                    total_chunks += 1
-                    # GATE: Skip obviously short UI noise before touching Gemma
-                    if len(chunk.split()) < MIN_CHUNK_WORDS:
-                        continue
+                        elif ctrl_type in CONTENT_TYPES:
+                            print(f"{_CYAN}[FlushWorker] {ctrl_type} ({len(sec_text)} chars) → Gemma{_RESET}")
+                            result = self._engine.extract_section(sec_text[:3000], ctrl_type)
 
-                    print(f"  [Gemma] Extracting chunk {len(all_extractions)+1}/{len(chunks)}...")
-                    extracted = self._engine.extract_ocr_chunk(chunk, prev_context=prev_extracted)
+                            if result:
+                                section_extractions.append(result)
+                    
+                    if section_extractions:
+                        combined_raw = "\n\n".join(e["content"] for e in section_extractions)
 
-                    if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
-                        print(f"\n{_YELLOW}--- GEMMA EXTRACTED KNOWLEDGE ---{_RESET}")
-                        print(f"{_GREEN}{extracted}{_RESET}")
-                        print(f"{_YELLOW}---------------------------------{_RESET}\n")
-                        all_extractions.append(extracted)
-                        prev_extracted = extracted
+                        self._embedder.save_memory(
+                            app_name = app_name, window_title = app_name,
+                            text_content = combined_raw, file_path = None
+                        )
+
+                        doc = self._engine.combine_sections(section_extractions, file_path=file_path)
+                        doc_dicts = [doc] if doc else []
                     else:
-                        prev_extracted = chunk[:100] if chunk else ""
+                        doc_dicts = []
+                    
+                elif "===SECTION===" in raw_text:
+                    # ── LEGACY: Old ===SECTION=== flat string ─────────────────────────
+                    raw_sections = [s.strip() for s in raw_text.split("===SECTION===") if s.strip()]
+                    chunks = []
+                    for i, sec in enumerate(raw_sections):
+                        if not sec.splitlines(): continue
+                        print(f"{_CYAN}[FlushWorker] Legacy Section {i+1}/{len(raw_sections)} ({len(sec)} chars){_RESET}")
+                        chunks.append(sec[:3000])  # truncate, never split
+                    total_chunks += len(chunks)
+                    if chunks:
+                        combined = "\n\n".join(chunks)
+                        self._embedder.save_memory(
+                            app_name=app_name, window_title=app_name,
+                            text_content=combined, file_path=None
+                        )
+                        pseudo_ext = {"content": combined, "tags": ["ocr"], "notes": "", "topic": "OCR Capture", "verbatim": False}
+                        doc_dicts = [self._engine.combine_sections([pseudo_ext], file_path=file_path)]
+                    else:
+                        doc_dicts = []
 
-            # --- PHASE 4: Final Synthesis Pass (ONE call per section per OCR) ---
-            if all_extractions:
-                print(f"\n{_CYAN}  [Gemma] Synthesizing {len(all_extractions)} extractions into knowledge doc...{_RESET}")
+                    
+                else:
+                    # ── OCR FALLBACK: noisy text, must extract with AI first ───────────
+                    chunks = _chunk_text(raw_text, CHUNK_SIZE)
+                    all_ocr_extractions = []
+                    prev_extracted = ""
 
-                # Always save raw joined text to episodic_memories (the raw log)
-                combined = "\n\n".join(all_extractions)
-                self._embedder.save_memory(
-                    app_name=app_name,
-                    window_title=app_name,
-                    text_content=combined,
-                    file_path=None
-                )
+                    for chunk in chunks:
+                        total_chunks += 1
+                        # GATE: Skip obviously short UI noise before touching Gemma
+                        if len(chunk.split()) < MIN_CHUNK_WORDS:
+                            continue
 
-                # synthesize_ocr_extractions now returns a LIST of docs (one per UIA section)
-                doc_jsons = self._engine.synthesize_ocr_extractions(all_extractions)
+                        print(f"  [Gemma] Extracting chunk {len(all_ocr_extractions)+1}/{len(chunks)}...")
+                        extracted = self._engine.extract_ocr_chunk(chunk, prev_context=prev_extracted)
 
-                if doc_jsons:
-                    any_saved = False
-                    for doc_json in doc_jsons:
-                        import json
-                        doc = json.loads(doc_json)
+                        if extracted and len(extracted.split()) >= MIN_CHUNK_WORDS:
+                            print(f"\n{_YELLOW}--- GEMMA EXTRACTED KNOWLEDGE ---{_RESET}")
+                            print(f"{_GREEN}{extracted}{_RESET}")
+                            print(f"{_YELLOW}---------------------------------{_RESET}\n")
+                            all_ocr_extractions.append(extracted)
+                            prev_extracted = extracted
+                        else:
+                            prev_extracted = chunk[:100] if chunk else ""
+                    if all_ocr_extractions:
+                        print(f"\n{_CYAN}  [Gemma] Synthesizing {len(all_ocr_extractions)} extractions into knowledge doc...{_RESET}")
+
+                        # Always save raw joined text to episodic_memories (the raw log)
+                        combined = "\n\n".join(all_ocr_extractions)
+                        self._embedder.save_memory(
+                            app_name=app_name,
+                            window_title=app_name,
+                            text_content=combined,
+                            file_path=None
+                        )
+
+                        pseudo_ext = {"content": combined, "tags": ["ocr"], "notes": "", "topic": "OCR Capture", "verbatim": False}
+                        doc_dicts = [self._engine.combine_sections([pseudo_ext], file_path=file_path)]
+                    else:
+                        doc_dicts = []
+
+                # --- PHASE 4: Save all docs ─────────────────────────────────────────
+                if doc_dicts:
+                    for doc_dict in doc_dicts:
                         print(f"\n{_YELLOW}━━━ SYNTHESIZED KNOWLEDGE DOC ━━━{_RESET}")
-                        print(f"{_GREEN}TOPIC: {doc.get('topic','')}{_RESET}")
-                        print(f"{_CYAN}TAGS:  {', '.join(doc.get('tags', []))}{_RESET}")
-                        print(f"{_GREEN}{doc.get('content','')[:300]}...{_RESET}")
+                        print(f"{_GREEN}TOPIC: {doc_dict.get('topic','')}{_RESET}")
+                        print(f"{_CYAN}TAGS:  {', '.join(doc_dict.get('tags', []))}{_RESET}")
+                        print(f"{_CYAN}SOURCE: {doc_dict.get('source_type','')} | PATH: {doc_dict.get('file_path') or 'none'}{_RESET}")
+                        print(f"{_GREEN}SUMMARY: {doc_dict.get('summary','')[:200]}{_RESET}")
+                        print(f"{_GREEN}{doc_dict.get('content','')[:300]}...{_RESET}")
                         print(f"{_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{_RESET}\n")
 
-                        saved = self._embedder.save_knowledge_doc(app_name, doc_json, self._engine)
+                        saved = self._embedder.save_knowledge_doc(app_name, doc_dict, self._engine)
                         if saved:
                             useful_saved += 1
-                            any_saved = True
-                            print(f"{_GREEN}[FlushWorker] Saved knowledge doc: '{doc.get('topic','')}'.{_RESET}")
+                            print(f"{_GREEN}[FlushWorker] Saved knowledge doc: '{doc_dict.get('topic','')}'.{_RESET}")
                         else:
                             # Embedder returned False = semantic duplicate already in DB.
                             # The knowledge is already there — still safe to delete the raw row.
-                            print(f"{_YELLOW}[FlushWorker] Doc '{doc.get('topic','')}' already in DB (duplicate). Row will be cleared.{_RESET}")
-
+                            print(f"{_YELLOW}[FlushWorker] Doc '{doc_dict.get('topic','')}' already in DB (duplicate). Row will be cleared.{_RESET}")
+                    
                     # Always delete the row after synthesis ran — even if all were duplicates.
                     # Leaving it in means infinite reprocessing of the same screen capture.
                     if row_id not in ids_to_delete:
@@ -310,10 +416,12 @@ class FlushWorker:
                     # All sections failed synthesis — raw text already in episodic_memories
                     print(f"{_YELLOW}  [FlushWorker] All sections failed synthesis — raw text saved to episodic_memories only.{_RESET}")
                     ids_to_delete.append(row_id)
-                    useful_saved += 1
-            else:
-                print(f"{_YELLOW}  No useful content found in this OCR.{_RESET}")
-                ids_to_delete.append(row_id)  # No content = junk row, safe to delete
+    
+            except Exception as e:
+                # Gemma crashed, OOM, Ollama timeout, etc.
+                # Do NOT delete this row — leave it in ocr_buffer to be retried next cycle.
+                print(f"{_RED}[FlushWorker] Row #{row_id} ({app_name}) failed with exception: {e}{_RESET}")
+                ids_failed.append(row_id)
                 
         # DELETE: Clean up all rows just processed
         if ids_to_delete:
@@ -325,6 +433,12 @@ class FlushWorker:
             conn.commit()
 
         conn.close()
+
+        # Summary report
         print(f"{_GREEN}[FlushWorker] Done. "
-          f"{useful_saved} memories saved from {total_chunks} chunks "
-          f"({len(rows)} raw rows processed).{_RESET}")
+              f"{useful_saved} docs saved from {total_chunks} chunks "
+              f"({len(rows)} raw rows processed, "
+              f"{len(ids_to_delete)} deleted, "
+              f"{len(ids_failed)} failed/retrying).{_RESET}")
+        if ids_failed:
+            print(f"{_RED}[FlushWorker] {len(ids_failed)} row(s) will be retried next cycle: {ids_failed}{_RESET}")

@@ -23,6 +23,7 @@ namespace Jugnu
         static std::vector<std::string> GetPredictedNextApps();
         static std::unordered_map<std::string, std::unordered_map<std::string, int>> ExtractAndClearMarkovChain();
         static std::unordered_map<std::string, float> GetEMAScores();
+        static void UpdateEMA(const std::string& currentApp);
 
         static std::string GenerateContextJSON(const std::string& currentApp);
 
@@ -44,7 +45,6 @@ namespace Jugnu
         static void UpdateLRU(const std::string& app);
 
         static std::unordered_map<std::string, float> emaScores;
-        static void UpdateEMA(const std::string& currentApp);
         static void PrefetchToRAM(const std::string& processName);
 
         // Throttles background distractors based on current app

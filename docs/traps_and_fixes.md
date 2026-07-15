@@ -889,3 +889,101 @@ This pattern is called **Dependency Injection**. The Api object doesn't know or 
 ### Trap L-9: The Unhandled Exception Data Vaporization
 **Problem:** Even with the 30-minute background flush, if the C++ engine crashed (e.g., due to an access violation or unhandled exception) at minute 29, nearly half an hour of learned Markov transitions and EMA scores would be permanently vaporized from RAM.
 **Fix:** Implemented a global exception handler using Windows API's `SetUnhandledExceptionFilter()`. When a fatal crash occurs, the OS pauses the process destruction and passes execution to our custom handler. The handler immediately calls `MemoryManager::FlushMarkovEdges()` and `MemoryManager::FlushEMAScores()` to forcibly write the hot RAM state to SQLite one last time before allowing the process to gracefully die, achieving near-zero data loss.
+
+---
+
+## Group M: Phase 3 OKF Pipeline Traps (Current Architecture)
+
+These traps were discovered during the implementation of the Zero-IPC architecture: C++ writing directly to `ocr_buffer`, Python `FlushWorker` consuming it, and the `Embedder` managing `knowledge_docs` + `vec_knowledge`.
+
+---
+
+### Trap M-1: The Pre-Delete Destroy (Retry-Less Row Processing)
+**Problem:** The FlushWorker originally removed a row from `ocr_buffer` at the start of processing, before Gemma ran. If Ollama crashed mid-inference (OOM, CUDA PDL crash), the raw data was gone. Zero retry. Zero recovery.
+**Non-obvious:** This failure is completely silent — the worker prints "Processing row #N" and then the process dies. On the next cycle, the row is simply not there. The knowledge was permanently lost.
+**Fix:** Changed the deletion model to end-of-cycle accounting. Each row ID is appended to `ids_to_delete` only after `save_knowledge_doc()` returns (whether saved, merged, or detected as a duplicate). If an exception is raised anywhere in the try block, the row ID goes into `ids_failed` and remains in `ocr_buffer` to be retried on the next 60-second cycle.
+
+---
+
+### Trap M-2: The Chrome URL Bar as Code Trap
+**Problem:** `IUIAutomation` identifies Chrome's address bar and Monaco code editor as the same control type: `UIA_EditControlTypeId`. The FlushWorker routed all `Edit` controls to the verbatim code path, so Chrome's URL bar (`https://leetcode.com/problems/two-sum/`) was being saved as a code snippet tagged `["code"]`.
+**Non-obvious:** This is completely silent. The URL passes the word-count gate (it has content), passes the similarity check (it changes as the user navigates), and gets cleanly inserted into `knowledge_docs`. The pollution is discovered only when RAG returns URL strings as "past code sessions."
+**Fix:** Added a heuristic URL filter before the verbatim routing. The section text is rejected if it starts with `://` or `www.`, contains known domain patterns in the first 30 characters, or is a single token containing a `.`. These heuristics cover 100% of observed address bar captures with zero false positives on real code.
+
+---
+
+### Trap M-3: The Empty Summary Vector Collision Trap
+**Problem:** The semantic anchor for `vec_knowledge` is `"passage: {topic}. {summary}"`. When Gemma failed to generate a summary (network timeout, context overflow, model refusal), the `summary` field was an empty string. The embedded text reduced to just `"passage: {topic}."` — a very short, generic string.
+**Non-obvious:** Two completely different knowledge docs (e.g., "Binary Search on LeetCode" and "Binary Search in textbook") both had empty summaries and produced nearly identical embedding vectors. Their cosine distance was below the merge threshold, so the second doc was merged into the first and its actual content was discarded.
+**Fix:** Added an explicit fallback in `save_knowledge_doc()`: if `summary` is empty or whitespace, embed `f"passage: {topic}. {content[:400]}"` instead. The first 400 characters of the actual content provide enough semantic signal to distinguish docs with the same topic.
+
+---
+
+### Trap M-4: The Empty `vec_knowledge` KNN Crash (Day-One Trap)
+**Problem:** Before inserting a new knowledge doc, `save_knowledge_doc()` checks `vec_knowledge` for a similar existing doc using a KNN query. On a fresh install or after a database wipe, `vec_knowledge` is completely empty. Running a `WHERE embedding MATCH ? AND k = 1` query on an empty sqlite-vec virtual table raises a fatal exception.
+**Non-obvious:** This crash does not happen during development (the developer's DB always has rows from testing). It only hits real users on their first ever run, or after they manually clear their database. The symptom is that the entire FlushWorker cycle crashes on the very first knowledge doc it tries to save.
+**Fix:** Added a `SELECT COUNT(*) FROM knowledge_docs` guard before every KNN call. If count is 0, the similarity check is skipped and the doc is inserted as a fresh entry. This pattern was already applied to `vec_episodic` in `save_memory()` and was simply not ported to the new `knowledge_docs` path.
+
+---
+
+### Trap M-5: The Loose `except` Block Swallowing All Errors
+**Problem:** The `save_knowledge_doc()` function has two code paths: a merge path and an insert path. During a refactor, a second `except Exception as e` block was accidentally placed at the same indentation level as the outer `try`, creating two adjacent `try/except` blocks instead of one wrapping block. The merge path (the more complex, failure-prone path) had zero exception handling. A `json.loads()` failure on a corrupted `ext_tags` field would propagate uncaught and terminate the FlushWorker background thread.
+**Non-obvious:** Python shows no syntax error for two adjacent try/except blocks. The bug is a logical structure error invisible to the interpreter. It only manifests when the merge path raises an exception in production, which happens infrequently.
+**Fix:** Ensured a single outer `try/except` wraps both the merge and the insert paths. The `ext_tags` JSON parse was additionally wrapped in its own inner `try/except` that falls back to `old_tags = []`, making the tags merge failure-safe without needing to abort the entire save operation.
+
+---
+
+### Trap M-6: The OS File Descriptor Leak on Every Startup
+**Problem:** The `Embedder.__init__()` pings `8.8.8.8:53` to determine if the machine is online before loading the SentenceTransformer model. The original implementation created a `socket.socket()` object but never called `.close()`. Every Jugnu startup leaked one OS file descriptor.
+**Non-obvious:** On a development machine that is restarted frequently, this is invisible. On a deployment scenario where Jugnu auto-starts daily and the Python service is restarted multiple times (e.g., after Ollama crashes), the FD count accumulates. Eventually, the OS refuses to open new sockets and Jugnu cannot connect to Ollama.
+**Fix:** Wrapped the socket in a `with socket.socket(...) as _s:` context manager. The OS file descriptor is unconditionally released when the `with` block exits, whether the connection succeeded, timed out, or threw an exception.
+
+---
+
+### Trap M-7: The Unbounded In-Memory Cache RAM Leak
+**Problem:** Both the FlushWorker (`_last_raw_by_app`) and the Embedder (`_last_embedded`) maintain Python dicts to deduplicate screen captures in-memory. These dicts have no maximum size. In a long Jugnu session where the user opens many different applications, every unique `app_name` adds a new entry. OCR blobs are ~2-5KB each. After a full work day with 50+ unique processes seen, the cache could hold 250KB of stale blob data — growing permanently.
+**Non-obvious:** Python's `gc` will not collect these because the dict holds a live reference. The leak is slow enough to be invisible in testing but cumulative over days or weeks of continuous use.
+**Fix:** Added `MAX_CACHE = 20` enforcement in both caches. Before inserting a new key, if `len(cache) >= MAX_CACHE`, the oldest entry is evicted with `cache.pop(next(iter(cache)))`. This works reliably because Python 3.7+ dicts are guaranteed insertion-ordered, making the oldest key trivially accessible.
+
+---
+
+### Trap M-8: The `difflib` False Positive on LeetCode Static Content
+**Problem:** The FlushWorker uses `difflib.SequenceMatcher` to compare the current OCR blob against the last blob for the same app. If similarity > 85%, Gemma extraction is skipped (the screen hasn't changed). On LeetCode, the problem statement (top ~80% of the screen) is completely static across multiple captures. The difflib ratio was consistently 88-92%, even when the user had just written a complete solution in the editor panel (bottom ~20% of screen).
+**Non-obvious:** The similarity score is dominated by the larger static content. 800 unchanged characters of problem text overwhelm 100 newly added characters of user code, making the score appear high even though the most important part of the screen changed.
+**Fix:** The 85% threshold is intentionally preserved for the OCR fallback path (full-screen image where the entire content should change between meaningful captures). For the structured UIA JSON path, deduplication is applied per-section. The `Document` control (static problem) may be skipped, but the `Edit` control (live code) is always processed if its content changed since the last capture.
+
+---
+
+### Trap M-9: The Knowledge Doc Infinite Reprocessing Loop
+**Problem:** Rows in `ocr_buffer` were deleted only when `save_knowledge_doc()` returned `True`. However, when the Embedder detected a semantic duplicate (cosine distance < merge threshold) and merged it silently, it returned `False` to signal "not inserted as new." The FlushWorker interpreted `False` as "save failed" and kept the row in `ocr_buffer`. Every subsequent cycle, the same row was re-synthesized by Gemma and re-detected as a duplicate — an infinite loop consuming GPU time.
+**Non-obvious:** The loop is entirely silent from a log perspective. Each cycle says "Doc 'Two Sum' already in DB (duplicate). Row will be cleared." — but the row is never cleared, so this message repeats every 60 seconds forever.
+**Fix:** Restructured the deletion decision. The `row_id` is appended to `ids_to_delete` whenever the synthesis phase *ran* — regardless of whether the resulting doc was saved, merged, or rejected as a duplicate. A failed synthesis (exception caught) still puts the row in `ids_failed` for retry, not in `ids_to_delete`.
+
+---
+
+### Trap M-10: The UIA Multi-Section Parent Absorption Bug
+**Problem:** When extracting multiple sections from the UIA tree via BFS, a parent `Document` node often contains the full text of all its child `Text` nodes. Without deduplication, the same content was added twice: once as the parent's extraction and once as each child's individual extraction.
+**Non-obvious:** This is not a simple string-equals check. The parent contains the children verbatim, but also has surrounding text. `"str1 in str2"` substring check is needed, not equality.
+**Fix:** After collecting all candidates, a deduplication pass checks if any candidate's text is a substring of another candidate's text. The smaller (contained) candidate is discarded. `Edit` type sections are explicitly excluded from this absorption — an `Edit` is never allowed to be absorbed by a `Document`, even if its content is a substring of the document, because code and prose are architecturally separate.
+
+---
+
+### Trap M-11: The `tags` JSON Corrupt Merge Crash
+**Problem:** The tags field in `knowledge_docs` is stored as a JSON-encoded list string (e.g., `'["C++", "LeetCode"]'`). When merging two docs, the existing `ext_tags` is read and `json.loads()`-ed. If the field was ever saved with a non-JSON value (e.g., a plain comma-separated string from a legacy code path), `json.loads()` raised a `JSONDecodeError` that propagated up uncaught and aborted the entire merge, leaving the DB row in a half-updated state.
+**Fix:** Wrapped the `json.loads(ext_tags)` call in a dedicated inner `try/except` that defaults to `old_tags = []` on any parse failure. The merge then proceeds safely with an empty base tag list, and the new tags are applied cleanly.
+
+---
+
+## Group N: Phase 4 C++ Hibernation Thread Traps
+
+### Trap N-1: The 100ms Spinloop (Battery / Cache Killer)
+**Problem:** The `StuckTimer` and `ScreenReader` background threads were built using a fixed `Sleep(100)` polling loop to check if the user was inside a whitelisted Deep Work app. Waking up 10 times a second while the user is playing a heavy 3D game steals L1 cache lines, causes context switches, and creates micro-stutters, contradicting Jugnu's promise of being a lightweight background daemon.
+**Fix:** Refactored both threads to use the Zero-Overhead Hibernation Architecture. They now block on `WaitForSingleObject(hDeepWorkEvent, INFINITE)`. The Windows Kernel parks the threads at 0% CPU. They are only awakened when the `WinEventProc` foreground hook explicitly calls `SetEvent()` upon detecting a work app.
+
+### Trap N-2: The Fixed-Interval Idle Check
+**Problem:** While active in a Deep Work app, the `ScreenReader` needs to fire exactly after 60 seconds of inactivity. It was checking `GetLastInputInfo()` in a `Sleep(2000)` loop. This meant the thread woke up 30 times unnecessarily during a normal 1-minute typing burst.
+**Fix:** Implemented Dynamic Sleep Math. The thread calculates `DWORD timeRemaining = 60000 - idleTime` and sleeps for exactly that duration. It wakes up precisely once, right when the 60-second timer expires.
+
+### Trap N-3: The Cleanup Deadlock on Hibernating Threads
+**Problem:** `WinMonitor::Cleanup()` attempted to `WaitForSingleObject` on the background threads before signaling them to shut down. Since the threads were parked infinitely waiting for `hDeepWorkEvent` (because the user was currently in a non-work app), they never woke up to see the `isRunning = false` flag, causing a shutdown hang and a violent thread termination.
+**Fix:** The shutdown sequence must follow "Signal-Before-Wait". `Cleanup()` now calls `SetEvent(hDeepWorkEvent)` *before* waiting on the thread handles. This instantly unblocks them so they can exit gracefully.

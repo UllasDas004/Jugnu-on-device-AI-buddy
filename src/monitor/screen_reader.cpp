@@ -88,6 +88,56 @@ namespace Jugnu
     //   Monaco (LeetCode, VS Code) can register as Document, Edit, or Group depending
     //   on the Chrome version. Searching for the longest text is universal and robust.
     // ─────────────────────────────────────────────────────────────────────────
+
+    struct UiaSection
+    {
+        std::wstring typeName;      // "Edit", "Document", "Text"
+        std::wstring automationId;  // smantic role hint from the UIA tree
+        std::wstring text;          // verbatim extracted content
+    };
+
+    // Whitelist: only content-bearing leaf controls.
+    // Lists, trees, menus, toolbars, status bars are NOT in this set → auto-skipped.
+    static const std::unordered_set<CONTROLTYPEID> kContentTypes = {
+        UIA_EditControlTypeId,      // code editors (Monaco in Chrome/VS Code/Clion)
+        UIA_DocumentControlTypeId,  // rich text: problem descriptions, docs, READMEs
+        UIA_TextControlTypeId,      // plain text paragraphs
+    };
+
+    // Helper: Convert UIA CONTROLTYPEID to a readable string
+    static std::wstring ControlTypeName(CONTROLTYPEID id)
+    {
+        switch(id)
+        {
+            case UIA_EditControlTypeId:     return L"Edit";
+            case UIA_DocumentControlTypeId: return L"Document";
+            case UIA_TextControlTypeId:     return L"Text";
+            default:                        return L"Unknown";
+        }
+    }
+
+    // Helper: JSON escape for C++ wide strings (needed for "text": "...")
+    // Without this, "Hello\nWorld" breaks the JSON structure.
+    static std::wstring JsonEscapeW(const std::wstring& s)
+    {
+        std::wstring out;
+        out.reserve(s.size() + 16);
+        for(wchar_t c : s)
+        {
+            switch (c) {
+            case L'"':  out += L"\\\""; break;
+            case L'\\': out += L"\\\\"; break;
+            case L'\n': out += L"\\n";  break;
+            case L'\r': out += L"\\r";  break;
+            case L'\t': out += L"\\t";  break;
+            default:
+                if (c < 0x20) break;  // drop other control chars
+                out += c;
+            }
+        }
+        return out;
+    }
+
     std::wstring ScreenReader::ExtractTextViaUIA(HWND targetWindow)
     {
         // 1. Initialize the UIA COM factory.
@@ -134,7 +184,7 @@ namespace Jugnu
         const size_t MIN_TEXT = 100;    // skip tiny buttons/labels
         const size_t MAX_TEXT = 150000; // kip the root "all-page" element that subsumes everything
 
-        std::vector<std::wstring> candidates;
+        std::vector<UiaSection> candidates;
 
         if(pElemnts)
         {
@@ -146,6 +196,16 @@ namespace Jugnu
                 IUIAutomationElement* pEl = nullptr;
                 if(FAILED(pElemnts->GetElement(i, &pEl)) || !pEl) continue;
 
+                // ── Only process whitelisted content types ────────────────────────
+                CONTROLTYPEID ctrlType = 0;
+                pEl->get_CurrentControlType(&ctrlType);
+                if(!kContentTypes.count(ctrlType))
+                {
+                    pEl->Release();
+                    continue;  // skip List, Tree, Menu, StatusBar, ToolBar, etc.
+                }
+
+                // ── Extract text via TextPattern ──────────────────────────────────
                 // 6. Query the TextPattern interface from this element.
                 //    Not every element has a TextPattern — most buttons and labels don't.
                 //    GetCurrentPattern() returns E_NOINTERFACE if the pattern isn't supported.
@@ -167,25 +227,46 @@ namespace Jugnu
                             SysFreeString(bstr);
                             // 8. Keep only the longest text we've found.
                             //    The code editor always has the most characters.
-                            if(text.length() >= MIN_TEXT && text.length() <= MAX_TEXT)
+                            size_t min_required = (ctrlType == UIA_EditControlTypeId) ? 20 : MIN_TEXT;
+                            if(text.length() >= min_required && text.length() <= MAX_TEXT)
                             {
+                                // ── Get automation ID for Python-side context ─────
+                                std::wstring autoId;
+                                BSTR bId = nullptr;
+                                if(SUCCEEDED(pEl->get_CurrentAutomationId(&bId)) && bId)
+                                {
+                                    autoId = std::wstring(bId, SysStringLen(bId));
+                                    SysFreeString(bId);
+                                }
+
+                                UiaSection sec{
+                                    ControlTypeName(ctrlType),
+                                    autoId,
+                                    text
+                                };
+
                                 // Dedup: prevent parent nodes from duplicating children
                                 bool absorbed = false;
                                 for(auto& existing : candidates)
                                 {
-                                    if(text.find(existing) != std::wstring::npos)
+                                    // Never let Document/Text absorb an Edit, and vice versa.
+                                    // Edits (code blocks) must be preserved independently.
+                                    if(existing.typeName == L"Edit" && sec.typeName != L"Edit") continue;
+                                    if(sec.typeName == L"Edit" && existing.typeName != L"Edit") continue;
+
+                                    if(text.find(existing.text) != std::wstring::npos)
                                     {
-                                        existing = text;    // new is a superset — promote it
+                                        existing = sec;    // new is a superset — promote it
                                         absorbed = true;
                                         break;
                                     }
-                                    if(existing.find(text) != std::wstring::npos)
+                                    if(existing.text.find(text) != std::wstring::npos)
                                     {
                                         absorbed = true; // already captured by a larger block
                                         break;
                                     }
                                 }
-                                if(!absorbed) candidates.push_back(text);
+                                if(!absorbed) candidates.push_back(sec);
                             }
                         }
                         pRange->Release();
@@ -196,25 +277,31 @@ namespace Jugnu
             }
             pElemnts->Release();
         }
+        //── COM cleanup (fix original leak: pCond/pRoot/pAutomation never freed) ─
+        pTrueCondition->Release();
+        pRoot->Release();
+        pAutomation->Release();
+
+        if(candidates.empty()) return L"";
+
         // Sort by length descending — richest content first
         std::sort(candidates.begin(), candidates.end(),
-            [](const std::wstring& a, const std::wstring& b){ return a.length() > b.length(); });
+            [](const UiaSection& a, const UiaSection& b){ return a.text.length() > b.text.length(); });
 
-        // Cap at 3 sections — Problem Statement, Code, and Notes
-        if(candidates.size() > 3) candidates.resize(3);
+        // Cap at 5 sections — Problem Statement, Code, and Notes
+        if(candidates.size() > 5) candidates.resize(5);
 
-        // 9. Cleanup all COM references. COM uses reference counting —
-        //    every object you get must be Release()'d or you leak memory.
-
-        // Join with a clear separator so Python can see section boundaries
-        std::wstring bestText = L"";
-        for(size_t i = 0; i < candidates.size(); i++)
+        // ── Serialize to JSON array → Python reads with json.loads() ─────────────
+        std::wstring json = L"[";
+        for (size_t i = 0; i < candidates.size(); i++)
         {
-            bestText += L"===SECTION===\n";
-            bestText += candidates[i];
-            bestText += L"\n";
+            if (i > 0) json += L",";
+            json += L"{\"type\":\"" + candidates[i].typeName;
+            json += L"\",\"name\":\"" + JsonEscapeW(candidates[i].automationId);
+            json += L"\",\"text\":\"" + JsonEscapeW(candidates[i].text) + L"\"}";
         }
-        return bestText;
+        json += L"]";
+        return json;
     }
 
 
@@ -285,81 +372,122 @@ namespace Jugnu
     // ─────────────────────────────────────────────────────────────────────────
     DWORD WINAPI ScreenReader::ReaderThread(LPVOID lpParam)
     {
-        // Bug4 fix: Do NOT call CoInitializeEx manually before winrt::init_apartment().
-        // winrt::init_apartment() calls CoInitializeEx internally as STA (apartment-threaded).
-        // Calling CoInitializeEx first with COINIT_MULTITHREADED and then winrt with STA
-        // returns RPC_E_CHANGED_MODE — a silent apartment model conflict.
-        // Let WinRT own COM initialization for this thread entirely.
-        winrt::init_apartment(); // Initializes COM as STA — correct for both WinRT OCR and UIA
+        winrt::init_apartment(); 
         g_ocrEngine = OcrEngine::TryCreateFromLanguage(Language(L"en-US"));
         std::cout << "\033[1;36m[ScreenReader]\033[0m UIA + OCR Engine started.\n";
 
-
         bool hasOcredWhileIdle = false;
+        bool wasHibernating = true;
         while(isRunning)
         {
-            // Poll faster (every 2 seconds) so we can catch the exact moment they go idle
-            for(int i=0;i<2&&isRunning;i++) Sleep(1000);
+            // PHASE 1: Hibernate. Sleep infinitely while user is gaming/watching a movie.
+            // WinMonitor::WinEventProc calls SetEvent(hDeepWorkEvent) when a work app opens.
+            if(wasHibernating)
+                std::cout << "\033[90m[ScreenReader]\033[0m Standby — waiting for a focus session to begin.\n";
+            WaitForSingleObject(Jugnu::hDeepWorkEvent, INFINITE);
             if(!isRunning) break;
 
-            // Check if user has been idle for the threshold (e.g., 30s)
-            bool isIdle = WinMonitor::IsUserIdle();
-            if(!isIdle)
+            if(wasHibernating)
             {
-                // User is actively moving mouse/typing. Reset flag, but DON'T OCR yet.
-                hasOcredWhileIdle = false;
-                continue;
+                std::cout << "\033[1;32m[ScreenReader]\033[0m Focus session detected — screen capture guard is live.\n";
+                wasHibernating = false;
             }
 
-            if(isIdle && hasOcredWhileIdle) continue;
-
-            hasOcredWhileIdle = true;
-            
-            HWND hwnd = GetForegroundWindow();
-            if(!hwnd) continue;
-
-            std::string currentApp = WinMonitor::GetProcessName(hwnd);
-
-            // Only capture if the app is explicitly whitelisted (e.g., an IDE or Browser)
-            if(ShouldCapture(currentApp))
+            // PHASE 2: User is in a Deep Work app. Use dynamic math.
+            LASTINPUTINFO lii;
+            lii.cbSize = sizeof(LASTINPUTINFO);
+            if(!GetLastInputInfo(&lii))
             {
-                // ── PRIMARY: Try UIA first ────────────────────────────────
-                std::cout << "\033[90m[ScreenReader]\033[0m Trying UIA for " << currentApp << "...\n";
-                std::wstring text = ExtractTextViaUIA(hwnd);
-                if(!text.empty())
+                Sleep(2000);
+                continue;
+            }
+            
+            DWORD idleTime = GetTickCount() - lii.dwTime;
+
+            if(idleTime >= 60000)   // 60 seconds idle → capture screen
+            {
+                if(!hasOcredWhileIdle)
                 {
-                    std::cout << "\033[32m[ScreenReader]\033[0m UIA extracted "
-                              << text.length() << " chars from " << currentApp << ".\n";
-                }
-                else
-                {
-                    // ── FALLBACK: OCR if UIA returned nothing ─────────────
-                    std::cout << "\033[33m[ScreenReader]\033[0m UIA empty — falling back to OCR for "
-                              << currentApp << "...\n";
-                    text = CaptureAndOCR(hwnd);
-                }
-
-                // Bug3 fix: removed stale "Capturing" log line leftover from OCR-only version
-
-                if(!text.empty())
-                {
-                    // Convert UTF-16 wide string to UTF-8 standard string for JSON compatibility
-                    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0, NULL, NULL);
-                    std::string utf8_text(size_needed, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), &utf8_text[0], size_needed, NULL, NULL);
-
-                    // ARCHITECTURE CHANGE: Write directly to SQLite ocr_buffer.
-                    // No JSON escaping needed — SQLite prepared statements handle all special chars safely.
-                    // No IPC pipe involved — large OCR text blobs never travel over Named Pipes.
-                    // Python's FlushWorker will read this table every 60s and clean it with Gemma.
-
-                    if(DBHandler::BufferOCR(currentApp, utf8_text))
+                    hasOcredWhileIdle = true;
+                    
+                    HWND hwnd = GetForegroundWindow();
+                    if(!hwnd)
                     {
-                        std::cout << "\033[32m[ScreenReader]\033[0m Buffered " 
-                                  << utf8_text.length() << " chars from " 
-                                  << currentApp << " to ocr_buffer.\n";
+                        Sleep(2000);
+                        continue;
+                    }
+
+                    std::string currentApp = WinMonitor::GetProcessName(hwnd);
+
+                    // Only capture if the app supports UIA extraction
+                    if(ShouldCapture(currentApp))
+                    {
+                        std::cout << "\033[1;36m[ScreenReader]\033[0m 60s idle detected in '" << currentApp << "' — reading screen context...\n";
+
+                        // ── PRIMARY: Try UIA first ────────────────────────────────
+                        std::cout << "\033[90m[ScreenReader]\033[0m Trying UIA for " << currentApp << "...\n";
+                        std::wstring text = ExtractTextViaUIA(hwnd);
+                        if(!text.empty())
+                        {
+                            std::cout << "\033[32m[ScreenReader]\033[0m UIA extracted "
+                                    << text.length() << " chars from " << currentApp << ".\n";
+                        }
+                        else
+                        {
+                            // ── FALLBACK: OCR if UIA returned nothing ─────────────
+                            std::cout << "\033[33m[ScreenReader]\033[0m UIA returned nothing — falling back to OCR for "
+                                    << currentApp << "...\n";
+                            text = CaptureAndOCR(hwnd);
+                        }
+
+                        if(!text.empty())
+                        {
+                            // Convert UTF-16 wide string to UTF-8 standard string for JSON compatibility
+                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0, NULL, NULL);
+                            std::string utf8_text(size_needed, 0);
+                            WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), &utf8_text[0], size_needed, NULL, NULL);
+
+                            // ARCHITECTURE CHANGE: Write directly to SQLite ocr_buffer.
+                            // No JSON escaping needed — SQLite prepared statements handle all special chars safely.
+                            // No IPC pipe involved — large OCR text blobs never travel over Named Pipes.
+                            // Python's FlushWorker will read this table every 60s and clean it with Gemma.
+
+                            if(DBHandler::BufferOCR(currentApp, utf8_text))
+                            {
+                                std::cout << "\033[32m[ScreenReader]\033[0m Queued " 
+                                        << utf8_text.length() << " chars from " 
+                                        << currentApp << " \u2014 pending synthesis by Gemma.\n";
+                            }
+                        }
+                        else
+                        {
+                            std::cout << "\033[33m[ScreenReader]\033[0m Both UIA and OCR returned empty for " << currentApp << ". Nothing buffered.\n";
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "\033[90m[ScreenReader]\033[0m '" << currentApp << "' is not in the capture list \u2014 skipping context read.\n";
                     }
                 }
+                Sleep(2000);    // Stay in slow loop while they remain idle
+            }
+            else
+            {
+                // User is active. Check if we left the focus zone.
+                DWORD eventState = WaitForSingleObject(Jugnu::hDeepWorkEvent, 0);
+                if(eventState == WAIT_TIMEOUT)
+                {
+                    std::cout << "\033[90m[ScreenReader]\033[0m Left the focus zone \u2014 screen capture entering standby.\n";
+                    wasHibernating = true;
+                    hasOcredWhileIdle = false;
+                    continue;
+                }
+
+                hasOcredWhileIdle = false;
+                DWORD timeRemaining = 60000 - idleTime;
+                std::cout << "\033[90m[ScreenReader]\033[0m User is active. Screen guard sleeping for "
+                          << (timeRemaining / 1000) << "s.\n";
+                Sleep(timeRemaining);
             }
         }
         CoUninitialize();   // Cleanup COM on thread exit

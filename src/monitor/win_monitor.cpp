@@ -2,7 +2,9 @@
 #include "monitor/memory_manager.h"
 #include "db/db_handler.h"
 #include "server/ipc_server.h"
-#include<psapi.h> // for getWindowTextA
+#include <psapi.h> // for getWindowTextA
+#include <unordered_set>
+
 // Definition of static member frequency                   
 LARGE_INTEGER Jugnu::WinMonitor::frequency;
 namespace Jugnu
@@ -12,6 +14,16 @@ namespace Jugnu
     HANDLE WinMonitor::hStuckThread = NULL;
     std::string WinMonitor::currentForegroundProcess = "";
     std::string WinMonitor::lastMeaningfulApp = "";
+    
+    // --- Deep Work Whitelist ---
+    // Shared between the foreground hook (to gate UIA extraction) 
+    // and the StuckTimer (to prevent notifications during games/movies).
+    static const std::unordered_set<std::string> DeepWorkWhitelist = {
+        "code.exe", "devenv.exe", "clion64.exe", "idea64.exe", 
+        "pycharm64.exe", "rider64.exe", "webstorm64.exe", 
+        "sublime_text.exe", "notepad++.exe", "WindowsTerminal.exe", 
+        "pwsh.exe", "chrome.exe", "Antigravity IDE.exe"
+    };
 
     std::string WinMonitor::GetWindowTextString(HWND hwnd)
     {
@@ -76,7 +88,7 @@ namespace Jugnu
         DWORD windowPid;
         GetWindowThreadProcessId(hwnd, &windowPid);
 
-        std::cout << "\033[90m[Debug] Foreground Switched: PID=" << windowPid << " | processName=" << processName << " | title=" << windowTitle << "\033[0m\n";
+        std::cout << "\033[1;36m[System]\033[0m Foreground Switched: PID=" << windowPid << " | processName=\033[1;32m" << processName << "\033[0m | title=" << windowTitle << "\n";
 
         // Ignore Explorer.EXE during transient states (Alt-Tab task switcher, empty titles)
         if(processName == "Explorer.EXE" || processName == "explorer.exe")
@@ -94,8 +106,7 @@ namespace Jugnu
                 return;
             }
         }
-
-
+        
         if (ownPid == windowPid) {
             std::cout << "\033[90m[Debug] Ignored because ownPid == windowPid\033[0m\n";
             return;
@@ -119,7 +130,20 @@ namespace Jugnu
         Jugnu::DBHandler::LogAppSwitch(processName, windowTitle);
         Jugnu::MemoryManager::ProcessAppSwitch(processName, windowTitle);
 
-        // All filters passed — this is a real user-focused app. Safe to use in idle payload.
+        
+        if(DeepWorkWhitelist.find(processName) == DeepWorkWhitelist.end())
+        {
+            // Non-work app → put both threads to sleep
+            if(hDeepWorkEvent) ResetEvent(hDeepWorkEvent);
+            std::cout << "\033[90m[Jugnu]\033[0m \'" << processName << "\' is outside the focus zone — background threads entering standby.\n";
+            return;
+        }
+
+        // Deep Work app → wake up both threads
+        if(hDeepWorkEvent) SetEvent(hDeepWorkEvent);
+        std::cout << "\033[1;32m[Jugnu]\033[0m Focus zone active: \'" << processName << "\' — monitoring threads are live.\n";
+
+        // All filters passed — this is a real user-focused Deep Work app. Safe to use in idle payload.
         lastMeaningfulApp = processName;
 
         // GENERATE JSON AND BROADCAST TO PYTHON
@@ -149,6 +173,10 @@ namespace Jugnu
 
     void WinMonitor::Init()
     {
+        // Create a manual-reset event, initially non-signaled (threads start suspended).
+        // Manual-reset means ALL waiting threads wake up when SetEvent() is called, not just one.
+        hDeepWorkEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
         std::cout << "\033[1;36m[WinMonitor]\033[0m Installing EVENT_SYSTEM_FOREGROUND hook...\n";
         
         // Grab the initial window state in case the user started Jugnu inside an integrated terminal!
@@ -182,8 +210,15 @@ namespace Jugnu
     void WinMonitor::Cleanup()
     {
         isRunning = false;
+
+        // CRITICAL ORDER: Signal the event FIRST so blocked threads can unblock,
+        // check isRunning=false, and exit. THEN we wait for the thread to finish.
+        // If we wait BEFORE signaling, the thread blocks forever on WaitForSingleObject.
+        if(hDeepWorkEvent)
+            SetEvent(hDeepWorkEvent);
+
         if(hStuckThread) {
-            WaitForSingleObject(hStuckThread, 1000);
+            WaitForSingleObject(hStuckThread, 2000);
             CloseHandle(hStuckThread);
             hStuckThread = NULL;
         }
@@ -193,6 +228,12 @@ namespace Jugnu
             UnhookWinEvent(hook);
             hook = nullptr;
             std::cout<<"[WinMonitor] Hook removed.\n";
+        }
+
+        if(hDeepWorkEvent)
+        {
+            CloseHandle(hDeepWorkEvent);
+            hDeepWorkEvent = NULL;
         }
     }
 
@@ -221,36 +262,66 @@ namespace Jugnu
     DWORD WINAPI WinMonitor::StuckTimerThread(LPVOID lpParam)
     {
         bool hasTriggered = false;
+        bool wasHibernating = true; // Track state to avoid spamming prints
 
         while(isRunning)
         {
-            // P2-FIX: 10-second granularity is fine for idle detection.
-            // Reduces wakeups from 86,400/day to 8,640/day.
-            Sleep(10000); // Check every 10 second
+            // PHASE 1: Hibernate. Sleep infinitely while user is in a game/movie.
+            // When WinEventProc sees a Deep Work app, it calls SetEvent() to wake us.
+            if(wasHibernating)
+                std::cout << "\033[90m[StuckTimer]\033[0m Standby — waiting for a focus session to begin.\n";
+            WaitForSingleObject(hDeepWorkEvent, INFINITE);
+            if(!isRunning) break;   // Cleanup() called SetEvent to unblock us for exit
 
+            if(wasHibernating)
+            {
+                std::cout << "\033[1;32m[StuckTimer]\033[0m Focus session detected — idle guard is active.\n";
+                wasHibernating = false;
+            }
+
+            // PHASE 2: User is in a Deep Work app. Use dynamic math — no fixed polling.
             LASTINPUTINFO lii;
             lii.cbSize = sizeof(LASTINPUTINFO);
-            if (GetLastInputInfo(&lii)) {
-                DWORD currentTick = GetTickCount(); 
-                DWORD idleTime = currentTick - lii.dwTime;
-                
-                // If the user has been idle for > 3 minutes (180000 ms)
-                // AND they are currently staring at a coding app...
-                if (idleTime > 180000)
+            if(!GetLastInputInfo(&lii))
+            {
+                Sleep(10000);   // Failsafe: prevent divide-by-zero / spinloop if API fails
+                continue;
+            }
+            DWORD currentTick = GetTickCount(); 
+            DWORD idleTime = currentTick - lii.dwTime;
+            
+            if (idleTime > 180000)
+            {
+                // Hit 3 minutes! Fire the stuck notification (only once per idle session).
+                if (!hasTriggered)
                 {
-                    if (!hasTriggered)
-                    {
-                        std::cout << "\n\033[1;31m[StuckTimer]\033[0m User has been idle for 3 min. Notifying Python...\n";
-                        // Use lastMeaningfulApp (set AFTER all filters) not currentForegroundProcess
-                        // (set BEFORE filters, so Explorer.EXE poisons it on every taskbar hover)
-                        const std::string& idleApp = lastMeaningfulApp.empty() ? currentForegroundProcess : lastMeaningfulApp;
-                        std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + idleApp + "\"}";
-                        Jugnu::IPCServer::SendMessageToPython(idlePayload);
-                        hasTriggered = true; // Prevent spamming
-                    }
+                    std::cout << "\n\033[1;31m[StuckTimer]\033[0m No activity for 3 minutes. Sending focus nudge to Python...\n";
+                    const std::string& idleApp = lastMeaningfulApp.empty() ? currentForegroundProcess : lastMeaningfulApp;
+                    std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + idleApp + "\"}";
+                    Jugnu::IPCServer::SendMessageToPython(idlePayload);
+                    hasTriggered = true;
                 }
-                else if(idleTime < 180000)
-                    hasTriggered = false; // Reset when user moves the mouse again
+                // Stay in a slow 10s loop while they remain stuck (don't spin-lock)
+                Sleep(10000);
+            }
+            else
+            {
+                // User is active. Check if event was reset (they switched to a non-work app)
+                DWORD eventState = WaitForSingleObject(hDeepWorkEvent, 0);
+                if(eventState == WAIT_TIMEOUT)
+                {
+                    // Event was reset — they switched to a game/movie.
+                    std::cout << "\033[90m[StuckTimer]\033[0m Left the focus zone — idle guard entering standby.\n";
+                    wasHibernating = true;
+                    hasTriggered = false;
+                    continue; // Loop back to WaitForSingleObject(INFINITE)
+                }
+
+                hasTriggered = false;
+                DWORD timeRemaining = 180000 - idleTime;
+                std::cout << "\033[90m[StuckTimer]\033[0m User is active. Idle guard sleeping for "
+                          << (timeRemaining / 1000) << "s.\n";
+                Sleep(timeRemaining);
             }
         }
         return 0;

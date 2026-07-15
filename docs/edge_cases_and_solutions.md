@@ -463,3 +463,132 @@
 **Situation:** The `Embedder` prevents duplicate entries by running a cosine similarity check. If two docs share a topic (`dist < 0.30`), it merges them using the LLM.
 **Problem:** The merge prompt brutally truncated the existing JSON doc to `1000` characters to save tokens. If the existing doc was a long problem statement, the JSON was abruptly sliced in half (`{"content": "Output...`), causing Gemma to completely hallucinate or drop the corrupted data during the merge.
 **Solution:** Increased the merge prompt truncation limits to `4000` characters to comfortably fit full JSON representations, and doubled the inference context window (`num_ctx = 8192`) to guarantee the LLM has enough memory to digest both full documents.
+
+---
+
+## Category 10: OKF Pipeline & Context Saving Edge Cases (Phase 3 — Current)
+
+These edge cases were discovered during the implementation of the Zero-IPC OCR pipeline and the structured OKF knowledge_docs system.
+
+### EC-OKF1 — The "Infinite Reprocessing" Trap
+**Situation:** The FlushWorker reads from `ocr_buffer`, calls Gemma to extract knowledge, and then deletes the processed row.
+**Problem:** We originally deleted the row from `ocr_buffer` at the start of processing — before Gemma ran. If Gemma crashed mid-way (OOM, Ollama timeout), the row was already gone. The knowledge was lost permanently and there was no retry mechanism.
+**Solution:** Changed the delete strategy to end-of-processing. A row is now only added to `ids_to_delete` after `save_knowledge_doc()` returns successfully. If an exception is caught, the row ID goes into `ids_failed` and stays in `ocr_buffer` to be retried on the next 60-second cycle.
+
+---
+
+### EC-OKF2 — The "URL Bar Poisoning" Trap
+**Situation:** The UIA engine captures `Edit` control types from Chrome, which maps to code editors (Monaco). But Chrome's address bar is also a UIA `Edit` control.
+**Problem:** The FlushWorker was routing all `Edit` controls as verbatim code, so the Chrome URL bar (`https://leetcode.com/problems/...`) was being saved as a "code snippet" tagged as `["code"]`. This polluted the knowledge vault with hundreds of URL entries.
+**Solution:** Added a heuristic URL filter before the verbatim path. If the `Edit` text starts with `://`, `www.`, contains `leetcode.com` or `github.com` in the first 30 chars, or is a single word containing a `.` — it is silently skipped. Only the actual Monaco editor content passes through.
+
+---
+
+### EC-OKF3 — The "Semantic Anchor Embedding Failure" Trap
+**Situation:** We embed the 1-2 sentence prose summary as the semantic anchor in `vec_knowledge`, not the raw code.
+**Problem:** When the AI engine failed to generate a summary (empty `summary` field), the embedder fell back to embedding `topic + ""` — essentially just the topic string alone. This produced vectors that were nearly identical for all docs with the same topic, making KNN search useless and causing every document about "dynamic programming" to collide.
+**Solution:** Added a fallback in `save_knowledge_doc()`: if `summary` is empty, embed `topic + content[:400]` instead. This ensures the vector always has enough semantic signal, even when Gemma fails to generate the prose anchor.
+
+---
+
+### EC-OKF4 — The "vec_knowledge Count Guard" Crash
+**Situation:** The OKF similarity check runs a KNN query on `vec_knowledge` before deciding to insert or merge.
+**Problem:** On a fresh install or after a database wipe, `vec_knowledge` has zero rows. Running `WHERE embedding MATCH ? AND k = 1` on an empty sqlite-vec virtual table throws a fatal exception instead of returning an empty result set. The entire FlushWorker cycle crashes on the very first knowledge doc it tries to save.
+**Solution:** Added a `SELECT COUNT(*) FROM knowledge_docs` guard before the KNN call. If `count == 0`, the similarity check is skipped and the doc is inserted directly as a fresh entry. This mirrors the identical guard that was already in `save_memory()` for `vec_episodic`.
+
+---
+
+### EC-OKF5 — The "Duplicate Except Outer Try" Bug
+**Situation:** The `save_knowledge_doc()` function in `embedder.py` has two code paths: a merge path (when a similar doc exists) and an insert path (when it's new).
+**Problem:** During a refactor, a second `except Exception` block was accidentally placed at the same indentation level as the outer `try`, creating two separate `try/except` blocks. The inner merge path had no exception handling. Any error during merging (e.g., `json.loads` failure on a corrupted `ext_tags`) would propagate uncaught and crash the FlushWorker thread entirely.
+**Solution:** Verified the exception handler covers the entire function body with a single outer `try/except`. The `tags` merge uses a nested `try/except` to handle malformed JSON gracefully, falling back to `old_tags = []` without breaking the outer flow.
+
+---
+
+### EC-OKF6 — The "Socket FD Leak on Startup" Trap
+**Situation:** The `Embedder.__init__()` checks if the machine is online by connecting a raw socket to `8.8.8.8:53`.
+**Problem:** The original implementation created a `socket.socket()` object and stored it in a variable but never explicitly called `.close()`. On every Jugnu startup, one OS file descriptor was leaked. On a machine running for weeks, this would eventually exhaust the process's FD limit.
+**Solution:** Replaced the socket creation with a `with socket.socket(...) as _s:` context manager. The OS file descriptor is guaranteed to be closed the instant the `with` block exits, whether the connection succeeded, timed out, or raised an exception.
+
+---
+
+### EC-OKF7 — The "Unbounded Cache Memory Leak" Trap
+**Situation:** The FlushWorker and Embedder both maintain in-memory caches (`_last_raw_by_app`, `_last_embedded`) to deduplicate screen captures and embeddings.
+**Problem:** These caches were plain Python dicts with no size limit. In a long session where the user uses many different applications (each with a different `app_name` key), the cache grows unboundedly. Over days, this becomes a measurable RAM leak as OCR blobs (~2KB each) accumulate for every process the user has ever opened.
+**Solution:** Added a `MAX_CACHE = 20` eviction policy in both caches. Before inserting a new entry, if the dict exceeds the limit, the oldest entry is evicted using `cache.pop(next(iter(cache)))`. This works because Python 3.7+ dicts are guaranteed to be insertion-ordered, so `next(iter(cache))` always returns the oldest key.
+
+---
+
+### EC-OKF8 — The "85% Screen Similarity False Skip" Trap
+**Situation:** The FlushWorker uses `difflib.SequenceMatcher` to compare the current OCR dump to the last one processed for the same app. If similarity is > 85%, the AI extraction is skipped.
+**Problem:** On LeetCode, the problem statement (top 80% of the screen) is static, but the user's code (bottom 20%) changes as they type. The difflib ratio was dominated by the stable problem text, consistently scoring > 85%, which caused Jugnu to skip Gemma extraction even when the user had just written a complete solution.
+**Solution:** The 85% threshold is intentionally kept for full-screen OCR (fallback path) where the screen changes substantially between captures. For the structured UIA JSON path (primary path), similarity check is applied per-section rather than on the full blob, allowing changed `Edit` (code) sections to be processed even when the surrounding `Document` (problem statement) is unchanged.
+
+---
+
+### EC-OKF9 — The "Greedy Section Best-Wins" Problem
+**Situation:** Early versions of the OKF pipeline extracted multiple UIA sections but used a "best-wins" strategy — only keeping the single extraction with the highest confidence score.
+**Problem:** The LeetCode problem statement (a long `Document` control) consistently scored higher than the user's C++ code (a shorter `Edit` control). The strategy discarded the code entirely, making Jugnu blind to the user's actual solution — the most valuable thing to remember.
+**Solution:** Changed `combine_sections()` to accept and return **all** valid extractions as a list. Every section that produces valid structured knowledge is preserved as an independent doc. Both the problem statement and the code snippet are saved to `knowledge_docs` as separate, linked entries.
+
+---
+
+### EC-OKF10 — The "30-Second Settle Time Race" Trap
+**Situation:** The FlushWorker uses a 30-second settle-time filter: it only processes `ocr_buffer` rows that are at least 30 seconds old, giving C++ time to finish writing before Python reads.
+**Problem:** When the user switches apps rapidly (e.g., switches to Chrome, types for 20 seconds, then switches back), C++ may write 3-4 rows within the 30-second window for the same app with evolving screen state. All 4 rows would pass the settle filter together in the next cycle, causing Gemma to extract the same progressively-built code snippet 4 times and creating duplicate knowledge docs.
+**Solution:** The per-row difflib deduplication (EC-OKF8) handles this: when 4 rows for the same app arrive in the same cycle, the second, third, and fourth are compared against the cached text of the one before them and skipped if similarity is > 85%. Only the first (oldest) and last (most current) are ever extracted, and the merge logic in `save_knowledge_doc()` consolidates them into a single doc.
+
+---
+
+## Summary: Core Principles Added from OKF Edge Cases
+
+| Principle | Implementation |
+|---|---|
+| **Delete only after success** | `ids_to_delete` populated at end of processing, not start |
+| **Filter at the source** | URL bar heuristic prevents URL bar from entering the code path |
+| **Always have a fallback embedding** | `topic + content[:400]` when `summary` is empty |
+| **Guard KNN on empty tables** | `COUNT(*)` check before every sqlite-vec `MATCH` query |
+| **Cap all caches** | `MAX_CACHE=20` eviction on every in-memory dict |
+| **Per-section deduplication** | Similarity check on sections, not on full blobs |
+| **Preserve all extractions** | Every section saved — no best-wins strategy |
+| **Retry on failure** | Failed rows stay in `ocr_buffer` for next cycle |
+
+---
+
+## Category 11: The Zero-Overhead Hibernation Architecture (Phase 4)
+
+These optimizations focus purely on how we eliminated CPU polling overhead in the native C++ monitor threads (`ScreenReader` and `StuckTimer`).
+
+### EC-CPP1 — The "100ms Polling Spinloop" Overhead
+**Situation:** The `StuckTimer` and `ScreenReader` threads need to know when the user is actively working in a Deep Work app (IDE/browser) vs when they are playing a game or watching a movie.
+**Problem:** Early designs used a fixed `Sleep(100)` polling loop. The threads would wake up 10 times a second, query the foreground window, check if it was in the whitelist, and then go back to sleep. While low-impact individually, doing this constantly while the user is playing a CPU-heavy game steals L1 cache and micro-cycles from the game, leading to micro-stutters and battery drain.
+**Solution:** Eliminated polling completely via the **Zero-Overhead Hibernation Architecture**.
+1. We created a manual-reset Windows Event (`hDeepWorkEvent`).
+2. When the user is NOT in a work app, both background threads call `WaitForSingleObject(hDeepWorkEvent, INFINITE)`. The Windows kernel suspends the threads with absolute **0% CPU usage** and zero cache evictions.
+3. The `WinMonitor` foreground hook (which only fires exactly when the window changes) calls `SetEvent()` to instantly wake both threads when a whitelisted app is focused.
+4. If a game is launched, `ResetEvent()` is called, and the threads seamlessly fall back into infinite hibernation.
+
+---
+
+### EC-CPP2 — The "Fixed Polling vs Dynamic Math" Trap
+**Situation:** Even when the user *is* inside a Deep Work app, the `ScreenReader` needs to wait exactly 60 seconds of idle time before capturing the screen.
+**Problem:** The initial implementation used a fixed `Sleep(2000)` loop while the user was active, waking up every 2 seconds to check `GetLastInputInfo()` and see if 60 seconds had passed. This is still a form of polling.
+**Solution:** Switched to **Dynamic Sleep Math**. The thread queries `GetLastInputInfo()`, calculates exactly how much time is remaining until the 60-second threshold (`DWORD timeRemaining = 60000 - idleTime;`), and calls `Sleep(timeRemaining)`. The thread wakes up exactly once, at the exact millisecond the user has been idle for 60 seconds, completely eliminating mid-interval polling.
+
+---
+
+### EC-CPP3 — The "Infinite Shutdown Deadlock"
+**Situation:** When Jugnu exits, `WinMonitor::Cleanup()` is called to terminate the hibernating background threads safely.
+**Problem:** The cleanup function originally called `WaitForSingleObject(hStuckThread, 2000)` to wait for the thread to exit before signaling `hDeepWorkEvent`. But because the thread was blocked indefinitely on `WaitForSingleObject(hDeepWorkEvent, INFINITE)` while the user was in a non-work app, it would never wake up to check the `isRunning = false` flag. The cleanup function would hang for 2 seconds and then violently force-close the thread.
+**Solution:** Reversed the shutdown order (Signal-Before-Wait). The cleanup function now explicitly calls `SetEvent(hDeepWorkEvent)` *first*. This instantly unblocks the sleeping threads. They wake up, see `isRunning = false`, and exit gracefully before the main thread calls `Wait`.
+
+---
+
+## Summary: Hibernation Architecture
+
+| Principle | Implementation |
+|---|---|
+| **Zero-Overhead Hibernation** | `WaitForSingleObject(INFINITE)` completely suspends threads outside work apps. |
+| **Event-Driven Wakeup** | `SetEvent()` / `ResetEvent()` triggered exclusively by the foreground OS hook. |
+| **Dynamic Sleep Math** | `Sleep(timeRemaining)` eliminates polling even during active work sessions. |
+| **Signal-Before-Wait** | Ensures sleeping threads can wake up to process termination signals. |

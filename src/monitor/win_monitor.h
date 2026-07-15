@@ -6,6 +6,10 @@
 
 namespace Jugnu
 {
+    // Shared Kernel Event: signaled when user is in a Deep Work app, reset otherwise.
+    // ScreenReader and StuckTimer both wait on this to hibernate when gaming/watching movies.
+    inline HANDLE hDeepWorkEvent = NULL;
+    
     class WinMonitor
     {
     public:

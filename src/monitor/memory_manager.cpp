@@ -2,6 +2,8 @@
 #include <iostream>
 #include <algorithm>
 #include "db/db_handler.h"
+#include <unordered_set>
+#include <cmath>
 
 namespace Jugnu
 {
@@ -54,7 +56,6 @@ namespace Jugnu
         lastApp = processName;
         UpdateLRU(processName);
         UpdateEMA(processName);
-        ThrottleDistractors(processName);
     }
 
     void MemoryManager::UpdateMarkov(const std::string& currentApp, const std::string& nextApp)
@@ -149,24 +150,32 @@ namespace Jugnu
 
     void MemoryManager::UpdateEMA(const std::string& currentApp)
     {
-        emaScores[currentApp] = 1.0f; // Boost current app
+        if(currentApp.empty() || currentApp == "Explorer.EXE" || currentApp == "explorer.exe") return;
 
-        // Decay all others
-        for(auto it=emaScores.begin();it!= emaScores.end();)
+        // Current app gets bumped to 1.0
+        emaScores[currentApp] = 1.0f;
+
+        // Everyone else decays
+        for(auto it = emaScores.begin(); it != emaScores.end(); )
         {
             if(it->first != currentApp)
             {
                 it->second *= 0.8f;
-
-                // TRAP FIX: Subnormal Float slowdown
-                if(it->second < 0.1f)
-                {
-                    it = emaScores.erase(it);
-                    continue;
-                }
             }
-            ++it;
+
+            // Purge dead apps from RAM to save memory
+            if(it->second < 0.05f)
+            {
+                it = emaScores.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
+
+        // Evaluate priorities on every switch
+        ThrottleDistractors(currentApp);
     }
 
     void MemoryManager::PrefetchToRAM(const std::string& processName)
@@ -257,28 +266,27 @@ namespace Jugnu
 
     void MemoryManager::ThrottleDistractors(const std::string& currentApp)
     {
+        auto it = emaScores.find(currentApp);
+        if(it == emaScores.end()) return;
+
+        float currentScore = it->second;
+        const float DEEP_WORK_THRESHOLD = 0.8f;
+        const float DISTRACTOR_THRESHOLD = 0.2f;
+        
+        bool isDeepWork = (currentScore >= DEEP_WORK_THRESHOLD);
+
         // P1-FIX: Only snapshot the process list when the app actually changes.
         // CreateToolhelp32Snapshot() scans 150+ processes every call — 5-20ms.
         // Previously this ran on EVERY foreground event, causing the >1ms warnings.
         static std::string lastThrottledFor = "";
         if(currentApp == lastThrottledFor) return;
+        
+        static bool lastWasDeepWork = false;
+
+        lastWasDeepWork = isDeepWork;
         lastThrottledFor = currentApp;
 
-        // --- FULLY DYNAMIC: No hardcoded names. Pure EMA data. ---
-        // Thresholds (tune these after a week of real usage data)
-        constexpr float DEEP_WORK_THRESHOLD  = 0.6f;  // "I use this app intensely and stay in it"
-        constexpr float DISTRACTOR_THRESHOLD  = 0.2f;  // "This process is running but I rarely focus on it"
-        // Is the CURRENT focused app a deep work app? Let the EMA score decide!
-        float currentScore = 0.0f;
-        auto it = emaScores.find(currentApp);
-        if(it != emaScores.end()) currentScore = it->second;
-
-        // Define what constitutes a "Deep Work" app
-        bool isDeepWork = (currentScore >= DEEP_WORK_THRESHOLD);
-
-        if(isDeepWork)
-        std::cout << "\033[33m[Governor]\033[0m Deep Work detected on " << currentApp 
-                      << " (EMA=" << currentScore << "). Throttling distractors...\n";
+        static std::unordered_set<DWORD> throttledPids;
 
         // Scan ALL running processes and let EMA scores decide who to throttle
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -296,35 +304,45 @@ namespace Jugnu
                 if(exeName == currentApp || exeName == "System" || 
                    exeName == "svchost.exe" || exeName == "explorer.exe") continue;
 
-                float score = 0.0f;
-                auto scoreIt = emaScores.find(exeName);
-                if(scoreIt != emaScores.end()) score = scoreIt->second;
-
                 // Only act on apps we have actually SEEN before (score > 0)
                 // Unknown background processes (score == 0) are left alone entirely
 
+                float score = 0.0f;
+                auto scoreIt = emaScores.find(exeName);
+                if(scoreIt != emaScores.end()) score = scoreIt->second;
                 if(score == 0.0f) continue;
-                // A "distractor" is an app you rarely switch to (low EMA) but is running
-                bool isDistractor = (score < DISTRACTOR_THRESHOLD);
-
-                DWORD newPriority;
-                if(isDeepWork && isDistractor) newPriority = IDLE_PRIORITY_CLASS;
-                else newPriority = NORMAL_PRIORITY_CLASS;
                 
-                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
+                bool isDistractor = (score < DISTRACTOR_THRESHOLD);
+                
+                // We need QUERY permission to read the current priority, and SET to change it.
+                HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
                 if(hProcess)
                 {
                     DWORD currentPriority = GetPriorityClass(hProcess);
-                    // Only set if it actually needs to change (avoid redundant syscalls!)
-                    if(currentPriority != newPriority)
+                    if(currentPriority != 0) // 0 means access denied or error
                     {
-                        SetPriorityClass(hProcess, newPriority);
                         if(isDeepWork && isDistractor)
-                            std::cout << "\033[33m[Governor]\033[0m Throttled " << exeName 
-                                      << " (EMA=" << score << ")\n";
+                        {
+                            // Only throttle if it isn't already throttled
+                            if(currentPriority != IDLE_PRIORITY_CLASS)
+                            {
+                                SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS);
+                                throttledPids.insert(pe32.th32ProcessID);
+                                std::cout << "\033[33m[Governor]\033[0m Throttled " << exeName << " (EMA=" << score << ")\n";
+                            }
+                        }
                         else
-                            std::cout << "\033[33m[Governor]\033[0m Restored  " << exeName 
-                                      << " (EMA=" << score << ")\n";
+                        {
+                            // CRITICAL FIX: Only restore if WE explicitly throttled it!
+                            // Chromium/Electron natively sets background renderers to IDLE_PRIORITY_CLASS.
+                            // If we blindly check for IDLE_PRIORITY_CLASS, we fight with Chrome!
+                            if(throttledPids.find(pe32.th32ProcessID) != throttledPids.end())
+                            {
+                                SetPriorityClass(hProcess, NORMAL_PRIORITY_CLASS);
+                                throttledPids.erase(pe32.th32ProcessID);
+                                std::cout << "\033[33m[Governor]\033[0m Restored  " << exeName << " (EMA=" << score << ")\n";
+                            }
+                        }
                     }
                     CloseHandle(hProcess);
                 }

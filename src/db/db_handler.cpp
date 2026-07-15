@@ -132,7 +132,13 @@ namespace Jugnu
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic         TEXT NOT NULL,
                 source_app    TEXT,
-                doc_json      TEXT NOT NULL,
+                source_type   TEXT DEFAULT 'browser',    -- 'ide' or 'browser'
+                file_path     TEXT,                      -- only set for ide captures
+                summary       TEXT,                      -- compact prose used as embedding anchor
+                tags          TEXT,                      -- JSON array of tags
+                notes         TEXT,                      -- Notes, constraints, edges cases
+                content       TEXT,                      -- Problem statements / documentation
+                code_snippet  TEXT,                      -- Verbatim code
                 first_seen    DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_updated  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 capture_count INTEGER DEFAULT 1
@@ -288,10 +294,14 @@ namespace Jugnu
         if(!db) return false;
         ExecuteSQL("BEGIN TRANSACTION;");
 
-        // UPSERT the scores. If the app exists, update its score. If not, insert it.
+        // Clear the old priorities. Since RAM is the source of truth (loaded on startup),
+        // wiping the table ensures that apps which decayed < 0.05 and were purged from RAM
+        // are also correctly removed from the database.
+        ExecuteSQL("DELETE FROM app_priorities;");
+
+        // Insert the fresh scores
         std::string sql = R"(
-            INSERT INTO app_priorities (process_name, ema_score) VALUES (?, ?) 
-            ON CONFLICT(process_name) DO UPDATE SET ema_score = excluded.ema_score;
+            INSERT INTO app_priorities (process_name, ema_score) VALUES (?, ?);
         )";
 
         sqlite3_stmt* stmt;

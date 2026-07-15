@@ -10,6 +10,9 @@ class StateManager:
         self.active_code_content = ""
         self.last_coding_app = ""
         self.last_coding_app_time = 0.0 # epoch timestamp
+        # Per-app cache of the most recently processed UIA text.
+        # Populated by FlushWorker after processing. Survives ocr_buffer deletion.
+        self._last_screen_text: dict[str, str] = {}
     
     def update_switch(self, current_app, predicted_next):
         self.current_app = current_app
@@ -22,6 +25,12 @@ class StateManager:
     def get_last_coding_app(self) -> str:
         """Returns the last meaningful coding app, or empty string if none."""
         return self.last_coding_app
+
+    def update_screen_text(self, app_name: str, text: str):
+        """Called by FlushWorker after processing a UIA row. Caches the text so
+        generate_prompt_context can still read it after ocr_buffer is cleared."""
+        if text and text.strip():
+            self._last_screen_text[app_name] = text[:8000]
 
     def was_recently_coding(self, within_minutes = 15):
         """Returns True if user was in a coding app within the last N minutes."""
@@ -84,23 +93,28 @@ class StateManager:
         if self.clipboard_content:
             context += f"Clipboard: {self.clipboard_content[:300]}\n"
 
-        # Fetch the LIVE screen text from the UIA buffer!
+        # 1. Fetch from live ocr_buffer first
         try:
             import sqlite3
             conn = sqlite3.connect("jugnu.db", timeout=0.5)
             row = conn.execute(
-                "SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1", 
+                "SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1",
                 (self.current_app,)
             ).fetchone()
             conn.close()
-            
+
             if row and row[0]:
                 uia_text = row[0]
-                # Clean up the SECTION separators for the prompt
                 uia_text = uia_text.replace("===SECTION===", "\n")
                 if len(uia_text) > 4000:
                     uia_text = uia_text[:4000] + "\n...[truncated]"
                 context += f"\nLive Screen Text:\n```\n{uia_text.strip()}\n```\n"
+            else:
+                # ocr_buffer was already cleared by FlushWorker — use cache
+                cached = self._last_screen_text.get(self.current_app, "")
+                if cached:
+                    display = cached[:4000] + ("\n...[truncated]" if len(cached) > 4000 else "")
+                    context += f"\nRecent Screen Text (cached):\n```\n{display.strip()}\n```\n"
         except Exception as e:
             print(f"[StateManager] DB read error: {e}")
 
@@ -114,7 +128,7 @@ class StateManager:
                     context += (
                         f"[Knowledge {i}: {doc['topic']} "
                         f"(seen {doc['capture_count']}x)]\n"
-                        f"{doc['content'][:600]}\n\n"
+                        f"{doc['content'][:3000]}\n\n"
                     )
             else:
                 # Fallback to raw episodic memories if no structured docs yet

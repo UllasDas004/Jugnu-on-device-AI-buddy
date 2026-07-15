@@ -6,6 +6,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import json
 import datetime
+import difflib
 
 
 # ANSI colors for terminal logging
@@ -195,30 +196,39 @@ class Embedder:
             print(f"{_RED}[Embedder] Unexpected error: {e}{_RESET}")
             return False
 
-    def save_knowledge_doc(self, app_name: str, doc_json: str, engine) -> bool:
+    def save_knowledge_doc(self, app_name: str, doc: dict | str, engine) -> bool:
         """
-        Saves or merges a synthesized OKF knowledge document.
-        Flow:
-          1. Embed topic+content as search key
-          2. KNN search in vec_knowledge for similar existing doc
-          3a. Similar found → call engine.merge_knowledge_docs() → UPDATE row
-          3b. No match → INSERT new doc
+        Saves or merges a structured knowledge document into the new column-split schema.
+        Accepts either a dict or a legacy JSON string.
+        Embeds the SUMMARY as the vector anchor for fast semantic search.
         """
         try:
-            doc = json.loads(doc_json)
+            if isinstance(doc, str):
+                doc = json.loads(doc)
         except Exception:
-            print(f"{_RED}[Embedder] Invalid JSON in save_knowledge_doc, skipping.{_RESET}")
+            print(f"{_RED}[Embedder] Invalid doc in save_knowledge_doc, skipping.{_RESET}")
             return False
         
-        topic = doc.get("topic", "")
-        content = doc.get("content", "")
-        search_text = f"{topic}. {content[:400]}"
+        topic       = doc.get("topic", "")
+        summary     = doc.get("summary", "") or ""
+        content     = doc.get("content", "") or doc.get("blocks", "") or ""
+        code_snippet= doc.get("code_snippet", "") or ""
+        notes       = doc.get("notes", "") or ""
+        tags_str    = json.dumps(doc.get("tags", []))
+        file_path   = doc.get("file_path")
+        source_type = doc.get("source_type", "browser")
+
+        # Embedding anchor = summary if available, else topic + first 400 chars of blocks
+        if summary:
+            embed_text = f"{topic}. {summary}"
+        else:
+            embed_text = f"{topic}. {content[:400]}"
 
         try:
             cursor = self._conn.cursor()
 
             # Embed the topic + content snippet for semantic search
-            vec = self._model.encode(f"passage: {search_text}", normalize_embeddings=True)
+            vec = self._model.encode(f"passage: {embed_text}", normalize_embeddings=True)
             blob = self._serialize_vector(vec.tolist())
 
             # Check if vec_knowledge has anything to search
@@ -235,7 +245,7 @@ class Embedder:
                     # find the matching doc id via JSON
                     cursor.execute(
                         """
-                        SELECT kd.id, kd.doc_json
+                        SELECT kd.id, kd.code_snippet, kd.content, kd.notes, kd.tags
                         FROM vec_knowledge vk
                         INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                         WHERE vk.embedding MATCH ? AND k = 1
@@ -245,49 +255,85 @@ class Embedder:
                     )
                     match = cursor.fetchone()
                     if match:
-                        existing_id, existing_json = match
+                        existing_id, ext_code, ext_content, ext_notes, ext_tags = match
                         print(f"{_CYAN}[Embedder] Similar knowledge doc found (id={existing_id}). Merging...{_RESET}")
-                        merged_json = engine.merge_knowledge_docs(existing_json, doc_json)
 
-                        if merged_json:
-                            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                            cursor.execute(
-                                """
-                                UPDATE knowledge_docs
-                                SET doc_json=?, topic=?,
-                                last_updated=?,capture_count=capture_count+1
-                                WHERE id=?;
-                                """,
-                                (merged_json, json.loads(merged_json).get("topic", topic), now, existing_id)
-                            )
-                            # Recompute embedding for merged doc and update vec_knowledge
-                            merged_doc = json.loads(merged_json)
-                            merged_text = f"{merged_doc.get('topic','')}. {merged_doc.get('content','')[:400]}"
-                            merged_vec = self._model.encode(f"passage: {merged_text}", normalize_embeddings=True)
-                            merged_blob = self._serialize_vector(merged_vec.tolist())
-                            cursor.execute(
-                                "UPDATE vec_knowledge SET embedding=? WHERE rowid=?;",
-                                (merged_blob, existing_id)
-                            )
+                        # Merge Code:
+                        # - Similar (>70%): keep the LONGER one (never overwrite a full solution with a stub)
+                        # - Different (<70%): append, but deduplicate line-by-line
+                        if ext_code and code_snippet:
+                            ratio = difflib.SequenceMatcher(None, ext_code, code_snippet).ratio()
+                            if ratio > 0.7:
+                                # Keep whichever is longer — user may have added lines since last capture
+                                final_code = code_snippet if len(code_snippet) >= len(ext_code) else ext_code
+                            else:
+                                # Genuinely different code (e.g. brute force + optimized) — append
+                                # but deduplicate by line to prevent exact duplication
+                                existing_lines = set(ext_code.splitlines())
+                                new_lines = [l for l in code_snippet.splitlines() if l not in existing_lines]
+                                final_code = ext_code + ("\n" + "\n".join(new_lines) if new_lines else "")
+                        else:
+                            final_code = code_snippet or ext_code or ""
 
-                            self._conn.commit()
-                            print(f"{_GREEN}[Embedder] Knowledge doc #{existing_id} merged and updated.{_RESET}")
-                            return True
-            # No Match - insert fresh knowledge doc
+                        # Merge Content: Deduplication by paragraphs
+                        old_paras = [p.strip() for p in (ext_content or "").split("\n\n") if p.strip()]
+                        new_paras = [p.strip() for p in content.split("\n\n") if p.strip()]
+
+                        final_paras = old_paras.copy()
+                        for p in new_paras:
+                            if p not in final_paras:
+                                final_paras.append(p)
+                        final_content = "\n\n".join(final_paras)
+
+
+                        # Merge Notes and & Tags
+                        final_notes = ext_notes + "\n\n" + notes if notes and ext_notes and notes not in ext_notes else (notes or ext_notes or "")
+
+                        try:
+                            old_tags = json.loads(ext_tags) if ext_tags else []
+                        except:
+                            old_tags = []
+                        
+                        merged_tags = list(dict.fromkeys(old_tags + doc.get("tags", [])))
+
+                        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        cursor.execute(
+                            """
+                            UPDATE knowledge_docs
+                            SET topic=?, summary=?, content=?, code_snippet=?, notes=?, tags=?, last_updated=?, capture_count=capture_count+1
+                            WHERE id=?;
+                            """,
+                            (topic, summary, final_content, final_code, final_notes, json.dumps(merged_tags), now, existing_id)
+                        )
+
+                        # Re-embed summary
+                        merged_vec = self._model.encode(f"passage: {topic}. {summary}", normalize_embeddings=True)
+                        cursor.execute("UPDATE vec_knowledge SET embedding=? WHERE rowid=?;", (self._serialize_vector(merged_vec.tolist()), existing_id))
+                        
+                        self._conn.commit()
+                        print(f"{_GREEN}[Embedder] Knowledge doc #{existing_id} merged.{_RESET}")
+                        return True
+                
+            # No Match - insert fresh
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             cursor.execute(
-                """INSERT INTO knowledge_docs (topic, source_app, doc_json, first_seen, last_updated)
-                   VALUES (?, ?, ?, ?, ?);""",
-                (topic, app_name, doc_json, now, now)
+            """INSERT INTO knowledge_docs
+                (topic, source_app, source_type, file_path, summary, tags, notes, content, code_snippet, first_seen, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                (topic, app_name, source_type, file_path, summary, tags_str, notes, content, code_snippet, now, now)
             )
+
             rowid = cursor.lastrowid
-            cursor.execute(
-                "INSERT OR IGNORE INTO vec_knowledge(rowid, embedding) VALUES (?, ?);",
-                (rowid, blob)
-            )
+            cursor.execute("INSERT OR IGNORE INTO vec_knowledge(rowid, embedding) VALUES (?, ?);", (rowid, blob))
             self._conn.commit()
             print(f"{_GREEN}[Embedder] New knowledge doc #{rowid} saved: '{topic}'{_RESET}")
             return True
+        except Exception as e:
+            print(f"{_RED}[Embedder] save_knowledge_doc error: {e}{_RESET}")
+            self._conn.rollback()
+            return False
+                
+                        
         except Exception as e:
             print(f"{_RED}[Embedder] save_knowledge_doc error: {e}{_RESET}")
             self._conn.rollback()
@@ -314,7 +360,7 @@ class Embedder:
 
             cursor.execute(
                 """
-                SELECT kd.topic, kd.doc_json, kd.capture_count, kd.last_updated
+                SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes, kd.capture_count, kd.last_updated
                 FROM vec_knowledge vk
                 INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                 WHERE vk.embedding MATCH ? AND k = ?
@@ -325,18 +371,25 @@ class Embedder:
             rows = cursor.fetchall()
             results = []
             
-            for topic,doc_json_str,capture_count,last_updated in rows:
+            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated in rows:
                 try:
-                    doc = json.loads(doc_json_str)
-                    results.append({
-                        "topic":         doc.get("topic", topic),
-                        "tags":          doc.get("tags", []),
-                        "content":       doc.get("content", ""),
-                        "capture_count": capture_count,
-                        "last_updated":  last_updated,
-                    })
+                    tags = json.loads(tags_str) if tags_str else []
                 except Exception:
-                    continue    # SKip malformed docs silently
+                    tags = []
+
+                full_content = ""
+                if content: full_content += f"CONTENT:\n{content}\n\n"
+                if code_snippet: full_content += f"CODE:\n{code_snippet}\n\n"
+                if notes: full_content += f"NOTES:\n{notes}\n"
+                
+                results.append({
+                    "topic":         topic,
+                    "tags":          tags,
+                    "content":       full_content.strip(),
+                    "capture_count": capture_count,
+                    "last_updated":  last_updated,
+                })
+                
             print(f"{_GREEN}[Embedder] Knowledge search: {len(results)} docs found.{_RESET}")
             return results
         except Exception as e:
