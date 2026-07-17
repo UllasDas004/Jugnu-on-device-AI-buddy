@@ -157,6 +157,61 @@ def _synthesize_and_save_file(engine, embedder, app_name, filepath, code_text):
 # Global stop flag — set by main thread on Ctrl+C, read by reader daemon
 _stop_event = threading.Event()
 
+def _idle_handler_background(state, engine, embedder, screen_context):
+    """
+    Runs in a background thread. Keeps the IPC listener free.
+    Does: LLM query generation → KNN search → situation detection → notification.
+    """
+    print(f"{_YELLOW}[IPC-BG] Generating search query...{_RESET}")
+    search_query = engine.generate_search_query(screen_context)
+    print(f"{_YELLOW}[IPC-BG] KNN Query: '{search_query}'{_RESET}")
+
+    knowledge_docs = embedder.search_knowledge_docs(search_query, limit = 3)
+    context_chunks  = []
+    sources         = []
+    situation_type  = "NO_MEMORY"
+
+    if knowledge_docs:
+        top           = knowledge_docs[0]
+        capture_count = top.get('capture_count', 1)
+        source_type   = top.get('source_type', '')
+        code_snippet  = top.get('code_snippet', '')
+        if capture_count >= 4:
+            situation_type = "REPEATED_STRUGGLE"
+        elif source_type == 'ide':
+            situation_type = "STUCK_ON_OWN_CODE"        # always — user was writing code
+        elif source_type == 'browser' and code_snippet:
+            situation_type = "STUCK_ON_OWN_CODE"        # browser with code = practice problem
+        elif source_type == 'browser':
+            situation_type = "READING_NEW_MATERIAL"     # browser, no code = pure docs
+        else:
+            situation_type = "GENERAL"
+
+        sources = [doc['topic'] for doc in knowledge_docs]
+        print(f"{_GREEN}[IPC-BG] Situation: {situation_type} | Docs: {len(knowledge_docs)}{_RESET}")
+    
+    else:
+        # Fallback: episodic memories
+        memories = embedder.semantic_search(search_query, limit=3)
+        if memories:
+            context_chunks = [m["snippet"] for m in memories]
+            sources        = ["past session memory"]
+            situation_type = "GENERAL"
+            print(f"{_GREEN}[IPC-BG] Falling back to {len(memories)} episodic memories.{_RESET}")
+        else:
+            print(f"{_YELLOW}[IPC-BG] No memory found. Notification will use general insight.{_RESET}")
+        
+    notification.trigger_flow(
+        state, engine, embedder,
+        search_query   = search_query,
+        context_chunks = context_chunks,
+        knowledge_docs = knowledge_docs,
+        sources        = sources,
+        screen_context = screen_context,
+        situation_type = situation_type,
+    )
+
+
 def _pipe_reader_daemon(handle, state, engine, embedder):
     """
     Runs in a daemon thread. Uses PeekNamedPipe to avoid blocking
@@ -206,7 +261,9 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                     
                                     # Since C++ now strictly filters for whitelisted Deep Work apps,
                                     # every SWITCH event is guaranteed to be a coding app.
-                                    state.set_last_coding_app(app)
+                                    # FIX IPC-1: Don't track terminals as coding apps
+                                    if app.lower() not in {"windowsterminal.exe", "pwsh.exe", "cmd.exe"}:
+                                        state.set_last_coding_app(app)
                                 elif event_type == 'CLIPBOARD':
                                     text = payload.get('text', '')
                                     state.update_clipboard(text)
@@ -249,59 +306,19 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         except Exception as e:
                                             print(f"\033[1;31m[Embedder] Could not read file: {e}\033[0m")
                                 elif event_type == "USER_IDLE":
-                                    
-
-                                    # C++ ensures we only receive IDLE events for whitelisted Deep Work apps,
-                                    # using 'lastMeaningfulApp' as the target. So we can proceed directly.
                                     if state.was_recently_coding():
-
-                                        # Step 1: Gemma reads screen context and generates a focused search query
-                                        # (This is a cheap, fast LLM call — just 30 tokens)
-                                        screen_context = state.generate_prompt_context(embedder=None)
-                                        search_query = engine.generate_search_query(screen_context)
-                                        print(f"{_YELLOW}[IPC] KNN Query: '{search_query}'{_RESET}")
-
-                                        # Step 2: Run KNN search ONLY (fast vector math, no GPU inference)
-                                        # We store the results and pass them to notification.
-                                        # Gemma will generate the actual answer ONLY if user clicks Y.
-                                        context_chunks = []
-                                        sources = []
-                                        knowledge_results = embedder.search_knowledge_docs(search_query, limit=3)
-                                        if knowledge_results:
-                                            # Add current screen as first chunk (so Gemma sees what's visible right now)
-                                            if screen_context:
-                                                context_chunks.insert(0, f"[CURRENT SCREEN]\n{screen_context}")
-                                                sources.insert(0, "Current Screen")
-                                                
-                                            for doc in knowledge_results:
-                                                sources.append(doc['topic'])
-                                                context_chunks.append(
-                                                    f"[Topic: {doc['topic']} | Seen {doc['capture_count']}x]\n{doc['content']}"
-                                                )
-                                            print(f"{_GREEN}[IPC] Found {len(sources)} knowledge docs. Spawning notification...{_RESET}")
-                                        else:
-                                            memories = embedder.semantic_search(search_query, limit=3)
-                                            if memories:
-                                                context_chunks = [m["snippet"] for m in memories]
-                                                sources = ["past session memory"]
-                                                print(f"{_GREEN}[IPC] Found {len(memories)} episodic memories. Spawning notification...{_RESET}")
-                                            else:
-                                                print(f"{_YELLOW}[IPC] No memory found. Notification will use general insight.{_RESET}")
-
-                                        # Spawn the notification window — it will run Gemma AFTER user clicks Y
+                                        # Take an instant snapshot — no LLM calls on the IPC thread
+                                        # FIX IPC-2: Trust the payload provided by C++!
+                                        idle_app = payload.get('current_app', state.last_coding_app)
+                                        screen_context_snapshot = state.generate_prompt_context(embedder=None, target_app = idle_app)
                                         threading.Thread(
-                                            target=notification.trigger_flow,
-                                            args=(state, engine, embedder),
-                                            kwargs={
-                                                "search_query": search_query,
-                                                "context_chunks": context_chunks,
-                                                "sources": sources,
-                                                "screen_context": screen_context,
-                                            },
+                                            target=_idle_handler_background,
+                                            args=(state, engine, embedder, screen_context_snapshot),
                                             daemon=True
                                         ).start()
                                     else:
                                         print("\033[90m[System] No recent coding context. Skipping.\033[0m", flush=True)
+
                             except json.JSONDecodeError:
                                 print(f"\033[1;31m[Error] Failed to decode JSON:\033[0m {msg}", flush=True)
                     

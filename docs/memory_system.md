@@ -98,11 +98,12 @@ We transitioned to a **Zero-IPC** approach for heavy data:
 
 [Python FlushWorker (Wakes every 60s)]
   ├─ 1. Prunes rows > 10 mins old (saves GPU)
-  ├─ 2. Deduplication check (>85% similar? Skip entirely)
-  ├─ 3. UIA JSON Routing:
+  ├─ 2. Sanitization: Strips `\ufffc` and `\x00` characters to prevent LLM tokenizer stack-buffer overruns.
+  ├─ 3. Area-Wise Sequence Matching: Decouples Code from Page. Only skips if BOTH are >85% similar.
+  ├─ 4. UIA JSON Routing:
   │      ├─ Type 'Edit' → Bypasses Gemma! Flagged verbatim. Heuristically tags language.
   │      └─ Type 'Document' → Sent to Gemma for strict TOPIC/CONTENT extraction
-  └─ 4. combine_sections(): Pure Python fusion (deduplicates tags/code mathematically)
+  └─ 5. combine_sections(): Pure Python fusion (deduplicates tags/code mathematically)
 
 [AI Engine]
   └─ generate_summary(): Generates a 1-2 sentence prose anchor
@@ -129,6 +130,35 @@ prefixed = f"passage: {topic}. {summary}"
 
 # Search (in Embedder.search_knowledge_docs):
 query_prefixed = f"query: {query_text}"
+```
+
+---
+
+## 2.5 The Phase 3 OKF Read Pipeline (The RAG Engine)
+
+When the user asks for help (via `jugnu_interact.py`), Jugnu transitions from a passive observer to an active assistant.
+
+### The Full Retrieval Flow
+
+```text
+[User Query / Screen Context] 
+  └─ AI Engine: `generate_search_query()` creates a highly focused 15-word semantic search string.
+
+[Embedder (search_knowledge_docs)]
+  ├─ 1. e5-small-v2 embeds the query with the `"query: "` prefix.
+  ├─ 2. sqlite-vec KNN Search (`WHERE embedding MATCH ?`) retrieves top 5 structured OKF docs.
+  ├─ 3. Layer 3 Topic Deduplication: Discards docs if their `topic` is 85% identical to an already accepted doc.
+  └─ 4. Blended Re-Ranking: Mathematically mutates the cosine distance:
+        final_score = distance - (0.12 * recency_bonus) - (0.08 * frequency_bonus)
+
+[State Manager (build_rag_context)]
+  ├─ Enforces strict Tiered Token Budgeting to prevent VRAM OOM:
+  ├─ Layer 1: Current Screen Context (capped at 3000 chars)
+  ├─ Layer 2: Primary Knowledge Doc (Code capped at 2500, Content at 1500)
+  └─ Layer 3: Supporting Docs (Content capped at 800 chars)
+
+[AI Engine (answer_with_context)]
+  └─ Situation-Aware Prompt Engineering: Reads `capture_count` and current app to inject `REPEATED_STRUGGLE` or `STUCK_ON_OWN_CODE` personas, forcing the LLM to provide hyper-specific bug fixes instead of generic tutorials.
 ```
 
 ---

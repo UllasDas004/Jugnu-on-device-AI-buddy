@@ -1,5 +1,8 @@
+import sqlite3
 import os
 import time
+import sqlite3
+import json
 
 class StateManager:
     def __init__(self):
@@ -70,53 +73,75 @@ class StateManager:
         
         return "\n".join(parts) if parts else "No recent coding context found."
 
-    
-    def generate_prompt_context(self, custom_problem = None, embedder = None):
+
+    def generate_prompt_context(self, custom_problem = None, embedder = None, target_app: str = ""):
         """
         Packages all short-term memory + long-term RAG results into a string for the LLM.
         If embedder is provided, injects the top 3 semantically similar past memories.
         For file memories, re-reads the current file from disk for full context.
         """
+        # FIX SM-2: Use the explicit target_app provided by the idle handler
+        app = target_app or self.current_app
 
-        context = f"The user is currently using: {self.current_app}.\n"
+        # FIX SM-1: Detect if we are actually in an IDE
+        IDE_APPS = {"code", "cursor", "devenv", "vim", "clion", "pycharm", "antigravity"}
+        is_ide_context = any(ide in app.lower() for ide in IDE_APPS)
+
+        context = f"The user is currently using: {app}.\n"
 
         if self.last_coding_app:
             mins_ago = int((time.time() - self.last_coding_app_time) /60)
             context += f"They were recently coding in {self.last_coding_app} ({mins_ago} min ago).\n"
-        
-        if self.active_code_file:
-            context += f"The last file they worked on: {self.active_code_file}.\n"
 
-        if self.active_code_content:
+        # FIX SM-1: ONLY inject code file content if we are idling in an IDE!
+        if self.active_code_file and is_ide_context:
+            context += f"The last file they worked on: {self.active_code_file}.\n"
+        if self.active_code_content and is_ide_context:
             context += f"File content:\n```\n{self.active_code_content[:1500]}\n```\n"
 
         if self.clipboard_content:
             context += f"Clipboard: {self.clipboard_content[:300]}\n"
 
-        # 1. Fetch from live ocr_buffer first
-        try:
-            import sqlite3
-            conn = sqlite3.connect("jugnu.db", timeout=0.5)
-            row = conn.execute(
-                "SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1",
-                (self.current_app,)
-            ).fetchone()
-            conn.close()
+        # Smart UIA Formatter: Puts Code (Edit controls) at the TOP before truncation
+        def _format_uia_payload(raw_payload: str) -> str:
+            try:
+                sections = json.loads(raw_payload)
+                edits = [sec.get("text", "").strip() for sec in sections if sec.get("type") == "Edit" and sec.get("text", "").strip()]
+                docs = [sec.get("text", "").strip() for sec in sections if sec.get("type") != "Edit" and sec.get("text", "").strip()]
 
-            if row and row[0]:
-                uia_text = row[0]
-                uia_text = uia_text.replace("===SECTION===", "\n")
-                if len(uia_text) > 4000:
-                    uia_text = uia_text[:4000] + "\n...[truncated]"
-                context += f"\nLive Screen Text:\n```\n{uia_text.strip()}\n```\n"
-            else:
-                # ocr_buffer was already cleared by FlushWorker — use cache
-                cached = self._last_screen_text.get(self.current_app, "")
-                if cached:
-                    display = cached[:4000] + ("\n...[truncated]" if len(cached) > 4000 else "")
-                    context += f"\nRecent Screen Text (cached):\n```\n{display.strip()}\n```\n"
-        except Exception as e:
-            print(f"[StateManager] DB read error: {e}")
+                combined = ""
+                # Prioritize Editor Content at the top!
+                if edits:
+                    combined += "--- Editor Content ---\n" + "\n\n".join(edits) + "\n\n"
+                if docs:  
+                    combined += "--- Page Content ---\n" + "\n\n".join(docs)
+                return combined
+            except:
+                return raw_payload.replace("===SECTION===", "\n")
+            
+        cached = self._last_screen_text.get(app, "")
+        uia_text = ""
+
+        if cached:
+            uia_text = _format_uia_payload(cached)
+        else:
+            try:
+                conn = sqlite3.connect("jugnu.db", timeout=0.5)
+                row = conn.execute("SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
+
+                if not row or not row[0]:
+                    row = conn.execute("SELECT text_content FROM episodic_memories WHERE app_name = ? AND source_type = 'browser' ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
+                conn.close()
+
+                if row and row[0]:
+                    uia_text = _format_uia_payload(row[0])
+            
+            except Exception as e:
+                print(f"[StateManager] DB read error: {e}")
+        
+        if uia_text:
+            display = uia_text[:4000] + ("\n...[truncated]" if len(uia_text) > 4000 else "")
+            context += f"\nCurrent Screen Context (from {app}):\n```\n{display.strip()}\n```\n"
 
         if embedder:
             query = custom_problem or self.active_code_content[:200] or self.current_app

@@ -135,16 +135,19 @@ namespace Jugnu
         {
             // Non-work app → put both threads to sleep
             if(hDeepWorkEvent) ResetEvent(hDeepWorkEvent);
-            std::cout << "\033[90m[Jugnu]\033[0m \'" << processName << "\' is outside the focus zone — background threads entering standby.\n";
+            std::cout << "\033[90m[Jugnu]\033[0m \'" << processName << "\' is outside the focus zone - background threads entering standby.\n";
             return;
         }
 
         // Deep Work app → wake up both threads
         if(hDeepWorkEvent) SetEvent(hDeepWorkEvent);
-        std::cout << "\033[1;32m[Jugnu]\033[0m Focus zone active: \'" << processName << "\' — monitoring threads are live.\n";
+        std::cout << "\033[1;32m[Jugnu]\033[0m Focus zone active: \'" << processName << "\' - monitoring threads are live.\n";
 
         // All filters passed — this is a real user-focused Deep Work app. Safe to use in idle payload.
-        lastMeaningfulApp = processName;
+        // FIX ST-1: But DO NOT let terminals overwrite the work context!
+        if (processName != "WindowsTerminal.exe" && processName != "pwsh.exe") {
+            lastMeaningfulApp = processName;
+        }
 
         // GENERATE JSON AND BROADCAST TO PYTHON
         std::string payload = Jugnu::MemoryManager::GenerateContextJSON(processName);
@@ -269,7 +272,7 @@ namespace Jugnu
             // PHASE 1: Hibernate. Sleep infinitely while user is in a game/movie.
             // When WinEventProc sees a Deep Work app, it calls SetEvent() to wake us.
             if(wasHibernating)
-                std::cout << "\033[90m[StuckTimer]\033[0m Standby — waiting for a focus session to begin.\n";
+                std::cout << "\033[90m[StuckTimer]\033[0m Standby - waiting for a focus session to begin.\n";
             WaitForSingleObject(hDeepWorkEvent, INFINITE);
             if(!isRunning) break;   // Cleanup() called SetEvent to unblock us for exit
 
@@ -311,7 +314,7 @@ namespace Jugnu
                 if(eventState == WAIT_TIMEOUT)
                 {
                     // Event was reset — they switched to a game/movie.
-                    std::cout << "\033[90m[StuckTimer]\033[0m Left the focus zone — idle guard entering standby.\n";
+                    std::cout << "\033[90m[StuckTimer]\033[0m Left the focus zone - idle guard entering standby.\n";
                     wasHibernating = true;
                     hasTriggered = false;
                     continue; // Loop back to WaitForSingleObject(INFINITE)

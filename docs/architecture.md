@@ -155,6 +155,11 @@ The OKF pipeline transforms dirty, raw screen captures into clean, structured kn
 
 The pipeline has four distinct stages:
 
+**Stage 0.5 — JSON Sanitization & Area-Wise Sequence Matching**
+
+Before any processing, the raw UIA JSON is scrubbed of `\ufffc` (Object Replacement Character) and `\x00` null bytes. This prevents fatal buffer overflows deep inside the C++ `llama.cpp` bindings which previously crashed the entire inference engine. 
+Then, an Area-Wise Deduplication check runs: it completely decouples the user's Code (`Edit` control) from the webpage prose (`Document` control). It only skips processing if BOTH the code and the page are >85% identical to the last capture. This ensures that a single character edit in the user's code triggers an OKF capture, even if the surrounding 5,000 words of LeetCode documentation remained completely static.
+
 **Stage 1 — Routing by Control Type**
 
 Because C++ now attaches the UIA control type to each captured section, Python can route immediately:
@@ -207,19 +212,26 @@ The database is organized into tiers by permanence:
 | 2 (knowledge) | `knowledge_docs` + `vec_knowledge` | Never evicted, only merged | Python FlushWorker |
 | 3 (persona) | `core_persona` | Permanent | Written at onboarding |
 
+**The Column-Split OKF Schema**: 
+Previously, `knowledge_docs` stored a massive stringified JSON blob which caused severe CPU bottlenecks during Python parsing on every search. In Phase 3, this was refactored into dedicated SQLite columns (`topic`, `content`, `code_snippet`, `notes`, `tags`). Now, the C-powered SQLite engine handles the parsing and filtering, and Python simply fetches the raw strings for the RAG payload, drastically reducing CPU overhead.
+
 Knowledge documents are never deleted or evicted — they only grow richer through merging. The episodic log rolls over (oldest rows pruned) to keep the database size bounded. The OKF vault is the long-term brain.
 
 ---
 
 ## RAG Context Assembly
 
-When the user asks a question, context is assembled in two steps:
+When the user asks a question, context is assembled through a rigorous four-stage pipeline designed to prevent VRAM crashes and provide hyper-specific answers:
 
-1. **Search Query Generation**: Gemma reads the current screen context (what the user is looking at right now) and generates a dense 15-word semantic query that captures the core technical problem. This is significantly more accurate than using the user's raw question as a search query, because the screen context reveals what they are actually working on.
+1. **Search Query Generation**: Gemma reads the current screen context (what the user is looking at right now) and generates a dense 15-word semantic query that captures the core technical problem. This is significantly more accurate than using the user's raw question as a search query.
 
-2. **Vector Search**: The 15-word query is embedded and searched against `vec_knowledge` using KNN cosine similarity. The top 5 matching OKF documents are retrieved — these may contain the exact LeetCode problem the user was solving yesterday, or the exact code pattern they were studying last week.
+2. **Vector Search + Blended Re-Ranking**: The 15-word query is embedded and searched against `vec_knowledge` using KNN cosine similarity. Before returning results, the system applies **Layer 3 Topic Deduplication** (discarding search results if they are >85% identical to an already accepted document, preventing the LLM from being flooded with 3 copies of the exact same LeetCode problem). The surviving documents undergo **Blended Re-Ranking**, mathematically mutating the raw cosine distance with an exponential time decay (rewarding recent memories) and logarithmic frequency scale (rewarding problems the user has struggled on repeatedly).
 
-The answer is then grounded in the user's own past learning history, not general knowledge.
+3. **Tiered Token Budgeting**: The context is physically sliced before ingestion to guarantee it mathematically fits inside the `num_ctx` window, preventing CUDA Out-Of-Memory (OOM) crashes. The current screen context is capped at 3,000 chars, the primary retrieved OKF document code at 2,500 chars, and secondary supporting documents heavily truncated to 800 chars.
+
+4. **Situation-Aware Prompt Engineering**: Based on the `capture_count` telemetry of the retrieved topic, Jugnu dynamically swaps its core persona. If `capture_count >= 4`, Jugnu shifts into a `REPEATED_STRUGGLE` mode, altering its system prompt to stop giving generic tutorials and instead strictly cross-check the user's code against their own historically documented edge cases and constraints, providing the one precise insight that will unblock them.
+
+The answer is then grounded in the user's own past learning history and precisely tuned to their current level of frustration, not just general knowledge.
 
 ---
 

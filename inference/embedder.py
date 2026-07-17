@@ -7,6 +7,8 @@ from sentence_transformers import SentenceTransformer
 import json
 import datetime
 import difflib
+import math
+from datetime import timezone
 
 
 # ANSI colors for terminal logging
@@ -328,23 +330,36 @@ class Embedder:
             self._conn.commit()
             print(f"{_GREEN}[Embedder] New knowledge doc #{rowid} saved: '{topic}'{_RESET}")
             return True
-        except Exception as e:
-            print(f"{_RED}[Embedder] save_knowledge_doc error: {e}{_RESET}")
-            self._conn.rollback()
-            return False
-                
-                        
+
         except Exception as e:
             print(f"{_RED}[Embedder] save_knowledge_doc error: {e}{_RESET}")
             self._conn.rollback()
             return False
             
     
+    def _blended_rerank(self, docs: list[dict]) -> list[dict]:
+        """
+        Re-ranks KNN results using exponential decay recency + log frequency.
+        Keeps scores bounded and smooth — no scale divergence.
+        """
+        current_time = time.time()
+        seconds_in_a_day = 86400.0
+        for doc in docs:
+            # Exponential decay: half-life ~3 days, bounded [0, 1]
+            days_old = (current_time - doc.get('last_updated_ts', current_time)) / seconds_in_a_day
+            recency_bonus = math.exp(-0.23 * max(0.0, days_old))
+            # Log frequency: capture 1 → 0.0, 3 → 0.47, 10+ → ~1.0
+            frequency_bonus = min(1.0, math.log1p(doc.get('capture_count', 1)) / math.log1p(10))
+            raw_distance = doc.get('distance', 1.0)
+            doc['final_score'] = raw_distance - (0.12 * recency_bonus) - (0.08 * frequency_bonus)
+        
+        return sorted(docs, key=lambda x: x['final_score'])
+
     def search_knowledge_docs(self, query_text: str, limit: int = 3) -> list[dict]:
         """
         Semantic search over the OKF knowledge_docs table.
-        Returns richer context than episodic_memories — full structured JSON docs.
-        Used by the RAG pipeline when user needs help.
+        Returns full structured dicts — no flattening.
+        Applies: Layer-3 topic deduplication + blended re-ranking.
         """
 
         try:
@@ -358,43 +373,83 @@ class Embedder:
             query_vec = self._model.encode(f"query: {query_text}", normalize_embeddings=True)
             query_blob = self._serialize_vector(query_vec.tolist())
 
+            # Fetch +1 extra to absorb dedup losses
+            fetch_limit = limit + 2
+
             cursor.execute(
                 """
-                SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes, kd.capture_count, kd.last_updated
+                SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes,
+                   kd.capture_count, kd.last_updated, kd.source_type, distance
                 FROM vec_knowledge vk
                 INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                 WHERE vk.embedding MATCH ? AND k = ?
                 ORDER BY distance ASC;
                 """,
-                (query_blob, limit)
+                (query_blob, fetch_limit)
             )
             rows = cursor.fetchall()
-            results = []
+
+            # Build raw result dicts — all fields separate, no flattening
+            raw_results = []
             
-            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated in rows:
+            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated, source_type, distance in rows:
                 try:
                     tags = json.loads(tags_str) if tags_str else []
                 except Exception:
                     tags = []
 
-                full_content = ""
-                if content: full_content += f"CONTENT:\n{content}\n\n"
-                if code_snippet: full_content += f"CODE:\n{code_snippet}\n\n"
-                if notes: full_content += f"NOTES:\n{notes}\n"
-                
-                results.append({
-                    "topic":         topic,
-                    "tags":          tags,
-                    "content":       full_content.strip(),
-                    "capture_count": capture_count,
-                    "last_updated":  last_updated,
+                # Convert last_updated ISO string to epoch for re-ranking
+                last_updated_ts = time.time()
+                if last_updated:
+                    try:
+                        dt = datetime.datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                        last_updated_ts = dt.timestamp()
+                    except Exception:
+                        pass
+
+                raw_results.append({
+                    "topic":          topic,
+                    "tags":           tags,
+                    "content":        content or "",
+                    "code_snippet":   code_snippet or "",
+                    "notes":          notes or "",
+                    "capture_count":  capture_count or 1,
+                    "last_updated":   last_updated or "",
+                    "last_updated_ts": last_updated_ts,
+                    "source_type":    source_type or "browser",
+                    "distance":       distance or 1.0,
                 })
+
+            # Layer 3 Hard Deduplication — skip docs whose topic is too similar
+            # to an already-accepted one (prevents 3 captures of same problem)
+            deduped = []
+            for doc in raw_results:
+                is_dup = False
+                for accepted in deduped:
+                    if accepted['topic'] == doc['topic']:
+                        is_dup = True
+                        break
+
+                    sim = difflib.SequenceMatcher(None, accepted['topic'].lower(), doc['topic'].lower()).ratio()
+
+                    if sim > 0.85:
+                        is_dup = True
+                        break
                 
-            print(f"{_GREEN}[Embedder] Knowledge search: {len(results)} docs found.{_RESET}")
-            return results
+                if not is_dup:
+                    deduped.append(doc)
+                if len(deduped) >= limit:
+                    break
+
+            # Blended re-rank: recency + frequency on top of cosine distance
+            reranked = self._blended_rerank(deduped)
+            print(f"{_GREEN}[Embedder] Knowledge search: {len(reranked)} docs (reranked).{_RESET}")
+            return reranked
+            
         except Exception as e:
             print(f"{_RED}[Embedder] search_knowledge_docs error: {e}{_RESET}")
-            return []
+        return []
+                
 
     def semantic_search(self, query_text: str, limit: int = 5) -> list[dict]:
         """

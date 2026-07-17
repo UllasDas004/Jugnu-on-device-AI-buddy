@@ -94,7 +94,8 @@ def _spawn_interaction_window(context_summary, sources):
 
 def trigger_flow(state, engine, embedder,
                  search_query=None, context_chunks=None,
-                 sources=None, screen_context=None):
+                 knowledge_docs=None, sources=None,
+                 screen_context=None, situation_type="GENERAL"):
     # P0-FIX: non-blocking acquire — if another thread is already generating, bail out.
     if not _gen_lock.acquire(blocking=False):
         print("\033[90m[Notification] Already generating. Skipping duplicate trigger.\033[0m")
@@ -110,6 +111,8 @@ def trigger_flow(state, engine, embedder,
         sources = []
     if context_chunks is None:
         context_chunks = []
+    if knowledge_docs is None:
+        knowledge_docs = []
 
     summary = state.get_context_summary()
 
@@ -137,7 +140,7 @@ def trigger_flow(state, engine, embedder,
             # User described their own problem — this needs a fresh Q&A RAG search, NOT a generic insight!
             print("\033[90m[Notification] Fetching specific knowledge for custom problem...\033[0m", flush=True)
             fresh_query = engine.generate_search_query(custom_problem)
-            fresh_results = embedder.search_knowledge_docs(fresh_query, limit=3)
+            fresh_docs = embedder.search_knowledge_docs(fresh_query, limit=3)
             
             fresh_chunks = []
             fresh_sources = []
@@ -149,10 +152,10 @@ def trigger_flow(state, engine, embedder,
                 fresh_sources.append("Current Screen")
             
             # 2. Add historical knowledge from the vector database
-            if fresh_results:
-                for doc in fresh_results:
-                    fresh_sources.append(doc['topic'])
-                    fresh_chunks.append(f"[PAST KNOWLEDGE: {doc['topic']}]\n{doc['content']}")
+            if fresh_docs:
+                structured = engine.build_rag_context(ctx or "", fresh_docs, situation_type)
+                fresh_chunks.append(structured)
+                fresh_sources.extend([d['topic'] for d in fresh_docs])
             else:
                 # Fallback to episodic memory
                 memories = embedder.semantic_search(fresh_query, limit=3)
@@ -161,12 +164,23 @@ def trigger_flow(state, engine, embedder,
                     fresh_sources.append("past session memory")
                     
             # Use the strict Q&A prompt!
-            insight = engine.answer_with_context(custom_problem, fresh_chunks, fresh_sources)
+            insight = engine.answer_with_context(custom_problem, fresh_chunks, fresh_sources, screen_context=ctx or "", situation_type=situation_type)
             # Update the sources variable so it gets written to the UI done_file
             sources = fresh_sources
+        elif knowledge_docs:
+            # Pre-fetched structured docs - build the rich layered context
+            ctx = screen_context or state.generate_prompt_context(embedder=embedder)
+            structured = engine.build_rag_context(ctx or "", knowledge_docs, situation_type)
+            insight = engine.answer_with_context(
+                search_query or "", [structured], sources,
+                screen_context=ctx or "",
+                situation_type=situation_type
+            )
+
         elif context_chunks:
             # Use pre-fetched KNN results (fetched cheaply at idle time, now fed to Gemma)
-            insight = engine.answer_with_context(search_query or "", context_chunks, sources)
+            ctx = screen_context or ""
+            insight = engine.answer_with_context(search_query or "", context_chunks, sources, screen_context=ctx, situation_type=situation_type)
         else:
             # No memory at all — general insight from current screen state
             ctx = screen_context or state.generate_prompt_context(embedder=embedder)

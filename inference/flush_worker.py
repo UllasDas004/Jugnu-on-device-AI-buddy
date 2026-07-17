@@ -15,7 +15,6 @@ Why chunking?
     Feeding the whole blob at once confuses the extractor.
 """
 
-from typing import Type
 import difflib
 import sqlite3
 import threading
@@ -211,27 +210,74 @@ class FlushWorker:
             # A row is only deleted if it is successfully synthesized.
             # Failed rows stay in ocr_buffer and are retried next cycle.
             try:
-                # --- PHASE 1: Pre-Gemma OCR Deduplication ---
+                # Strip null bytes and Unicode replacement chars that crash the C++ LLM tokenizer
+                raw_text = raw_text.replace('\ufffc', '').replace('\x00', '')
+
+                # --- PHASE 1: Pre-Gemma Area-Wise Deduplication ---
                 if not hasattr(self, '_last_raw_by_app'):
                     self._last_raw_by_app = {}
+                if not hasattr(self, '_last_code_by_app'):
+                    self._last_code_by_app = {}
+                if not hasattr(self, '_last_page_by_app'):
+                    self._last_page_by_app = {}
                 # P1-FIX: Cap cache size to prevent unbounded memory growth.
                 # OCR blobs are ~2000 chars each; 20 entries = ~40KB max.
                 MAX_CACHE = 20
                 if len(self._last_raw_by_app) > MAX_CACHE:
                     self._last_raw_by_app.pop(next(iter(self._last_raw_by_app)))
+                    self._last_code_by_app.pop(next(iter(self._last_code_by_app)), None)
+                    self._last_page_by_app.pop(next(iter(self._last_page_by_app)), None)
                     
                 last_raw = self._last_raw_by_app.get(app_name, "")
-                # Calculate how similar this OCR dump is to the last one we saw
-                similarity = difflib.SequenceMatcher(None, raw_text, last_raw).ratio()
+                last_code = self._last_code_by_app.get(app_name, "")
+                last_page = self._last_page_by_app.get(app_name, "")
+                
+                skip_extraction = False
+                current_code = ""
+                current_page = ""
 
-                if similarity > 0.85:
-                    print(f"{_YELLOW}[FlushWorker] Screen for {app_name} is {similarity*100:.1f}% unchanged. Skipping AI extraction.{_RESET}")
-                    continue # Skip the Gemma extraction entirely!
+                try:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, list):
+                        # Separate Code (Edit controls) and Page (Document/Text controls)
+                        current_code = "\n".join([sec.get("text", "") for sec in parsed if sec.get("type") == "Edit"])
+                        current_page = "\n".join([sec.get("text", "") for sec in parsed if sec.get("type") != "Edit"])
 
-                # Update cache with the new screen state
+                        code_sim = difflib.SequenceMatcher(None, current_code, last_code).quick_ratio() if last_code or current_code else 1.0
+                        page_sim = difflib.SequenceMatcher(None, current_page, last_page).quick_ratio() if last_page or current_page else 1.0
+
+                        # Only skip if BOTH the code and the page are >85% unchanged
+                        if code_sim > 0.85 and page_sim > 0.85:
+                            skip_extraction = True
+                            print(f"{_YELLOW}[FlushWorker] Area Match: Code={code_sim*100:.1f}%, Page={page_sim*100:.1f}%. Skipping AI extraction.{_RESET}")
+                        else:
+                            print(f"{_CYAN}[FlushWorker] Area Change: Code={code_sim*100:.1f}%, Page={page_sim*100:.1f}%. Processing screen.{_RESET}")
+                    
+                    else:
+                        raise ValueError("Not a list")
+                except Exception:
+                    # Fallback to standard full text matching if not JSON
+                    similarity = difflib.SequenceMatcher(None, raw_text, last_raw).quick_ratio()
+
+                    if similarity > 0.85:
+                        skip_extraction = True
+                        print(f"{_YELLOW}[FlushWorker] Screen is {similarity*100:.1f}% unchanged. Skipping AI extraction.{_RESET}")
+                
+                if skip_extraction:
+                    self._last_raw_by_app[app_name] = raw_text
+                    self._last_code_by_app[app_name] = current_code
+                    self._last_page_by_app[app_name] = current_page
+
+                    if self._state:
+                        self._state.update_screen_text(app_name, raw_text)
+                    ids_to_delete.append(row_id)
+                    continue
+
+                # Update caches for normal processing
                 self._last_raw_by_app[app_name] = raw_text
-                # Notify StateManager so it can answer context queries even after
-                # this row is deleted from ocr_buffer.
+                self._last_code_by_app[app_name] = current_code
+                self._last_page_by_app[app_name] = current_page
+
                 if self._state:
                     self._state.update_screen_text(app_name, raw_text)
                 # --------------------------------------------

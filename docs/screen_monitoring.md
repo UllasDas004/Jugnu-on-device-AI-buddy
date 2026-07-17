@@ -47,7 +47,9 @@ Once text is successfully extracted, it goes through a robust cleaning and synth
 A background Python daemon (`flush_worker.py`) wakes up every 60 seconds to process the `ocr_buffer`.
 1. **Power & Settle Gates:** It only runs on AC Power (checked via Win32 `GetSystemPowerStatus`). It enforces a hard 30-second `Settle Time`, refusing to process rows that were inserted less than 30 seconds ago to ensure the user is done typing.
 2. **Staleness Purge:** Rows older than 10 minutes are deleted without processing.
-3. **Per-Section Deduplication:** It uses `difflib.SequenceMatcher` to compare the incoming text to an in-memory LRU cache (`MAX_CACHE=20`). If a section is >85% similar to the last capture of that app, AI extraction is skipped to save GPU cycles.
+3. **JSON Sanitization & Area-Wise Deduplication:** 
+   - First, the incoming JSON is stripped of `\ufffc` (Object Replacement Character) and `\x00` bytes to prevent fatal token-limit stack overflows inside the C++ `llama.cpp` bindings.
+   - Second, it performs an Area-Wise `difflib.SequenceMatcher` check against a FIFO cache (`MAX_CACHE=20`). Crucially, it decouples `Edit` controls (Code) from `Document` controls (Page Text). Both must independently be >85% similar to the last capture to skip processing. This guarantees that small code changes are captured even if the surrounding page text is huge and unchanged.
 4. **The Processing Split:**
    - **UIA Fast-Path:** The worker parses the JSON. `Edit` controls (user code) are treated as verbatim strings, bypassing Gemma extraction entirely. A heuristic URL filter ensures Chrome's URL bar (also an `Edit` control) is silently dropped. `Document` and `Text` controls (problem statements, docs) are sent to Gemma.
    - **OCR Fallback:** Noisy text is context-aware chunked into 500-character windows. Small noise chunks (<8 words) are discarded. The valid chunks are sent to Gemma for extraction.

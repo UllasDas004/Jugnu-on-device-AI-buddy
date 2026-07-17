@@ -378,18 +378,20 @@ namespace Jugnu
 
         bool hasOcredWhileIdle = false;
         bool wasHibernating = true;
+        std::string lastOcredApp = "";
+
         while(isRunning)
         {
             // PHASE 1: Hibernate. Sleep infinitely while user is gaming/watching a movie.
             // WinMonitor::WinEventProc calls SetEvent(hDeepWorkEvent) when a work app opens.
             if(wasHibernating)
-                std::cout << "\033[90m[ScreenReader]\033[0m Standby — waiting for a focus session to begin.\n";
+                std::cout << "\033[90m[ScreenReader]\033[0m Standby - waiting for a focus session to begin.\n";
             WaitForSingleObject(Jugnu::hDeepWorkEvent, INFINITE);
             if(!isRunning) break;
 
             if(wasHibernating)
             {
-                std::cout << "\033[1;32m[ScreenReader]\033[0m Focus session detected — screen capture guard is live.\n";
+                std::cout << "\033[1;32m[ScreenReader]\033[0m Focus session detected - screen capture guard is live.\n";
                 wasHibernating = false;
             }
 
@@ -406,18 +408,25 @@ namespace Jugnu
 
             if(idleTime >= 60000)   // 60 seconds idle → capture screen
             {
+                HWND hwnd = GetForegroundWindow();
+                if(!hwnd)
+                {
+                    Sleep(2000);
+                    continue;
+                }
+                std:: string currentApp = WinMonitor::GetProcessName(hwnd);
+                // [MID-IDLE APP SWITCHING LOGIC]
+                // If a user sits idle in VS Code for 60s, we capture it and set hasOcredWhileIdle = true.
+                // If they then Alt-Tab to Chrome without touching the mouse, system idleTime stays > 60s.
+                // By checking if currentApp changed, we instantly drop the lock to capture the new window.
+                if(currentApp != lastOcredApp) hasOcredWhileIdle = false;
+                
                 if(!hasOcredWhileIdle)
                 {
                     hasOcredWhileIdle = true;
                     
-                    HWND hwnd = GetForegroundWindow();
-                    if(!hwnd)
-                    {
-                        Sleep(2000);
-                        continue;
-                    }
-
-                    std::string currentApp = WinMonitor::GetProcessName(hwnd);
+                    // Mark this app as captured so we don't spam it in a loop
+                    lastOcredApp = currentApp;
 
                     // Only capture if the app supports UIA extraction
                     if(ShouldCapture(currentApp))
@@ -435,7 +444,7 @@ namespace Jugnu
                         else
                         {
                             // ── FALLBACK: OCR if UIA returned nothing ─────────────
-                            std::cout << "\033[33m[ScreenReader]\033[0m UIA returned nothing — falling back to OCR for "
+                            std::cout << "\033[33m[ScreenReader]\033[0m UIA returned nothing - falling back to OCR for "
                                     << currentApp << "...\n";
                             text = CaptureAndOCR(hwnd);
                         }
@@ -456,7 +465,7 @@ namespace Jugnu
                             {
                                 std::cout << "\033[32m[ScreenReader]\033[0m Queued " 
                                         << utf8_text.length() << " chars from " 
-                                        << currentApp << " \u2014 pending synthesis by Gemma.\n";
+                                        << currentApp << " pending synthesis by Gemma.\n";
                             }
                         }
                         else
@@ -477,13 +486,15 @@ namespace Jugnu
                 DWORD eventState = WaitForSingleObject(Jugnu::hDeepWorkEvent, 0);
                 if(eventState == WAIT_TIMEOUT)
                 {
-                    std::cout << "\033[90m[ScreenReader]\033[0m Left the focus zone \u2014 screen capture entering standby.\n";
+                    std::cout << "\033[90m[ScreenReader]\033[0m Left the focus zone screen capture entering standby.\n";
                     wasHibernating = true;
                     hasOcredWhileIdle = false;
+                    lastOcredApp = "";
                     continue;
                 }
 
                 hasOcredWhileIdle = false;
+                lastOcredApp = "";
                 DWORD timeRemaining = 60000 - idleTime;
                 std::cout << "\033[90m[ScreenReader]\033[0m User is active. Screen guard sleeping for "
                           << (timeRemaining / 1000) << "s.\n";

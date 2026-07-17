@@ -1,9 +1,6 @@
 import ollama
-from torch._dynamo import source
-import ollama
-import json
 import os
-import re
+from datetime import datetime, timezone
 
 class AIEngine:
     def __init__(self):
@@ -173,11 +170,91 @@ class AIEngine:
             return screen_context[:100] # fallback: use raw context as query
         except Exception:
             return screen_context[:100]
-    
-    def answer_with_context(self, user_query: str, context_chunks: list[str], sources: list[str] | None = None) ->str:
+
+    def build_rag_context(self, screen_context: str, knowledge_docs: list[dict], situation_type: str) -> str:
         """
-        RAG answer function. Feeds the user query + past memories into Gemma
-        and returns a context-aware answer.
+        Assembles a structured, token-budgeted context block.
+        Pure Python — zero LLM calls. Hard char caps prevent VRAM OOM on Gemma 4 E2B.
+        """
+        MAX_SCREEN   = 3000   # was 2000
+        MAX_CODE     = 2500   # was 1200 — code is the most valuable signal
+        MAX_CONTENT  = 1500   # was 800
+        MAX_NOTES    = 600    # was 400
+        MAX_SUPPORT  = 800    # was 500
+
+        parts = []
+
+        # ── Layer 1: Current Screen (always first, always hard-capped) ──────────
+        if screen_context:
+            capped = screen_context[:MAX_SCREEN]
+            if len(screen_context) > MAX_SCREEN:
+                capped += "\n...[truncated for token budget]"
+            parts.append(f"[RIGHT NOW — Current Screen]\n{capped}")
+
+        if not knowledge_docs:
+            return "\n\n".join(parts)
+
+        # ── Layer 2: Primary Knowledge (richest doc, all fields) ─────────────────
+        top = knowledge_docs[0]
+        topic        = top.get('topic', 'Unknown Topic')
+        content      = (top.get('content') or '')[:MAX_CONTENT]
+        code_snippet = (top.get('code_snippet') or '')[:MAX_CODE]
+        notes        = (top.get('notes') or '')[:MAX_NOTES]
+        tags         = top.get('tags', [])
+        capture_count = top.get('capture_count', 1)
+        last_updated  = top.get('last_updated', '')
+
+        # Human-readable time hint
+        time_hint = ""
+        if last_updated:
+            try:
+                dt = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                diff = datetime.now(timezone.utc) - dt
+                hours = int(diff.total_seconds() / 3600)
+
+                if hours < 1:
+                    time_hint = "< 1 hour ago"
+                elif hours < 24:
+                    time_hint = f"{hours}h ago"
+                else:
+                    time_hint = f"{diff.days} days ago"
+            except Exception:
+                pass
+
+        struggle_warning = ""
+        if capture_count >= 4:
+            struggle_warning = f"\n⚠️  You have revisited this topic {capture_count} times — you may be stuck at the same point repeatedly.\n"
+
+        layer2 = f"[YOUR PAST WORK: \"{topic}\" — seen {capture_count}x{', ' + time_hint if time_hint else ''}]{struggle_warning}"
+
+        if tags:
+            layer2 += f"\nTags: {', '.join(tags)}"
+        if content:
+            layer2 += f"\nProblem / Concept:\n{content}"
+        if code_snippet:
+            layer2 += f"\nYour Code Attempt:\n```\n{code_snippet}\n```"
+        if notes:
+            layer2 += f"\nYour Noted Edge Cases / Constraints:\n{notes}"
+
+        parts.append(layer2)
+
+        # ── Layer 3: Supporting Docs (brief, already deduped by embedder) ────────
+        for i, doc in enumerate(knowledge_docs[1:], 1):
+            sup_content = (doc.get('content') or '')[:MAX_SUPPORT]
+            sup_topic   = doc.get('topic', f'Related Topic {i}')
+            sup_count   = doc.get('capture_count', 1)
+
+            if sup_content:
+                parts.append(f"[RELATED: \"{sup_topic}\" — seen {sup_count}x]\n{sup_content}")
+        
+        return "\n\n".join(parts)
+                
+
+    
+    def answer_with_context(self, user_query: str, context_chunks: list[str], sources: list[str] | None = None,screen_context: str = "", situation_type: str = "GENERAL") ->str:
+        """
+        RAG answer function. Situation-aware prompt template selection.
+        Notes amplification guardrail active for STUCK and REPEATED_STRUGGLE.
         """
 
         # P2-FIX: Never use mutable default argument. The same [] would be shared
@@ -189,20 +266,49 @@ class AIEngine:
         # Hard cap context to avoid KV overrun
         context_block = context_block[:6000]
 
-        source_hint = ""
-        if sources:
-            source_hint = f"You retrieved this context from the developer's own past sessions on: {', '.join(sources)}. Reference the most relevant source by name in your answer."
+        source_hint = f"Sources: {', '.join(sources)}." if sources else ""
 
-        prompt = f"""You are Jugnu, a personal coding assistant with access to this developer's own learning history.
-        Context from the developer's past sessions:
-        {context_block}
-        Developer's current question / situation:
-        {user_query}
-        {source_hint}
-        Answer using the context above where relevant. Be direct, specific, and technical.
-        Start your answer with: "Based on your past work on [topic], ..." when the context is relevant.
-        If the context doesn't help, answer from general knowledge but say so.
-        Keep the answer under 5 sentences."""
+        # ── Situation-aware system instruction ───────────────────────────────────
+        if situation_type == "STUCK_ON_OWN_CODE":
+            system_role = (
+                "You are reviewing the developer's own code and past attempts. "
+                "Find the specific bug or missing edge case in THEIR code — not a generic explanation. "
+                "Reference specific patterns from their code_snippet directly. "
+                "IMPORTANT: Compare their implementation against the constraints listed under "
+                "'Your Noted Edge Cases / Constraints'. Explicitly call out if they are violating "
+                "a rule they previously documented themselves."
+            )
+        elif situation_type == "REPEATED_STRUGGLE":
+            system_role = (
+                "The developer has revisited this topic 4+ times and is still stuck. "
+                "Do NOT repeat generic advice. Identify WHAT specifically they are missing "
+                "based on their code pattern. "
+                "IMPORTANT: Cross-check their code against 'Your Noted Edge Cases / Constraints'. "
+                "Explicitly state if they are violating a constraint they themselves documented. "
+                "Give them the one precise insight that will unblock them."
+            )
+        elif situation_type == "READING_NEW_MATERIAL":
+            system_role = (
+                "The developer just read documentation or learned a new concept. "
+                "Connect this new knowledge directly to their active code file or recent work if visible. "
+                "Suggest the single most actionable next step to apply what they just read."
+            )
+        else:  # GENERAL or NO_MEMORY
+            system_role = (
+                "You are Jugnu, a personal coding assistant with access to this developer's own "
+                "learning history. Answer using the context above where relevant. "
+                "Be direct, specific, and technical. "
+                "Start with: 'Based on your past work on [topic], ...' when context is relevant. "
+                "If context doesn't help, answer from general knowledge but say so."
+            )
+        prompt = f"""You are Jugnu, a personal AI coding assistant.
+            {system_role}
+            Context:
+            {context_block}
+            Developer's question / current situation:
+            {user_query}
+            {source_hint}
+            Answer in under 5 sentences. Be direct and lead with the most actionable insight."""
 
         try:
             response = ollama.chat(
@@ -210,8 +316,8 @@ class AIEngine:
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
-                    "num_ctx": 4096,
-                    "num_predict": 300,
+                    "num_ctx": 8192,
+                    "num_predict": 500,
                     "flash_attn": False,
                 }
             )
