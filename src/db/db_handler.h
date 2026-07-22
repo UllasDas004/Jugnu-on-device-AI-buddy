@@ -36,7 +36,7 @@ namespace Jugnu
         // Write raw OCR text directly to the ocr_buffer staging table.
         // Python's FlushWorker reads this every 60s, cleans with Gemma, and vectorizes.
         // This bypasses the IPC pipe - large OCR blobs never travel over named Pipes.
-        static bool BufferOCR(const std::string& appName, const std::string& rawText);
+        static bool BufferOCR(const std::string& appName, const std::string& windowTitle, const std::string& rawText);
         
         private:
         // Sqlite DB Connection Handle

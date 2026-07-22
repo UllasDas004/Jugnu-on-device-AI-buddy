@@ -18,6 +18,10 @@
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <stack>
+
+// Register the Ignore tag globally so Windows knows not to track programmatic restorations
+static UINT cfIgnore = RegisterClipboardFormatA("ExcludeClipboardContentFromMonitorProcessing");
 
 using namespace winrt::Windows::Media::Ocr;
 using namespace winrt::Windows::Graphics::Imaging;
@@ -25,6 +29,8 @@ using namespace winrt::Windows::Globalization;
 
 namespace Jugnu
 {
+    std::atomic<ULONGLONG> g_ghostClipboardIgnoreUntilTick{0};
+    std::atomic<DWORD> g_lastGhostClipboardInputTime{0};
     std::atomic<bool> ScreenReader::isRunning(false);
     HANDLE ScreenReader::hThread = NULL;
     static winrt::Windows::Media::Ocr::OcrEngine g_ocrEngine = nullptr;
@@ -94,6 +100,7 @@ namespace Jugnu
         std::wstring typeName;      // "Edit", "Document", "Text"
         std::wstring automationId;  // smantic role hint from the UIA tree
         std::wstring text;          // verbatim extracted content
+        bool fullBuffer = false;
     };
 
     // Whitelist: only content-bearing leaf controls.
@@ -138,6 +145,146 @@ namespace Jugnu
         return out;
     }
 
+    // ── Ghost Clipboard: Full Code Buffer Extraction ──────────────────────────
+    // Calls SetFocus() on the Monaco editor element via UIA accessibility API,
+    // then synthesizes Ctrl+A + Ctrl+C to read Monaco's full JS model from clipboard.
+    // The user's original clipboard is backed up and restored atomically.
+    // Only called during 60s idle — user is not typing, safe to synthesize input.
+    // Returns empty wstring if SetFocus fails and bounding-rect fallback also fails.
+    // ─────────────────────────────────────────────────────────────────────────────
+    static std::wstring GhostClipboard(IUIAutomationElement* pMonacoEl)
+    {
+        // Step 1: Force focus onto Monaco via UIA.
+        // Chrome bridges SetFocus() → DOM focus() on the renderer element.
+        HRESULT hr = pMonacoEl->SetFocus();
+        if(FAILED(hr))
+        {
+            // Fallback: synthetic click at the center of the editor's bounding rect.
+            RECT rect{};
+            if(SUCCEEDED(pMonacoEl->get_CurrentBoundingRectangle(&rect)))
+            {
+                int cx = rect.left + (rect.right - rect.left) / 2;
+                int cy = rect.top + (rect.bottom - rect.top) / 2;
+                INPUT inputs[2] = {};
+                inputs[0].type  = INPUT_MOUSE;
+                inputs[0].mi.dx = cx * 65535 / GetSystemMetrics(SM_CXSCREEN);
+                inputs[0].mi.dy = cy * 65535 / GetSystemMetrics(SM_CYSCREEN);
+                inputs[0].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN;
+                inputs[1] = inputs[0];
+                inputs[1].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP;
+                SendInput(2, inputs, sizeof(INPUT));
+            }
+        }
+        Sleep(60); // Wait for Chrome renderer IPC to deliver focus (~10-30ms latency)
+
+        // Step 2 : Backup the user's current clipboard content.
+        std::wstring backup;
+        HWND hOwner = GetConsoleWindow();
+        if(OpenClipboard(hOwner))
+        {
+            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+            if(hData)
+            {
+                wchar_t* p = static_cast<wchar_t*>(GlobalLock(hData));
+                if(p)
+                {
+                    backup = p;
+                    GlobalUnlock(hData);
+                }
+            }
+            CloseClipboard();
+        }
+
+        // Step 3: Set ignore flag far into the future during extraction
+        g_ghostClipboardIgnoreUntilTick = GetTickCount64() + 10000;
+
+        // Step 4: Ctrl+A — Select All. Monaco selects its full JS model, not just viewport.
+        INPUT selAll[4] = {};
+        selAll[0].type = INPUT_KEYBOARD;
+        selAll[0].ki.wVk = VK_CONTROL;
+        selAll[1].type = INPUT_KEYBOARD;
+        selAll[1].ki.wVk = 'A';
+        selAll[2] = selAll[1];
+        selAll[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        selAll[3] = selAll[0];
+        selAll[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(4, selAll, sizeof(INPUT));
+        Sleep(30);
+
+        // Step 5: Ctrl+C — Copy. Monaco serializes the full buffer into clipboard.
+        INPUT copy[4] = {};
+        copy[0].type = INPUT_KEYBOARD;
+        copy[0].ki.wVk = VK_CONTROL;
+        copy[1].type = INPUT_KEYBOARD;
+        copy[1].ki.wVk = 'C';
+        copy[2] = copy[1];
+        copy[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        copy[3] = copy[0];
+        copy[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(4, copy, sizeof(INPUT));
+        Sleep(150); // Monaco clipboard write is async — give it time
+
+        // Step 6: Read the full code buffer.
+        std::wstring codeBuffer;
+        if(OpenClipboard(hOwner))
+        {
+            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+            if(hData)
+            {
+                wchar_t* p = static_cast<wchar_t*>(GlobalLock(hData));
+                if(p)
+                {
+                    codeBuffer = p;
+                    GlobalUnlock(hData);
+                }
+            }
+            CloseClipboard();
+        }
+
+        // Step 7: Restore the user's original clipboard content.
+        if(OpenClipboard(hOwner))
+        {
+            EmptyClipboard();
+            if(!backup.empty())
+            {
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (backup.size() + 1) * sizeof(wchar_t));
+                if(hMem)
+                {
+                    wchar_t* p = static_cast<wchar_t*>(GlobalLock(hMem));
+                    if(p)
+                    {
+                        wmemcpy(p, backup.c_str(), (backup.size() + 1));
+                        GlobalUnlock(hMem);
+                        SetClipboardData(CF_UNICODETEXT, hMem);
+                        // Note: do NOT call GlobalFree — SetClipboardData takes ownership
+
+                        // Inject the Ignore Tag alongside the restored text.
+                        // This prevents Win+V and other clipboard managers from capturing this restoration event.
+                        SetClipboardData(cfIgnore, NULL); 
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+
+        // Step 8: Lower flag — allow 1000ms for async WM_CLIPBOARDUPDATE to pass
+        g_ghostClipboardIgnoreUntilTick = GetTickCount64() + 1000;
+
+        // Step 9: Clear the visual "Select All" highlight in the editor by pressing Right Arrow
+        INPUT rightArrow[2] = {};
+        rightArrow[0].type = INPUT_KEYBOARD;
+        rightArrow[0].ki.wVk = VK_RIGHT;
+
+        rightArrow[1].type = INPUT_KEYBOARD;
+        rightArrow[1].ki.wVk = VK_RIGHT;
+        rightArrow[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        
+        SendInput(2, rightArrow, sizeof(INPUT));
+        Jugnu::g_lastGhostClipboardInputTime = GetTickCount();
+
+        return codeBuffer; // empty string if anything failed
+    }
+
     std::wstring ScreenReader::ExtractTextViaUIA(HWND targetWindow)
     {
         // 1. Initialize the UIA COM factory.
@@ -164,121 +311,250 @@ namespace Jugnu
             return L"";
         }
 
-        // 3. Build a condition that matches ALL elements (TrueCondition = no filter).
-        //    We want to walk every node in the subtree to find the richest text.
-        IUIAutomationCondition* pTrueCondition = nullptr;
-        hr = pAutomation->CreateTrueCondition(&pTrueCondition); // Bug1 fix: capture return value
-        if(FAILED(hr) || !pTrueCondition)
+        // 3. Prepare the Tree walker for manual BFS
+        IUIAutomationTreeWalker* pWalker = nullptr;
+        pAutomation->get_ControlViewWalker(&pWalker);
+        if(!pWalker)
         {
             pRoot->Release();
             pAutomation->Release();
             return L"";
         }
 
-        // 4. Get a flat array of ALL descendant elements under the root.
-        //    TreeScope_Descendants = walk the entire subtree recursively.
-        IUIAutomationElementArray* pElemnts = nullptr;
-        hr = pRoot->FindAll(TreeScope_Descendants, pTrueCondition, &pElemnts); // Bug2 fix: capture return value
-
-        // 5. Collect multiple independent text sections instead of just the longest
-        const size_t MIN_TEXT = 100;    // skip tiny buttons/labels
-        const size_t MAX_TEXT = 150000; // kip the root "all-page" element that subsumes everything
-
         std::vector<UiaSection> candidates;
+        IUIAutomationElement* pMonacoEl = nullptr;  // saved for Ghost Clipboard
+        IUIAutomationElement* pRootWebArea = nullptr;  // saved for URL + correct page title
+        size_t largestMonacoLen = 0;
 
-        if(pElemnts)
+        // ── 1. SETUP DFS STACK ──
+        std::stack<IUIAutomationElement*> dfsStack;
+        dfsStack.push(pRoot);
+        pRoot->AddRef(); 
+        bool foundMainLandmark = false;
+        while(!dfsStack.empty())
         {
-            int count = 0;
-            pElemnts->get_Length(&count);
-            // 5. BFS through every element in the UIA tree.
-            for(int i=0;i<count;i++)
+            IUIAutomationElement* pNode = dfsStack.top();
+            dfsStack.pop();
+
+            // ── 2. EARLY PRUNING: Visibility ──
+            BOOL isOffscreen = FALSE;
+            pNode->get_CurrentIsOffscreen(&isOffscreen);
+            if(isOffscreen)
             {
-                IUIAutomationElement* pEl = nullptr;
-                if(FAILED(pElemnts->GetElement(i, &pEl)) || !pEl) continue;
+                pNode->Release();
+                continue;
+            }
 
-                // ── Only process whitelisted content types ────────────────────────
-                CONTROLTYPEID ctrlType = 0;
-                pEl->get_CurrentControlType(&ctrlType);
-                if(!kContentTypes.count(ctrlType))
+            CONTROLTYPEID type = 0;
+            pNode->get_CurrentControlType(&type);
+
+            // ── 3. ARIA LANDMARK PRUNING (The Holy Grail) ──
+            bool isMainContent = false;
+            BSTR bLocalType = nullptr;
+            if (SUCCEEDED(pNode->get_CurrentLocalizedControlType(&bLocalType)) && bLocalType)
+            {
+                std::wstring localType(bLocalType, SysStringLen(bLocalType));
+                SysFreeString(bLocalType);
+                
+                // Prune web layout sidebars and footers entirely (which contain the ads/comments)
+                // We keep 'navigation' and 'banner' so we can still extract the browser URL bar!
+                if (localType == L"complementary" || localType == L"contentinfo")
                 {
-                    pEl->Release();
-                    continue;  // skip List, Tree, Menu, StatusBar, ToolBar, etc.
+                    pNode->Release();
+                    continue; // Skip extracting this AND skip all its children!
                 }
+                if (localType == L"main") isMainContent = true;
+            }
 
-                // ── Extract text via TextPattern ──────────────────────────────────
-                // 6. Query the TextPattern interface from this element.
-                //    Not every element has a TextPattern — most buttons and labels don't.
-                //    GetCurrentPattern() returns E_NOINTERFACE if the pattern isn't supported.
-
-                IUIAutomationTextPattern* pTextPattern = nullptr;
-                hr = pEl->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pTextPattern);
-
-                if(SUCCEEDED(hr) && pTextPattern)
+            // ── SPECIAL: Save RootWebArea for URL + page title extraction ─────────────────
+            // Chrome exposes the active tab's URL via LegacyIAccessible on the RootWebArea.
+            // This is reliable at idle (unlike the omnibox which is empty unless focused).
+            if(type == UIA_DocumentControlTypeId && !pRootWebArea)
+            {
+                BSTR bName = nullptr;
+                if(SUCCEEDED(pNode->get_CurrentName(&bName)) && bName)
                 {
-                    // 7. Get the full document text range and extract the raw string.
+                    std::wstring name(bName, SysStringLen(bName));
+                    SysFreeString(bName);
+                    // RootWebArea's Name is the page title — Chrome always sets this
+                    if(!name.empty())
+                    {
+                        pRootWebArea = pNode;
+                        pRootWebArea->AddRef();
+                    }
+                }
+            }
+
+            // Prune dead-end UI branches
+            if(type == UIA_ToolBarControlTypeId || type == UIA_MenuBarControlTypeId ||
+               type == UIA_ScrollBarControlTypeId || type == UIA_StatusBarControlTypeId ||
+               type == UIA_TitleBarControlTypeId || type == UIA_TabItemControlTypeId)
+            {
+                pNode->Release();
+                continue;
+            }
+
+            // ── 4. EXTRACT TEXT ──
+            // If it's a content type OR it's the ARIA "main" container
+            if(kContentTypes.count(type) || isMainContent)
+            {
+                std::wstring text = L"";
+                
+                IUIAutomationTextPattern* pTextPattern = nullptr;
+                if(SUCCEEDED(pNode->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pTextPattern)) && pTextPattern)
+                {
                     IUIAutomationTextRange* pRange = nullptr;
                     if(SUCCEEDED(pTextPattern->get_DocumentRange(&pRange)) && pRange)
                     {
                         BSTR bstr = nullptr;
-                        // -1 = no character limit, retrieve everything
                         if(SUCCEEDED(pRange->GetText(-1, &bstr)) && bstr)
                         {
-                            std::wstring text(bstr, SysStringLen(bstr));
+                            text = std::wstring(bstr, SysStringLen(bstr));
                             SysFreeString(bstr);
-                            // 8. Keep only the longest text we've found.
-                            //    The code editor always has the most characters.
-                            size_t min_required = (ctrlType == UIA_EditControlTypeId) ? 20 : MIN_TEXT;
-                            if(text.length() >= min_required && text.length() <= MAX_TEXT)
-                            {
-                                // ── Get automation ID for Python-side context ─────
-                                std::wstring autoId;
-                                BSTR bId = nullptr;
-                                if(SUCCEEDED(pEl->get_CurrentAutomationId(&bId)) && bId)
-                                {
-                                    autoId = std::wstring(bId, SysStringLen(bId));
-                                    SysFreeString(bId);
-                                }
-
-                                UiaSection sec{
-                                    ControlTypeName(ctrlType),
-                                    autoId,
-                                    text
-                                };
-
-                                // Dedup: prevent parent nodes from duplicating children
-                                bool absorbed = false;
-                                for(auto& existing : candidates)
-                                {
-                                    // Never let Document/Text absorb an Edit, and vice versa.
-                                    // Edits (code blocks) must be preserved independently.
-                                    if(existing.typeName == L"Edit" && sec.typeName != L"Edit") continue;
-                                    if(sec.typeName == L"Edit" && existing.typeName != L"Edit") continue;
-
-                                    if(text.find(existing.text) != std::wstring::npos)
-                                    {
-                                        existing = sec;    // new is a superset — promote it
-                                        absorbed = true;
-                                        break;
-                                    }
-                                    if(existing.text.find(text) != std::wstring::npos)
-                                    {
-                                        absorbed = true; // already captured by a larger block
-                                        break;
-                                    }
-                                }
-                                if(!absorbed) candidates.push_back(sec);
-                            }
                         }
                         pRange->Release();
                     }
                     pTextPattern->Release();
                 }
-                pEl->Release();
+
+                if(text.empty())
+                {
+                    IUIAutomationValuePattern* pValuePattern = nullptr;
+                    if(SUCCEEDED(pNode->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePattern)) && pValuePattern)
+                    {
+                        BSTR bstr = nullptr;
+                        if(SUCCEEDED(pValuePattern->get_CurrentValue(&bstr)) && bstr)
+                        {
+                            text = std::wstring(bstr, SysStringLen(bstr));
+                            SysFreeString(bstr);
+                        }
+                        pValuePattern->Release();
+                    }
+                }
+
+                size_t min_required = (type == UIA_EditControlTypeId) ? 20 : 100;
+                if(text.length() >= min_required && text.length() <= 150000)
+                {
+                                std::wstring autoId;
+                                BSTR bId = nullptr;
+                                if(SUCCEEDED(pNode->get_CurrentAutomationId(&bId)) && bId)
+                                {
+                                    autoId = std::wstring(bId, SysStringLen(bId));
+                                    SysFreeString(bId);
+                                }
+                                std::wstring typeNameForJson = isMainContent ? L"MainContent" : ControlTypeName(type);
+                                UiaSection sec{ typeNameForJson, autoId, text };
+
+                                // Dedup logic
+                                bool absorbed = false;
+                                for(auto& existing : candidates)
+                                {
+                                    // Protect Edit controls from being absorbed or absorbing others
+                                    if(existing.typeName == L"Edit" && sec.typeName != L"Edit") continue;
+                                    if(sec.typeName == L"Edit" && existing.typeName != L"Edit") continue;
+                                    
+                                    // Protect MainContent from being absorbed by Document
+                                    if(existing.typeName == L"MainContent" && sec.typeName != L"MainContent") continue;
+                                    if(sec.typeName == L"MainContent" && existing.typeName != L"MainContent") continue;
+
+                                    if(text.find(existing.text) != std::wstring::npos) {
+                                        existing = sec; absorbed = true; break;
+                                    }
+                                    if(existing.text.find(text) != std::wstring::npos) {
+                                        absorbed = true; break;
+                                    }
+                                }
+                                if(!absorbed) candidates.push_back(sec);
+                                
+                                if (isMainContent) foundMainLandmark = true;
+                                // Save Edit for Ghost Clipboard
+                                if(type == UIA_EditControlTypeId && text.length() > largestMonacoLen)
+                                {
+                                    if(pMonacoEl) pMonacoEl->Release();
+                                    pMonacoEl = pNode;
+                                    pMonacoEl->AddRef();
+                                    largestMonacoLen = text.length();
+                                }
+                            }
+
             }
-            pElemnts->Release();
+            // ── 5. ENQUEUE CHILDREN (DFS Reverse Order) ──
+            IUIAutomationElement* pChild = nullptr;
+            if(SUCCEEDED(pWalker->GetFirstChildElement(pNode, &pChild)) && pChild)
+            {
+                std::vector<IUIAutomationElement*> children;
+                while(pChild)
+                {
+                    children.push_back(pChild);
+                    IUIAutomationElement* pNext = nullptr;
+                    pWalker->GetNextSiblingElement(pChild, &pNext);
+                    pChild = pNext;
+                }
+                // Push in reverse order so the topmost visual child is popped FIRST
+                for (auto it = children.rbegin(); it != children.rend(); ++it)
+                dfsStack.push(*it);
+            }
+            pNode->Release();
         }
-        //── COM cleanup (fix original leak: pCond/pRoot/pAutomation never freed) ─
-        pTrueCondition->Release();
+        
+        pWalker->Release();
+
+        // ── 6a. EXTRACT URL + PAGE TITLE from RootWebArea ─────────────────────────
+        // We use LegacyIAccessiblePattern::get_CurrentValue() on the RootWebArea.
+        // Chrome populates this with the current page URL regardless of focus state.
+        // get_CurrentName() gives us the correct per-tab page title.
+        if(pRootWebArea)
+        {
+            std::wstring pageUrl;
+            std::wstring pageTitle;
+
+            // Get the page title from Name property
+            BSTR bTitle = nullptr;
+            if(SUCCEEDED(pRootWebArea->get_CurrentName(&bTitle)) && bTitle)
+            {
+                pageTitle = std::wstring(bTitle, SysStringLen(bTitle));
+                SysFreeString(bTitle);
+            }
+
+            // Get the URL from LegacuIAccessible value
+            IUIAutomationLegacyIAccessiblePattern* pLegacy = nullptr;
+            if(SUCCEEDED(pRootWebArea->GetCurrentPattern(UIA_LegacyIAccessiblePatternId, (IUnknown**)&pLegacy)) && pLegacy)
+            {
+                BSTR bUrl = nullptr;
+                if(SUCCEEDED(pLegacy->get_CurrentValue(&bUrl)) && bUrl)
+                {
+                    pageUrl = std::wstring(bUrl, SysStringLen(bUrl));
+                    SysFreeString(bUrl);
+                }
+                pLegacy->Release();
+            }
+
+            if(!pageUrl.empty() || !pageTitle.empty())
+            {
+                // Store as a combined PageMeta section — Python will split it out
+                // Format: "TITLE\n\nURL" so Python can split on \n\n
+                std::wstring meta = pageTitle + L"\n\n" + pageUrl;
+                UiaSection metaSec{
+                    L"PageMeta",
+                    L"",
+                    meta
+                };
+                candidates.push_back(metaSec);
+                std::wcout << L"\033[90m[ScreenReader] PageMeta: title='" << pageTitle << L"' url='" << pageUrl << L"'\033[0m\n";
+            }
+            pRootWebArea->Release();
+            pRootWebArea = nullptr;
+        }
+
+        // ── 6. PURGE DOCUMENT IF MAIN IS FOUND ──
+        if(foundMainLandmark)
+        {
+            candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                [](const UiaSection& s) { return s.typeName == L"Document"; }), 
+                candidates.end());
+        }
+        
+        //── COM cleanup (fix original leak: pRoot/pAutomation never freed) ─
         pRoot->Release();
         pAutomation->Release();
 
@@ -286,19 +562,98 @@ namespace Jugnu
 
         // Sort by length descending — richest content first
         std::sort(candidates.begin(), candidates.end(),
-            [](const UiaSection& a, const UiaSection& b){ return a.text.length() > b.text.length(); });
+            [](const UiaSection& a, const UiaSection& b)
+        {
+            // Edit (clean code) always before Document (noisy page text)
+            auto priority = [](const std::wstring& t) -> int
+            {
+                if(t == L"Edit") return 0;
+                if(t == L"Document") return 1;
+                return 2;
+            };
+            int pa = priority(a.typeName), pb = priority(b.typeName);
+            if(pa != pb) return pa < pb;
+            return a.text.length() > b.text.length();
+        });
 
-        // Cap at 5 sections — Problem Statement, Code, and Notes
-        if(candidates.size() > 5) candidates.resize(5);
+        // Cap at 5 sections — but always keep the PageMeta
+        {
+            std::vector<UiaSection> urlSecs, contentSecs;
+            for(auto& c : candidates)
+                (c.typeName == L"PageMeta" ? urlSecs : contentSecs).push_back(c);
+            if(contentSecs.size() > 5) contentSecs.resize(5);
+            candidates = urlSecs; // PageMeta first
+            candidates.insert(candidates.end(), contentSecs.begin(), contentSecs.end());
+        }
+
+        // ── Ghost Clipboard: override Edit section with full Monaco buffer ────────
+        if(pMonacoEl)
+        {
+            std::cout << "\033[90m[ScreenReader] Ghost Clipboard: extracting full code buffer...\033[0m\n";
+            std::wstring fullCode = GhostClipboard(pMonacoEl);
+            pMonacoEl->Release();
+            pMonacoEl = nullptr;
+
+            if(!fullCode.empty())
+            {
+                // Sanity check: ghost result must be >= the UIA partial window.
+                // If it's shorter, SetFocus hit the wrong element — use UIA fallback.
+
+                bool valid = true;
+                for(const auto& c : candidates)
+                {
+                    if(c.typeName == L"Edit" && fullCode.length() < c.text.length())
+                    {
+                        valid = false;
+                        std::cout << "\033[33m[ScreenReader] Ghost Clipboard shorter than UIA — keeping UIA window text.\033[0m\n";
+                        break;
+                    }
+                }
+
+                if(valid)
+                {
+                    for(auto& c : candidates)
+                    {
+                        if(c.typeName == L"Edit")
+                        {
+                            c.text = fullCode;
+                            c.fullBuffer = true;
+                            std::cout << "\033[32m[ScreenReader] Ghost Clipboard: " << fullCode.length() << " chars (full Monaco buffer).\033[0m\n";
+                            break; // only override the first Edit (Monaco code editor)
+                        }
+                    }
+                }
+            }
+            else
+                std::cout << "\033[33m[ScreenReader] Ghost Clipboard returned empty — using UIA window text.\033[0m\n";
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
 
         // ── Serialize to JSON array → Python reads with json.loads() ─────────────
         std::wstring json = L"[";
+        bool first = true;
         for (size_t i = 0; i < candidates.size(); i++)
         {
-            if (i > 0) json += L",";
-            json += L"{\"type\":\"" + candidates[i].typeName;
-            json += L"\",\"name\":\"" + JsonEscapeW(candidates[i].automationId);
-            json += L"\",\"text\":\"" + JsonEscapeW(candidates[i].text) + L"\"}";
+            if(!first) json += L",";
+            first = false;
+            if(candidates[i].typeName == L"PageMeta")
+            {
+                // Split "title\n\nurl" back into two fields for Python
+                std::wstring meta = candidates[i].text;
+                size_t sep = meta.find(L"\n\n");
+                std::wstring title = (sep != std::wstring::npos) ? meta.substr(0,sep) : meta;
+                std::wstring url   = (sep != std::wstring::npos) ? meta.substr(sep + 2) : L"";
+                json += L"{\"type\":\"PageMeta\",\"title\":\"" + JsonEscapeW(title)
+                      + L"\",\"url\":\"" + JsonEscapeW(url) + L"\"}";
+            }
+            else
+            {
+                json += L"{\"type\":\"" + candidates[i].typeName;
+                json += L"\",\"name\":\"" + JsonEscapeW(candidates[i].automationId);
+                json += L"\",\"full_buffer\":" + std::wstring(candidates[i].fullBuffer ? L"true" : L"false");
+                json += L",\"text\":\"" + JsonEscapeW(candidates[i].text) + L"\"}";
+            }
         }
         json += L"]";
         return json;
@@ -404,7 +759,22 @@ namespace Jugnu
                 continue;
             }
             
-            DWORD idleTime = GetTickCount() - lii.dwTime;
+            DWORD idleTime;
+            DWORD timeSinceGhost = 0;
+            if (lii.dwTime >= Jugnu::g_lastGhostClipboardInputTime) {
+                timeSinceGhost = lii.dwTime - Jugnu::g_lastGhostClipboardInputTime;
+            } else {
+                timeSinceGhost = Jugnu::g_lastGhostClipboardInputTime - lii.dwTime;
+            }
+
+            // If the last OS input event matches our GhostClipboard timestamp (within 500ms),
+            // it means the user hasn't touched the computer since we ran GhostClipboard.
+            if (timeSinceGhost < 500) {
+                // OS timer was hijacked by GhostClipboard. Force it to remain in the idle block.
+                idleTime = 60000;
+            } else {
+                idleTime = GetTickCount() - lii.dwTime;
+            }
 
             if(idleTime >= 60000)   // 60 seconds idle → capture screen
             {
@@ -415,6 +785,8 @@ namespace Jugnu
                     continue;
                 }
                 std:: string currentApp = WinMonitor::GetProcessName(hwnd);
+                std::string windowTitle = WinMonitor::GetWindowTextString(hwnd);
+
                 // [MID-IDLE APP SWITCHING LOGIC]
                 // If a user sits idle in VS Code for 60s, we capture it and set hasOcredWhileIdle = true.
                 // If they then Alt-Tab to Chrome without touching the mouse, system idleTime stays > 60s.
@@ -431,7 +803,7 @@ namespace Jugnu
                     // Only capture if the app supports UIA extraction
                     if(ShouldCapture(currentApp))
                     {
-                        std::cout << "\033[1;36m[ScreenReader]\033[0m 60s idle detected in '" << currentApp << "' — reading screen context...\n";
+                        std::cout << "\033[1;36m[ScreenReader]\033[0m 60s idle detected in '" << currentApp << "' - reading screen context...\n";
 
                         // ── PRIMARY: Try UIA first ────────────────────────────────
                         std::cout << "\033[90m[ScreenReader]\033[0m Trying UIA for " << currentApp << "...\n";
@@ -461,7 +833,7 @@ namespace Jugnu
                             // No IPC pipe involved — large OCR text blobs never travel over Named Pipes.
                             // Python's FlushWorker will read this table every 60s and clean it with Gemma.
 
-                            if(DBHandler::BufferOCR(currentApp, utf8_text))
+                            if(DBHandler::BufferOCR(currentApp, windowTitle, utf8_text))
                             {
                                 std::cout << "\033[32m[ScreenReader]\033[0m Queued " 
                                         << utf8_text.length() << " chars from " 
@@ -492,6 +864,8 @@ namespace Jugnu
                     lastOcredApp = "";
                     continue;
                 }
+
+
 
                 hasOcredWhileIdle = false;
                 lastOcredApp = "";

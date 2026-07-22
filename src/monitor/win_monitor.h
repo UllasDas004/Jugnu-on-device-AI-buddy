@@ -25,6 +25,9 @@ namespace Jugnu
         // Checks if the keyboard/mouse has been idle for 60 seconds
         static bool IsUserIdle();
         
+        // Helper: Extracts the text title of the window (e.g., "Jugnu - VS Code")
+        static std::string GetWindowTextString(HWND hwnd);
+        
     private:
         // Handle to the registered Windows Event Hook
         static HWINEVENTHOOK hook;
@@ -50,7 +53,5 @@ namespace Jugnu
             DWORD dwmsEventTime
         );
         
-        // Helper: Extracts the text title of the window (e.g., "Jugnu - VS Code")
-        static std::string GetWindowTextString(HWND hwnd);
     };
 }

@@ -66,24 +66,19 @@ Return ONLY the raw query string, nothing else. No quotes, no prefix.
 ### D. The Structured UIA Extractor
 **Function:** `extract_section()`
 **Temperature:** 0.1
-**Purpose:** Extracts structured knowledge from native Windows UIA elements (like 'Document' or 'Text' controls). Bypasses JSON entirely to prevent markdown hallucinations.
+**Purpose:** Extracts structured metadata (TOPIC, TAGS, NOTES) from one UIA section. Gemma no longer extracts the CONTENT itself — the raw C++ payload is saved directly in Python to save output tokens and prevent context cutoff on large code files.
 ```text
-You are extracting technical knowledge from a developer's screen.
+You are extracting structured metadata from a developer's screen capture.
 This text is from a {control_type} UI element.
-CRITICAL: You are an EXTRACTOR ONLY. Copy content VERBATIM. Do NOT generate or infer anything.
-If the text has no useful technical content (UI labels, dates, navigation links), output: NONE
-
-Extract:
-TOPIC: One line — what is this about? (e.g. "Find the Number of Subsequences With Equal GCD")
-TAGS: 3-6 semantic tags (comma separated).
-NOTES: Any hints, constraints, or edge cases. If none, leave blank.
-CONTENT:
-<Copy the relevant explanatory technical text (problem statements, docs) verbatim. Skip UI chrome.>
-
-RAW TEXT:
+The text may start with noisy UI labels (buttons, menus). Ignore them.
+If the ENTIRE text is UI noise with no technical content, output: NONE
+Output EXACTLY these three fields and nothing else:
+TOPIC: One line — what is this page/document about?
+TAGS: 3-6 semantic tags (comma separated). Use ONLY lowercase letters and spaces. No hyphens or punctuation. (e.g. "cpp", "dynamic programming")
+NOTES: Key constraints, edge cases, hints, or method improvements in 2-4 sentences. Leave blank if none.
+RAW TEXT (for context only — do NOT copy it):
 {text}
-
-Output TOPIC, TAGS, NOTES, then CONTENT. Nothing else. If nothing useful, output: NONE
+Output TOPIC, TAGS, NOTES in that order. Nothing else. If nothing useful, output: NONE
 ```
 
 ### E. The Legacy OCR Noise Extractor

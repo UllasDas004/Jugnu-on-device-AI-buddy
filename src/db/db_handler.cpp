@@ -117,6 +117,7 @@ namespace Jugnu
             CREATE TABLE IF NOT EXISTS ocr_buffer (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 app_name  TEXT NOT NULL,
+                window_title TEXT NOT NULL,
                 raw_text  TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
@@ -134,6 +135,8 @@ namespace Jugnu
                 source_app    TEXT,
                 source_type   TEXT DEFAULT 'browser',    -- 'ide' or 'browser'
                 file_path     TEXT,                      -- only set for ide captures
+                source_url    TEXT,                      -- only set for browser captures
+                window_title  TEXT,                      -- exact window title for merging
                 summary       TEXT,                      -- compact prose used as embedding anchor
                 tags          TEXT,                      -- JSON array of tags
                 notes         TEXT,                      -- Notes, constraints, edges cases
@@ -367,7 +370,7 @@ namespace Jugnu
         return result;
     }
 
-    bool DBHandler::BufferOCR(const std::string& appName, const std::string& rawText)
+    bool DBHandler::BufferOCR(const std::string& appName, const std::string& windowTitle, const std::string& rawText)
     {
         if(!db) return false;
 
@@ -376,12 +379,13 @@ namespace Jugnu
         // No manual escaping needed — that was only required for the JSON IPC pipe.
 
         sqlite3_stmt* stmt;
-        const char* sql = "INSERT INTO ocr_buffer (app_name, raw_text) VALUES (?, ?);";
+        const char* sql = "INSERT INTO ocr_buffer (app_name, window_title, raw_text) VALUES (?, ?, ?);";
         int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
         if(rc != SQLITE_OK) return false;
 
         sqlite3_bind_text(stmt, 1, appName.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, rawText.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, windowTitle.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, rawText.c_str(), -1, SQLITE_TRANSIENT);
 
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);

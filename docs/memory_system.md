@@ -66,6 +66,8 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
    - `notes`: Constraints and hints.
    - `tags`: JSON array of semantic tags (e.g., ["Python", "LeetCode"]).
    - `capture_count`: Incremented if the same knowledge is detected again.
+   - `source_type`: Origin of data (e.g. `ide`, `browser`, `clipboard`).
+   - `full_buffer`: Boolean flag indicating if this is a guaranteed complete file read (like a CTRL+C ghost clipboard grab) vs a partial UI viewport read.
 
 5. **`vec_knowledge`** (The OKF Vector Index — VIRTUAL TABLE)
    The `sqlite-vec` index for `knowledge_docs`. **Crucially**, it only embeds the `topic` and `summary` columns. This prevents the `e5-small-v2` embedding model from being confused by raw code symbols while retaining fast, accurate semantic search.
@@ -80,7 +82,7 @@ We use a local SQLite database enhanced with `sqlite-vec` for KNN cosine similar
 
 ---
 
-## 2. The Phase 3 OKF Write Pipeline (Zero-IPC)
+## 2. The Phase 5 OKF Write Pipeline (Zero-IPC)
 
 ### The Great IPC Bottleneck (Why we changed)
 Originally, C++ streamed massive OCR text blobs to Python via Named Pipes. This caused the Python background daemon to block for hundreds of milliseconds parsing JSON strings, leading to dropped telemetry events and severe lag. 
@@ -90,30 +92,33 @@ We transitioned to a **Zero-IPC** approach for heavy data:
 1. **Producer:** C++ instantly dumps raw, noisy text into the `ocr_buffer` table using native SQLite C APIs (ultra-fast, asynchronous).
 2. **Consumer:** Python's `FlushWorker` daemon wakes up every 60 seconds (only on AC power) and chews through the buffer at its own pace without blocking the main event loop.
 
-### The Full Event Flow
+### The Full Event Flow (Phase 5 Architecture)
 
 ```
-[C++ WinRT Capture] → Native SQLite Insert → [ocr_buffer]
-      (Zero IPC overhead, Python daemon remains unblocked)
+[C++ Data Sources]
+  ├─ UIA / OCR Capture → Native SQLite Insert → [ocr_buffer]
+  └─ Ghost Clipboard (CTRL+C) → Bypasses Buffer → Direct DB Insert (Pristine `full_buffer` flag)
 
 [Python FlushWorker (Wakes every 60s)]
   ├─ 1. Prunes rows > 10 mins old (saves GPU)
-  ├─ 2. Sanitization: Strips `\ufffc` and `\x00` characters to prevent LLM tokenizer stack-buffer overruns.
-  ├─ 3. Area-Wise Sequence Matching: Decouples Code from Page. Only skips if BOTH are >85% similar.
-  ├─ 4. UIA JSON Routing:
-  │      ├─ Type 'Edit' → Bypasses Gemma! Flagged verbatim. Heuristically tags language.
-  │      └─ Type 'Document' → Sent to Gemma for strict TOPIC/CONTENT extraction
-  └─ 5. combine_sections(): Pure Python fusion (deduplicates tags/code mathematically)
+  ├─ 2. Area-Wise Deduplication: Splits UIA JSON into 'Edit' (Code) and 'Document' (Page). 
+  │     Only skips extraction if BOTH are >95% identical to previous frame.
+  ├─ 3. UIA JSON Routing:
+  │      ├─ 'Edit' (Code) → Bypasses LLM, logged as pristine `verbatim` code.
+  │      └─ 'Document' → Gemma extracts TOPIC, TAGS, NOTES (CONTENT is handled directly via Python to save tokens)
+  └─ 4. combine_sections(): Pure Python fusion.
 
 [AI Engine]
   └─ generate_summary(): Generates a 1-2 sentence prose anchor
 
 [Embedder]
-  ├─ embeds ONLY the prose summary (massively improved e5-small-v2 accuracy)
-  ├─ Checks `vec_knowledge` for duplicates (similarity > 97%)
-  │      ├─ If Duplicate: Merges Code (keeps longest), Merges Paragraphs, deduplicates tags
-  │      └─ If New: Inserts into knowledge_docs and vec_knowledge
-  └─ DELETES row from ocr_buffer
+  ├─ 1. Deterministic Anchor Check: Looks for exact `window_title` or `file_path` matches.
+  ├─ 2. Vector Semantic Check: (Fallback) Checks `vec_knowledge` for > 97% cosine similarity.
+  ├─ 3. Intelligent Merging:
+  │      ├─ "Never Delete, Only Add": difflib union merge preserves user code during scroll-loss.
+  │      ├─ OCR-to-UIA Upgrade: Overwrites dirty OCR if pristine UIA data arrives.
+  │      └─ Full Buffer Override: If `full_buffer=true` (Clipboard), safe overwrite allowed.
+  └─ 4. DELETES row from ocr_buffer (even if merge happened).
 ```
 
 ### e5-small Prefix Strategy (Asymmetric Search)
@@ -134,7 +139,7 @@ query_prefixed = f"query: {query_text}"
 
 ---
 
-## 2.5 The Phase 3 OKF Read Pipeline (The RAG Engine)
+## 2.5 The Phase 5 OKF Read Pipeline (The RAG Engine)
 
 When the user asks for help (via `jugnu_interact.py`), Jugnu transitions from a passive observer to an active assistant.
 

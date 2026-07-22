@@ -109,7 +109,7 @@ This is architecturally superior in every way:
 - It captures **multiple independent sections** — the code editor block and the problem description block are extracted as separate items with their control type (`Edit`, `Document`, `Text`) attached.
 - It works **without GPU** — pure COM call, zero image processing.
 
-The UIA engine collects all candidate sections, deduplicates parent-child redundancy (a section that contains a smaller section's text absorbs it), and serializes the result as a structured JSON array. Python receives typed sections — it knows instantly if something is code or documentation.
+The UIA engine uses a **Depth-First Search (DFS)** with aggressive **ARIA Pruning**, checking `get_CurrentIsOffscreen()` to skip hidden noise and pruning structural nodes (`Pane`, `Group`), compressing the payload by 90%. It then serializes the result as a structured JSON array. Python receives typed sections — it knows instantly if something is code or documentation.
 
 **Tier 2: WinRT OCR (Fallback)**
 
@@ -157,8 +157,8 @@ The pipeline has four distinct stages:
 
 **Stage 0.5 — JSON Sanitization & Area-Wise Sequence Matching**
 
-Before any processing, the raw UIA JSON is scrubbed of `\ufffc` (Object Replacement Character) and `\x00` null bytes. This prevents fatal buffer overflows deep inside the C++ `llama.cpp` bindings which previously crashed the entire inference engine. 
-Then, an Area-Wise Deduplication check runs: it completely decouples the user's Code (`Edit` control) from the webpage prose (`Document` control). It only skips processing if BOTH the code and the page are >85% identical to the last capture. This ensures that a single character edit in the user's code triggers an OKF capture, even if the surrounding 5,000 words of LeetCode documentation remained completely static.
+Before any processing, the raw UIA JSON is scrubbed of `\ufffc` (Object Replacement Character) and `\x00` null bytes. This prevents fatal buffer overflows deep inside the LLM context.
+Then, an Area-Wise Deduplication check runs: it completely decouples the user's Code (`Edit` control) from the webpage prose (`Document` control). It only skips processing if BOTH the code and the page are **>95% identical** to the last capture. This ensures that a single character edit in the user's code triggers an OKF capture, even if the surrounding 5,000 words of LeetCode documentation remained completely static.
 
 **Stage 1 — Routing by Control Type**
 
@@ -168,9 +168,9 @@ Because C++ now attaches the UIA control type to each captured section, Python c
 
 This is the most important optimization in the pipeline. Previously, every captured section went through Gemma regardless. Now, the majority of content (code) completely bypasses the LLM — cutting GPU time by roughly 60-80% for typical coding sessions.
 
-**Stage 2 — Gemma Extraction (Document/Text only)**
+**Stage 2 — Gemma Extraction (Zero-Overhead Token Budget)**
 
-Gemma reads the raw document text and outputs structured key-value headers (`TOPIC:`, `TAGS:`, `NOTES:`, `CONTENT:`). There is no JSON in the output — this was a deliberate decision after LLM markdown hallucination crashes. When Gemma was asked to produce JSON, it would occasionally wrap the output in markdown code fences or hallucinate trailing commas, crashing `json.loads()`. Plain header lines are parsed with simple string splitting — robust against any hallucination.
+Gemma reads the raw document text and outputs structured key-value headers (`TOPIC:`, `TAGS:`, `NOTES:`). **Gemma no longer generates `CONTENT`.** The raw C++ UIA payload is piped directly through Python to the database, freeing up massive LLM output tokens and preventing generation cutoffs on large files. Plain header lines are parsed with simple string splitting — robust against any hallucination.
 
 **Stage 3 — Pure Python Section Fusion**
 
@@ -182,17 +182,17 @@ A critical insight: the `e5-small-v2` model works best on natural prose. Instead
 
 ---
 
-## The Deduplication + Merge Strategy
+## The Intelligent Merge Strategy (Phase 5)
 
-When a new knowledge document is about to be saved, `embedder.py` first checks if a semantically similar document already exists in `vec_knowledge` using KNN cosine similarity. If the cosine distance is less than 0.03 (greater than 97% similar), the documents are considered about the same topic.
+When a new knowledge document is about to be saved, `embedder.py` executes a strict deterministic-first merge pipeline:
 
-**The old approach** was to feed both the existing and new document into Gemma and ask it to merge them. This wasted GPU time, was slow (~2-3 seconds per merge), and occasionally hallucinated content.
-
-**The new approach** is entirely mathematical:
-- Code snippets: keep the longer one (longer = more complete implementation)
-- Content paragraphs: `difflib` line-by-line comparison, drop near-duplicate lines
-- Tags: Python set union
-- `capture_count` incremented: this field becomes a natural importance signal — a topic seen 15 times is demonstrably more important than one seen once
+1. **Deterministic Anchors:** Checks for an exact match on `window_title` or `file_path`. If found, it instantly merges the document. This prevents "Vector Identity" duplication where identical code files got slightly different LLM topics and failed the semantic threshold.
+2. **Semantic Search (Fallback):** Checks `vec_knowledge` using KNN cosine similarity. If distance < 0.03 (>97% similar), it initiates a merge.
+3. **Pure Mathematical Merging:**
+   - **"Never Delete, Only Add" (Union Merge):** When scrolling in VSCode, code falls off-screen. `difflib` naturally emits a `delete` opcode for the missing lines. Jugnu explicitly ignores deletes, preventing scroll-loss from erasing the user's codebase. Overwrites are only permitted when the `full_buffer` flag is true (via the Ghost Clipboard).
+   - **OCR-to-UIA Upgrade:** Automatically overwrites old, dirty OCR text with pixel-perfect strings if a pristine UIA capture arrives for the same topic.
+   - **Tags:** Python set union.
+   - **Capture Count:** Incremented to build importance signals.
 
 Zero GPU. Zero LLM. Pure Python running in milliseconds.
 
@@ -248,7 +248,7 @@ The answer is then grounded in the user's own past learning history and precisel
 | LRU Cache | C++ | DSA — hot path |
 | Named Pipe IPC server | C++ | Zero-latency secure bridge |
 | 30-min RAM→SQLite flush | C++ | Always running background thread |
-| Clipboard monitor | C++ | Win32 API |
+| Ghost Clipboard Bypass | C++ | Win32 `AddClipboardFormatListener` (Direct CTRL+C DB injection) |
 | File system watcher | C++ | Win32 `ReadDirectoryChangesW` |
 | `hDeepWorkEvent` gate | C++ | Kernel event — gates all background threads |
 | Stuck timer | C++ | Thread gated on `hDeepWorkEvent` |

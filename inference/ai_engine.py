@@ -328,38 +328,34 @@ class AIEngine:
         except Exception as e:
             return f"Ollama error: {e}"
 
-    def extract_section(self, text: str, control_type: str) -> dict | None:
+    def extract_section(self, text: str, control_type: str, cleaned_content: str = "") -> dict | None:
         """
-        Extracts structured knowledge from ONE UIA section (Document or Text type).
-        Returns: {content, tags, mini_summary} or None.
+            Extracts structured METADATA (TOPIC, TAGS, NOTES) from one UIA section.
+            cleaned_content is stored directly — Gemma no longer copies content verbatim,
+            so it has full output budget for NOTES and never runs out of tokens.
         """
         prompt = f"""
-            You are extracting technical knowledge from a developer's screen.
+            You are extracting structured metadata from a developer's screen capture.
             This text is from a {control_type} UI element.
-            CRITICAL: You are an EXTRACTOR ONLY. Copy content VERBATIM. Do NOT generate or infer anything.
-            If the text has no useful technical content (UI labels, dates, navigation links), output: NONE
-            
-            Extract:
-            TOPIC: One line — what is this about? (e.g. "Find the Number of Subsequences With Equal GCD")
-            TAGS: 3-6 semantic tags (comma separated).
-            NOTES: Any hints, constraints, or edge cases. If none, leave blank.
-            CONTENT:
-            <Copy the relevant explanatory technical text (problem statements, docs) verbatim. Skip UI chrome.>
-            
-            RAW TEXT:
+            The text may start with noisy UI labels (buttons, menus). Ignore them.
+            If the ENTIRE text is UI noise with no technical content, output: NONE
+            Output EXACTLY these three fields and nothing else:
+            TOPIC: One line — what is this page/document about?
+            TAGS: 3-6 semantic tags (comma separated). Use ONLY lowercase letters and spaces. No hyphens or punctuation. (e.g. "cpp", "dynamic programming")
+            NOTES: Key constraints, edge cases, hints, or method improvements in 2-4 sentences. Leave blank if none.
+            RAW TEXT (for context only — do NOT copy it):
             {text}
-            
-            Output TOPIC, TAGS, NOTES, then CONTENT. Nothing else. If nothing useful, output: NONE
+            Output TOPIC, TAGS, NOTES in that order. Nothing else. If nothing useful, output: NONE
         """
         try:
-            print(f"\033[35m[Gemma]\033[0m Extracting {control_type} section ({len(text)} chars)...")
+            print(f"\033[35m[Gemma]\033[0m Extracting metadata from {control_type} ({len(text)} chars)...")
             response = ollama.chat(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 think=False,
                 options={
                     "num_ctx": 4096,
-                    "num_predict": 1200,
+                    "num_predict": 300,   # TOPIC + TAGS + NOTES only — tiny output
                     "temperature": 0.1,
                     "flash_attn": False,
                 }
@@ -367,7 +363,11 @@ class AIEngine:
             raw = ""
             if hasattr(response, 'message') and response.message:
                 raw = (response.message.content or '').strip()
-            if not raw or raw.upper() == "NONE":
+
+            # Always show raw response so we can diagnose silent Gemma failures
+            print(f"\033[90m[Gemma] Raw ({len(raw)} chars): {repr(raw[:250])}\033[0m")
+
+            if not raw or raw.strip().upper() == "NONE":
                 return None
             
             tags = []
@@ -377,22 +377,25 @@ class AIEngine:
             mode = None
 
             for line in raw.split('\n'):
-                if line.startswith("TOPIC:"):
-                    topic = line.replace("TOPIC:", "").strip()
-                elif line.startswith("TAGS:"):
-                    tags = [t.strip().lower() for t in line.replace("TAGS:", "").split(',') if t.strip()]
-                elif line.startswith("NOTES:"): 
-                    notes = line.replace("NOTES:", "").strip()
+                stripped_line = line.strip()
+                if stripped_line.startswith("TOPIC:"):
+                    topic = stripped_line.replace("TOPIC:", "").strip()
+                    mode = None
+                elif stripped_line.startswith("TAGS:"):
+                    tags = [t.strip().lower() for t in stripped_line.replace("TAGS:", "").split(',') if t.strip()]
+                    mode = None
+                elif stripped_line.startswith("NOTES:"):
+                    # NOTES now comes AFTER CONTENT so mode switches correctly
+                    notes = stripped_line.replace("NOTES:", "").strip()
                     mode = "notes"
-                elif line.startswith("CONTENT:"):
-                    mode = "content"
                 elif mode == "notes":
                     notes += "\n" + line
-                elif mode == "content":
-                    content += "\n" + line
-            
-            content, notes = content.strip(), notes.strip()
+
+            # Use full cleaned content passed by caller — no token budget truncation
+            content = cleaned_content if cleaned_content else text
+            notes   = notes.strip()
             if not content or content.upper() == "NONE":
+                print(f"\033[33m[AIEngine] extract_section: no content after parse. Raw: {repr(raw[:150])}\033[0m")
                 return None
                 
             return {"content": content, "tags": tags, "notes": notes, "topic": topic}
@@ -410,8 +413,15 @@ class AIEngine:
         if not valid:
             return None
         
-        # Deduplicated semantic tags, ordered by first appearance
-        all_tags = list(dict.fromkeys(tag for e in valid for tag in e.get("tags", [])))
+        # Deduplicated semantic tags, ordered by first appearance (case and hyphen insensitive)
+        all_tags = []
+        seen = set()
+        for e in valid:
+            for tag in e.get("tags", []):
+                norm_tag = tag.lower().replace("-", " ")
+                if norm_tag not in seen:
+                    seen.add(norm_tag)
+                    all_tags.append(tag)
 
         # Join content sections
         combined_content = "\n\n".join(e["content"] for e in valid if not e.get("verbatim") and e.get("content"))
@@ -423,14 +433,25 @@ class AIEngine:
         combined_notes = "\n\n".join(e.get("notes", "") for e in valid if e.get("notes"))
 
         non_verbatim = [e for e in valid if not e.get("verbatim")]
-        topic = non_verbatim[0].get("topic", "Captured session") if non_verbatim else valid[0].get("topic", "Captured session")
+        
+        fallback_topic = "Captured session"
+        if "Solution" in combined_code and "class " in combined_code:
+            fallback_topic = "LeetCode Problem"
+        elif combined_code:
+            fallback_topic = "Code Snippet"
+
+        topic = non_verbatim[0].get("topic", fallback_topic) if non_verbatim else valid[0].get("topic", fallback_topic)
         # Fast semantic anchor summary
         summary = self.generate_summary(topic, combined_content, combined_code)
+        
+        is_full_buffer = any(e.get("full_buffer", False) for e in valid if e.get("verbatim"))
+        
         return {
             "topic": topic, "tags": all_tags, "notes": combined_notes, 
             "content": combined_content, "code_snippet": combined_code, 
             "summary": summary, "file_path": file_path,
             "source_type": "ide" if file_path else "browser",
+            "full_buffer": is_full_buffer
         }
     
     def generate_summary(self, topic: str, content: str, code: str) -> str:

@@ -28,14 +28,15 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 │                                                                     │
 │  ScreenReader Thread (hibernates on hDeepWorkEvent)                 │
 │     └─ Wakes ONLY when user is in a whitelisted work app            │
-│     └─ Extracts via UIA → Structured JSON [{type, name, text}]      │
+│     └─ Extracts via UIA (DFS ARIA Pruning) → JSON [{type, text}]    │
 │     └─ Falls back to WinRT OCR if UIA returns nothing               │
 │     └─ Writes result to SQLite ocr_buffer (zero IPC overhead)       │
 │                                                                     │
+│  ClipboardMonitor (WM_CLIPBOARDUPDATE)                              │
+│     └─ Ghost Clipboard bypasses 60s timer → pristine full_buffer    │
+│                                                                     │
 │  StuckTimer Thread (hibernates on hDeepWorkEvent)                   │
 │     └─ Fires USER_IDLE event to Python after 3 min AFK              │
-│                                                                     │
-│  App Switch → Named Pipe IPC → Python StateManager                  │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
               SQLite ocr_buffer │ Named Pipe IPC
@@ -44,25 +45,20 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 │                    Python Inference Engine (uv venv)                │
 │                                                                     │
 │  FlushWorker (every 60s, AC power only)                             │
-│     └─ Reads ocr_buffer rows settled for >30s                       │
-│     └─ Deduplicates per-section via difflib (MAX_CACHE=20)          │
+│     └─ Area-Wise Dedup (>95% match for Code & Page independently)   │
 │     └─ UIA JSON Path:                                               │
 │         Edit controls  → verbatim code, heuristic tag detection     │
-│         Document/Text  → Gemma extraction (section-aware)           │
-│     └─ OCR Fallback: context-aware 500-char chunks → Gemma          │
-│     └─ Synthesis → OKF knowledge_doc                                │
-│     └─ Embedder: cosine dedup check → insert or LLM merge           │
-│     └─ Deletes row only after successful synthesis (retry on crash) │
+│         Document/Text  → Gemma extraction (TOPIC, TAGS, NOTES only) │
+│     └─ OKF Synthesis → C++ payload passed directly, saving tokens   │
 │                                                                     │
 │  AIEngine (Ollama / Gemma4:e2b)                                     │
-│     └─ extract_section() for Document/Text controls                 │
-│     └─ combine_sections() → OKF knowledge_doc                       │
-│     └─ answer_with_context() with Situation-Aware Prompting         │
+│     └─ Situation-Aware Prompting (REPEATED_STRUGGLE)                │
 │     └─ Tiered Token Budgeting (prevents VRAM OOM)                   │
 │                                                                     │
 │  Embedder (multilingual-e5-small)                                   │
-│     └─ save_knowledge_doc() → vec_knowledge + knowledge_docs        │
-│     └─ search_knowledge_docs() → Blended Re-Ranking + Topic Dedup   │
+│     └─ Deterministic Anchors (exact window_title / file_path match) │
+│     └─ Union Merge ("Never Delete, Only Add" scroll-loss fix)       │
+│     └─ OCR-to-UIA Upgrade & full_buffer override                    │
 │                                                                     │
 │  StateManager ─→ ipc_client ─→ Terminal / WebView2 UI              │
 └─────────────────────────────────────────────────────────────────────┘
@@ -80,7 +76,7 @@ Jugnu is not just a passive chatbot; it actively profiles system-level behaviora
 The C++ monitoring threads (`ScreenReader`, `StuckTimer`) do not poll. When the user is outside a work app (gaming, watching a movie), both threads park on `WaitForSingleObject(hDeepWorkEvent, INFINITE)` — consuming **0% CPU**. The `WinEventProc` foreground hook wakes them instantly with a `SetEvent()` call the moment VS Code or Chrome is focused. While active, they sleep for the mathematically exact duration until the next meaningful event, eliminating even mid-interval polls.
 
 ### ✅ Structured UIA Extraction & Deduplication (C++)
-When the user has been idle for 60 seconds in a work app, `ScreenReader` walks the Windows UI Automation tree with a BFS traversal, extracting up to 5 meaningful sections. The key insight: it distinguishes **code editors** (`Edit` controls) from **prose** (`Document`, `Text` controls) and returns them as separate, labelled JSON objects. Parent-child deduplication prevents a `Document` node from absorbing its child `Text` nodes verbatim. `Edit` nodes (user code) can never be absorbed by prose.
+When the user has been idle for 60 seconds in a work app, `ScreenReader` walks the Windows UI Automation tree with a **Depth-First Search (DFS)** and aggressive **ARIA Pruning**. By checking `get_CurrentIsOffscreen()` and pruning structural nodes (`Pane`, `Group`), it compresses the payload by 90%. The key insight: it distinguishes **code editors** (`Edit` controls) from **prose** (`Document`, `Text` controls) and returns them as separate, labelled JSON objects. Parent-child deduplication prevents a `Document` node from absorbing its child `Text` nodes verbatim. `Edit` nodes (user code) can never be absorbed by prose.
 
 ### ✅ Battery-Aware OKF Pipeline & Power Gating (Python)
 The Python `FlushWorker` uses the Win32 `GetSystemPowerStatus` API to check if the laptop is plugged into AC power. If on battery, it completely aborts the GPU extraction cycle to save power, purging stale logs older than 10 minutes. When on AC, it parses the structured JSON from C++ and routes each section:
@@ -116,6 +112,12 @@ We overhauled the RAG engine to prevent VRAM crashes and improve answer quality:
 - **Situation-Aware Prompting:** Dynamically swaps the system persona based on telemetry (e.g., if a user has struggled on the same topic 4 times, Jugnu injects a `REPEATED_STRUGGLE` persona to stop giving generic tutorials).
 - **JSON Sanitization & Area-Wise Matching:** Strips `\ufffc` null bytes from UIA to prevent llama.cpp stack buffer overflows, and decouples Code vs Prose similarity checks to save GPU time safely.
 
+### ✅ Memory Determinism & Zero-Overhead Telemetry (Phase 7)
+We completely eliminated vector-identity hallucination and token-budget limits:
+- **Deterministic Anchors:** Bypasses fuzzy vector search for exact `window_title` / `file_path` matches, guaranteeing identical code files are merged, never duplicated.
+- **Union Merge (Scroll-Loss Fix):** `difflib` deletes are explicitly ignored via a "Never Delete, Only Add" policy, preventing code loss when scrolling in VSCode.
+- **Ghost Clipboard Bypass:** A native C++ `WM_CLIPBOARDUPDATE` hook intercepts CTRL+C actions, bypassing the 60-second idle timer to inject pristine, 100% complete `full_buffer` file reads directly into the DB.
+- **Zero-Overhead Token Budget:** Gemma is no longer forced to generate the `CONTENT` block itself. The raw C++ UIA payload is piped directly through Python to the database, saving massive LLM output tokens and preventing generation cutoffs.
 ---
 
 ## 🚧 What Needs Polishing — Gemma Response Quality
@@ -179,10 +181,10 @@ This decoupled storage allows:
 
 ## 📅 Development Roadmap
 
-### ✅ Phase 1–6 (Completed)
+### ✅ Phase 1–7 (Completed)
 - Full C++/Python dual-process architecture
 - Zero-Overhead Hibernation with Win32 Events
-- UIA Structured JSON extraction pipeline
+- UIA Structured JSON extraction pipeline (DFS + ARIA Pruning)
 - OKF Two-Pass synthesis pipeline (Column-Split Schema)
 - Resilient `ocr_buffer` safe-delete with retry
 - Dual-table memory system (episodic + knowledge)
@@ -192,6 +194,8 @@ This decoupled storage allows:
 - CUDA warmup to prevent KV-cache crash on RTX 4050
 - Tiered Token Budgeting & `\ufffc` Null Byte Sanitization
 - Situation-Aware Prompt Engineering & Blended Re-Ranking
+- Deterministic Vector Anchors & Union Merging
+- Ghost Clipboard Native Bypass
 
 ### 🔧 Phase 7 — Gemma Response Polishing (In Progress)
 - [ ] Refine few-shot prompting to force Gemma to respect brevity instructions

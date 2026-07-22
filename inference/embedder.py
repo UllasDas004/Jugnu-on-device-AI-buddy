@@ -1,3 +1,4 @@
+import difflib
 import sqlite3
 import struct
 import time
@@ -6,9 +7,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import json
 import datetime
-import difflib
 import math
-from datetime import timezone
 
 
 # ANSI colors for terminal logging
@@ -23,6 +22,51 @@ SNIPPET_LEN = 800
 
 # Minimum word count to consider content worth embedding
 MIN_WORDS = 5
+
+def _merge_code_diff(ext_code: str, new_code: str) -> tuple[str, bool]:
+    """
+    Union merge via difflib opcodes. Policy: NEVER delete from knowledge, only ADD.
+    A 'delete' opcode does NOT mean the user deleted code — it means the code
+    scrolled off the UIA window. With Ghost Clipboard (C++ SetFocus+Ctrl+A+Ctrl+C),
+    new_code IS the full buffer, so the diff is a proper full-file diff like git.
+    Same policy works correctly for both cases.
+    opcodes:
+      equal   → keep
+      delete  → keep (scrolled away, code still exists)
+      insert  → add  (user wrote new code)
+      replace → keep old + add new unique lines (accumulate, never lose)
+    """
+    if not ext_code:
+        return new_code, bool(new_code)
+
+    if not new_code:
+        return ext_code, False
+
+    ext_lines = ext_code.splitlines()
+    new_lines = new_code.splitlines()
+    ext_set = set(ext_lines)
+
+    matcher = difflib.SequenceMatcher(None, ext_lines, new_lines, autojunk=False)
+    merged = []
+    changed = False
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            merged.extend(ext_lines[i1 : i2])
+        elif tag == 'delete':
+            merged.extend(ext_lines[i1 : i2])        # scrolled away — keep
+        elif tag == 'insert':
+            merged.extend(new_lines[j1 : j2])         # new code — add
+            changed = True
+        elif tag == 'replace':
+            merged.extend(ext_lines[i1 : i2])       # keep old version
+            for line in new_lines[j1 : j2]:         # add new unique lines
+                if line not in ext_set:
+                    merged.extend(line)
+                    changed = True
+    
+    return '\n'.join(merged), changed
+
 
 class Embedder:
     """
@@ -198,11 +242,13 @@ class Embedder:
             print(f"{_RED}[Embedder] Unexpected error: {e}{_RESET}")
             return False
 
+    def _should_update_summary(self, capture_count: int) -> bool:
+        return capture_count > 1 and (capture_count % 3 == 0)
+
     def save_knowledge_doc(self, app_name: str, doc: dict | str, engine) -> bool:
         """
-        Saves or merges a structured knowledge document into the new column-split schema.
-        Accepts either a dict or a legacy JSON string.
-        Embeds the SUMMARY as the vector anchor for fast semantic search.
+        Saves or merges a structured knowledge document using a high-fidelity
+        fuzzy Multi-Signal Conflict Resolution Protocol to prevent data corruption.
         """
         try:
             if isinstance(doc, str):
@@ -211,20 +257,26 @@ class Embedder:
             print(f"{_RED}[Embedder] Invalid doc in save_knowledge_doc, skipping.{_RESET}")
             return False
         
-        topic       = doc.get("topic", "")
+        topic = doc.get("topic", "")
+        # Gate 6: Handle empty topic validation
+        if not topic:
+            print(f"{_YELLOW}[Embedder] Skipping save: Empty topic element detected.{_RESET}")
+            return False
+        
         summary     = doc.get("summary", "") or ""
         content     = doc.get("content", "") or doc.get("blocks", "") or ""
         code_snippet= doc.get("code_snippet", "") or ""
         notes       = doc.get("notes", "") or ""
         tags_str    = json.dumps(doc.get("tags", []))
         file_path   = doc.get("file_path")
+        source_url  = doc.get("source_url")
         source_type = doc.get("source_type", "browser")
+        window_title= doc.get("window_title", "")
 
-        # Embedding anchor = summary if available, else topic + first 400 chars of blocks
-        if summary:
-            embed_text = f"{topic}. {summary}"
-        else:
-            embed_text = f"{topic}. {content[:400]}"
+        # Embedding anchor = topic + stable content text (NOT the AI-generated summary).
+        # Summary changes every Gemma run (temperature > 0) → different vector each capture → merge fails.
+        # Content is verbatim-extracted, stable across captures of the same page.
+        embed_text = f"{topic}. {content[:300]}" if content else topic
 
         try:
             cursor = self._conn.cursor()
@@ -238,93 +290,184 @@ class Embedder:
             count = cursor.fetchone()[0]
 
             if count > 0:
-                cursor.execute(
-                    "SELECT distance FROM vec_knowledge WHERE embedding MATCH ? AND k = 1",
-                    (blob,)
-                )
-                row = cursor.fetchone()
-                if row and row[0] < 0.30:   # cosine sim > 0.97 - same topic
-                    # find the matching doc id via JSON
+                existing_id = None
+                ext_code = ext_content = ext_notes = ext_tags = ext_summary = ext_topic = ""
+                ext_count = 1
+
+                # ── PRIMARY: Hard identity lookup by Title, URL, or File path ─────────────
+                # Vector distance is the wrong tool for identity. Two captures of the
+                # same LeetCode page can diverge in topic text and fail the threshold.
+                # window title, URL and file path are exact, deterministic, always-correct keys.
+                if window_title and source_type == "browser":
                     cursor.execute(
-                        """
-                        SELECT kd.id, kd.code_snippet, kd.content, kd.notes, kd.tags
-                        FROM vec_knowledge vk
-                        INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
-                        WHERE vk.embedding MATCH ? AND k = 1
-                        ORDER BY distance ASC LIMIT 1;
-                        """,
-                        (blob,)
+                        "SELECT id, code_snippet, content, notes, tags, capture_count, summary, topic FROM knowledge_docs WHERE window_title = ? LIMIT 1",
+                        (window_title,)
+                    )
+                    match = cursor.fetchone()
+                    if not match and source_url:
+                        # Fallback to URL if title check didn't match (for older entries)
+                        cursor.execute(
+                            "SELECT id, code_snippet, content, notes, tags, capture_count, summary, topic FROM knowledge_docs WHERE source_url = ? LIMIT 1",
+                            (source_url,)
+                        )
+                        match = cursor.fetchone()
+                    if match:
+                        existing_id = match[0]
+                        ext_code, ext_content, ext_notes, ext_tags, ext_count, ext_summary, ext_topic = match[1:]
+                        print(f"{_CYAN}[Embedder] Anchor match (id={existing_id}). Merging...{_RESET}")
+
+                elif file_path:
+                    cursor.execute(
+                        "SELECT id, code_snippet, content, notes, tags, capture_count, summary, topic FROM knowledge_docs WHERE file_path = ? LIMIT 1",
+                        (file_path,)
                     )
                     match = cursor.fetchone()
                     if match:
-                        existing_id, ext_code, ext_content, ext_notes, ext_tags = match
-                        print(f"{_CYAN}[Embedder] Similar knowledge doc found (id={existing_id}). Merging...{_RESET}")
+                        existing_id = match[0]
+                        ext_code, ext_content, ext_notes, ext_tags, ext_count, ext_summary, ext_topic = match[1:]
+                        print(f"{_CYAN}[Embedder] File-path match (id={existing_id}). Merging by path...{_RESET}")
 
-                        # Merge Code:
-                        # - Similar (>70%): keep the LONGER one (never overwrite a full solution with a stub)
-                        # - Different (<70%): append, but deduplicate line-by-line
-                        if ext_code and code_snippet:
-                            ratio = difflib.SequenceMatcher(None, ext_code, code_snippet).ratio()
-                            if ratio > 0.7:
-                                # Keep whichever is longer — user may have added lines since last capture
-                                final_code = code_snippet if len(code_snippet) >= len(ext_code) else ext_code
-                            else:
-                                # Genuinely different code (e.g. brute force + optimized) — append
-                                # but deduplicate by line to prevent exact duplication
-                                existing_lines = set(ext_code.splitlines())
-                                new_lines = [l for l in code_snippet.splitlines() if l not in existing_lines]
-                                final_code = ext_code + ("\n" + "\n".join(new_lines) if new_lines else "")
+                # ── FALLBACK: Semantic vector search (no URL/path available) ──────
+                if existing_id is None:
+                    cursor.execute(
+                        "SELECT distance, rowid FROM vec_knowledge WHERE embedding MATCH ? AND k = 1",
+                        (blob,)
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0] < 0.30:
+                        existing_id = row[1]
+                        cursor.execute(
+                            "SELECT code_snippet, content, notes, tags, capture_count, summary, topic FROM knowledge_docs WHERE id = ?",
+                            (existing_id,)
+                        )
+                        match = cursor.fetchone()
+                        if match:
+                            ext_code, ext_content, ext_notes, ext_tags, ext_count, ext_summary, ext_topic = match
+                            print(f"{_CYAN}[Embedder] Semantic match (id={existing_id}, dist={row[0]:.3f}). Merging...{_RESET}")
                         else:
-                            final_code = code_snippet or ext_code or ""
+                            existing_id = None  # vec_knowledge out of sync — treat as new
 
-                        # Merge Content: Deduplication by paragraphs
+                # ── MERGE: Update existing doc ──────────────────────────────────
+                if existing_id is not None:
+                    try:
+                        old_tags = json.loads(ext_tags) if ext_tags else []
+                    except Exception:
+                        old_tags = []
+                    
+                    new_tags = doc.get("tags", [])
+                    is_old_ocr = "ocr" in old_tags
+                    is_new_ocr = "ocr" in new_tags
+
+                    if not is_old_ocr and is_new_ocr:
+                        print(f"{_YELLOW}[Embedder] Ignoring messy OCR capture because a clean UIA capture already exists!{_RESET}")
+                        return True
+                    
+                    changed = False
+                    final_topic = topic
+
+                    if is_old_ocr and not is_new_ocr:
+                        print(f"{_CYAN}[Embedder] Upgrading knowledge doc from OCR to UIA. Overwriting content entirely.{_RESET}")
+                        final_content = content
+                        final_notes = notes
+                        final_code = code_snippet
+                        changed = True
+                        if "ocr" in old_tags:
+                            old_tags.remove("ocr")
+                    else:
+                        # Use old topic if new one is just "OCR Capture"
+                        if final_topic == "OCR Capture" and ext_topic and ext_topic != "OCR Capture":
+                            final_topic = ext_topic
+
+                        is_full_buffer = doc.get("full_buffer", False)
+
+                        # ── Code merge: union-merge via diff opcodes ─────────────────
+                        if is_full_buffer:
+                            # We have the 100% accurate full file from Ghost Clipboard.
+                            # No diff needed — overwrite with truth, allowing deletions.
+                            final_code = code_snippet
+                            changed = (final_code != ext_code)
+                        else:
+                            # UIA partial window — use union-merge to prevent scroll-loss.
+                            final_code, merged_changed = _merge_code_diff(ext_code or "", code_snippet)
+                            changed = changed or merged_changed
+
+                        # Fuzzy Paragraph Dedup: prefer longer version of near-dupes
                         old_paras = [p.strip() for p in (ext_content or "").split("\n\n") if p.strip()]
                         new_paras = [p.strip() for p in content.split("\n\n") if p.strip()]
+                        for np in new_paras:
+                            best_ratio, best_idx = 0.0, -1
+                            for i, op in enumerate(old_paras):
+                                r = difflib.SequenceMatcher(None, np, op).ratio()
+                                if r > best_ratio:
+                                    best_ratio, best_idx = r, i
+                            if best_ratio > 0.85:
+                                if len(np) > len(old_paras[best_idx]):
+                                    old_paras[best_idx] = np
+                                    changed = True
+                            else:
+                                old_paras.append(np)
+                                changed = True
+                        final_content = "\n\n".join(old_paras)
 
-                        final_paras = old_paras.copy()
-                        for p in new_paras:
-                            if p not in final_paras:
-                                final_paras.append(p)
-                        final_content = "\n\n".join(final_paras)
+                        # Notes Fuzzy Paragraph Dedup
+                        old_notes = [p.strip() for p in (ext_notes or "").split("\n\n") if p.strip()]
+                        new_notes_paras = [p.strip() for p in notes.split("\n\n") if p.strip()]
+                        for nnp in new_notes_paras:
+                            is_dup = any(difflib.SequenceMatcher(None, nnp, onp).ratio() > 0.85 for onp in old_notes)
+                            if not is_dup:
+                                old_notes.append(nnp)
+                                changed = True
+                        final_notes = "\n\n".join(old_notes)
 
+                    # Notes Fuzzy Paragraph Dedup
+                    old_notes = [p.strip() for p in (ext_notes or "").split("\n\n") if p.strip()]
+                    new_notes_paras = [p.strip() for p in notes.split("\n\n") if p.strip()]
+                    for nnp in new_notes_paras:
+                        is_dup = any(difflib.SequenceMatcher(None, nnp, onp).ratio() > 0.85 for onp in old_notes)
+                        if not is_dup:
+                            old_notes.append(nnp)
+                            changed = True
+                    final_notes = "\n\n".join(old_notes)
 
-                        # Merge Notes and & Tags
-                        final_notes = ext_notes + "\n\n" + notes if notes and ext_notes and notes not in ext_notes else (notes or ext_notes or "")
+                    merged_tags = list(dict.fromkeys(old_tags + doc.get("tags", [])))
 
-                        try:
-                            old_tags = json.loads(ext_tags) if ext_tags else []
-                        except:
-                            old_tags = []
-                        
-                        merged_tags = list(dict.fromkeys(old_tags + doc.get("tags", [])))
+                    new_count = ext_count + 1 if (changed or len(final_content) > len(ext_content or "") + 100) else ext_count
 
-                        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        cursor.execute(
-                            """
-                            UPDATE knowledge_docs
-                            SET topic=?, summary=?, content=?, code_snippet=?, notes=?, tags=?, last_updated=?, capture_count=capture_count+1
-                            WHERE id=?;
-                            """,
-                            (topic, summary, final_content, final_code, final_notes, json.dumps(merged_tags), now, existing_id)
-                        )
+                    # Safe summary regen: only on every 3rd capture
+                    final_summary = ext_summary
+                    if self._should_update_summary(new_count) and engine is not None:
+                        print(f"{_CYAN}[Embedder] Re-calculating semantic summary anchor...{_RESET}")
+                        final_summary = engine.generate_summary(topic, final_content, final_code)
 
-                        # Re-embed summary
-                        merged_vec = self._model.encode(f"passage: {topic}. {summary}", normalize_embeddings=True)
+                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    cursor.execute(
+                        """UPDATE knowledge_docs
+                        SET topic=?, summary=?, content=?, code_snippet=?, notes=?, tags=?,
+                            source_url=COALESCE(NULLIF(source_url,''), ?),
+                            window_title=COALESCE(NULLIF(window_title,''), ?),
+                            last_updated=?, capture_count=?
+                        WHERE id=?;""",
+                        (final_topic, final_summary, final_content, final_code, final_notes,
+                         json.dumps(merged_tags), source_url or "", window_title or "",
+                         now, new_count, existing_id)
+                    )
+
+                    # Re-embed with the stable content anchor if content changed
+                    if changed:
+                        merged_vec = self._model.encode(f"passage: {final_topic}. {final_content[:300]}", normalize_embeddings=True)
                         cursor.execute("UPDATE vec_knowledge SET embedding=? WHERE rowid=?;", (self._serialize_vector(merged_vec.tolist()), existing_id))
-                        
-                        self._conn.commit()
-                        print(f"{_GREEN}[Embedder] Knowledge doc #{existing_id} merged.{_RESET}")
-                        return True
-                
-            # No Match - insert fresh
+
+                    self._conn.commit()
+                    return True
+
+            # ── FRESH INSERT ──────────────────────────────────────────────────────
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             cursor.execute(
-            """INSERT INTO knowledge_docs
-                (topic, source_app, source_type, file_path, summary, tags, notes, content, code_snippet, first_seen, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
-                (topic, app_name, source_type, file_path, summary, tags_str, notes, content, code_snippet, now, now)
+                """INSERT INTO knowledge_docs
+                    (topic, source_app, source_type, file_path, source_url, window_title, summary, tags, notes, content, code_snippet, first_seen, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                (topic, app_name, source_type, file_path, source_url, window_title, summary, tags_str, notes, content, code_snippet, now, now)
             )
-
             rowid = cursor.lastrowid
             cursor.execute("INSERT OR IGNORE INTO vec_knowledge(rowid, embedding) VALUES (?, ?);", (rowid, blob))
             self._conn.commit()

@@ -592,3 +592,23 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 | **Event-Driven Wakeup** | `SetEvent()` / `ResetEvent()` triggered exclusively by the foreground OS hook. |
 | **Dynamic Sleep Math** | `Sleep(timeRemaining)` eliminates polling even during active work sessions. |
 | **Signal-Before-Wait** | Ensures sleeping threads can wake up to process termination signals. |
+
+---
+
+## Category 12: Knowledge Merging & Determinism Edge Cases (Phase 5)
+
+### EC-OKF11 — The "Scroll Loss" Merging Trap
+**Situation:** The user scrolls down in VSCode. The top 50 lines of code fall out of the UIA viewport. A new OCR snapshot is captured and sent to the embedder.
+**Solution:** Implemented `difflib` opcode "Union Merge" in `embedder.py`. We treat any `delete` opcode as a "scroll off" event, not a deletion. We explicitly enforce a policy: **Never delete from knowledge, only add.** The only time code is safely overwritten is when the C++ Ghost Clipboard guarantees a `full_buffer` read.
+
+### EC-OKF12 — The "Vector Identity Crisis" Trap
+**Situation:** Two captures of the exact same LeetCode problem are embedded. Their vector distance is 0.35 because Gemma generated slightly different `topic` strings for each. They fail the similarity threshold and are treated as separate problems, duplicating the document.
+**Solution:** Vector distance is designed for semantic search, not identity. Added hard-deterministic anchors in `embedder.py`. If the `window_title` or `file_path` matches an existing document exactly, we immediately merge them and bypass the fuzzy semantic threshold entirely.
+
+### EC-OKF13 — The "Split-Deduplication" False Positive Trap
+**Situation:** The user is on LeetCode. The problem statement (80% of the screen text) is completely static. The code (20%) is changing rapidly as they type. `difflib.quick_ratio()` evaluates the entire screen as >95% identical, so the `FlushWorker` skips extraction, missing the critical code changes.
+**Solution:** Implemented Area-Wise Split Deduplication in `flush_worker.py`. We split the parsed UI JSON into `Edit` (Code) and `Document` (Page). We only skip extraction if *both* the Code is >95% identical AND the Page is >95% identical.
+
+### EC-OKF14 — The "OCR-to-UIA Upgrade" Path
+**Situation:** UIA fails to read a window, so Jugnu falls back to WinRT OCR. The resulting text is messy and tagged with `ocr`. Minutes later, the user interacts with the window, and UIA successfully captures pristine text for the exact same topic.
+**Solution:** The merge logic in `embedder.py` explicitly checks tags (`is_old_ocr` and `not is_new_ocr`). If a pristine UIA capture matches a dirty OCR document, we completely overwrite the old OCR text with the pixel-perfect UIA strings, seamlessly upgrading the knowledge quality in real-time.

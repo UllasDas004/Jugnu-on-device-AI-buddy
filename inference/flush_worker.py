@@ -40,19 +40,50 @@ def _preprocess_ocr(text: str) -> str:
     Clean raw OCR dump before chunking.
     Removes common garbage that ruins Gemma's extraction quality:
       - Lines that are only numbers (scrollbar positions like "123 / 456")
-      - Lines shorter than 3 chars (isolated symbols, stray letters)
+      - Lines shorter than 2 chars (isolated symbols, stray letters)
+      - Known browser/LeetCode nav chrome (Submit, Premium, Editorial, etc.)
       - Collapses 3+ consecutive newlines into 2 (paragraph boundary)
     """
+    # Known LeetCode / browser UI nav tokens that are NEVER technical content.
+    # These appear as standalone lines at the top of the RootWebArea Document.
+    NAV_LABELS = {
+        "submit", "editorial", "solutions", "submissions", "description",
+        "testcase", "test result", "premium", "daily question", "hint",
+        "topics", "companies", "code", "run", "accepted", "solved",
+        "easy", "medium", "hard", "discussion", "similar questions",
+        "related topics", "next", "prev", "previous", "advertisement",
+        "yes", "no", "acceptance rate", "staff", "comment", "choose a type",
+        "all solutions", "saved", "you must run your code first", "auto"
+    }
+    
+    # Text triggers that indicate the end of the actual problem description.
+    # Everything after these is usually hints, discussions, or related questions.
+    CUTOFF_TRIGGERS = [
+        "seen this question in a real interview before?",
+        "💡 discussion rules",
+        "comments ("
+    ]
+
     lines = text.splitlines()
     clean = []
     for line in lines:
         stripped = line.strip()
-        # Skip pure-number lines (scrollbar artifacts)
-        if re.fullmatch(r'[\d\s/|%]+', stripped):
+        lower_stripped = stripped.lower()
+        
+        # Hard cutoff: stop reading if we hit the comments or footer of a LeetCode problem
+        if any(trigger in lower_stripped for trigger in CUTOFF_TRIGGERS):
+            break
+
+        # Skip pure-number lines (scrollbar artifacts, acceptance rates, fractions)
+        if re.fullmatch(r'[\d\s/|%.,kkm]+', lower_stripped):
             continue
-        # Skip very short lines (single chars,menu dots, etc...)
-        if len(stripped) < 3:
+        # Skip very short lines (single chars, menu dots, etc.)
+        if len(stripped) < 2:
             continue
+        # Skip known nav chrome labels
+        if lower_stripped in NAV_LABELS or lower_stripped.startswith("hint "):
+            continue
+            
         clean.append(stripped)
 
     # Collapse 3+ blank lines into 2 (preserve paragraph breaks)
@@ -117,19 +148,19 @@ def _detect_code_tags(code: str) -> list[str]:
     """Heuristic language detection from code. No LLM needed."""
     tags = []
     if any(k in code for k in ["#include", "vector<", "std::", "->", "endl", "::"]):
-        tags.append("C++")
+        tags.append("cpp")
     elif any(k in code for k in ["def ", "import ", "elif ", "print(", "lambda "]):
-        tags.append("Python")
+        tags.append("python")
     elif any(k in code for k in ["public class", "ArrayList", "System.out", "@Override"]):
-        tags.append("Java")
+        tags.append("java")
     elif any(k in code for k in ["func ", "package ", "fmt.Print", ":= "]):
-        tags.append("Go")
+        tags.append("go")
     elif any(k in code for k in ["fn ", "let mut ", "impl ", "use std"]):
-        tags.append("Rust")
+        tags.append("rust")
     if "Solution" in code and any(k in code for k in ["nums", "target", "node", "root"]):
-        tags.append("LeetCode")
+        tags.append("leetcode")
     if "dp[" in code or "memo" in code.lower():
-        tags.append("dynamic-programming")
+        tags.append("dynamic programming")
     return tags or ["code"]
 
 # ── FlushWorker Class ────────────────────────────────────────────────────────
@@ -190,7 +221,7 @@ class FlushWorker:
         # (prevents reading mid-burst while C++ is still capturing the same app)
 
         rows = conn.execute(
-            "SELECT id, app_name, raw_text FROM ocr_buffer "
+            "SELECT id, app_name, window_title, raw_text FROM ocr_buffer "
             "WHERE datetime(timestamp) < datetime('now', '-30 seconds') "
             "ORDER BY id ASC;"
         ).fetchall()
@@ -205,7 +236,7 @@ class FlushWorker:
         ids_failed      = []
         useful_saved    = 0
         total_chunks    = 0
-        for row_id, app_name, raw_text in rows:
+        for row_id, app_name, window_title, raw_text in rows:
             # NOTE: We do NOT pre-queue for deletion here.
             # A row is only deleted if it is successfully synthesized.
             # Failed rows stay in ocr_buffer and are retried next cycle.
@@ -247,7 +278,7 @@ class FlushWorker:
                         page_sim = difflib.SequenceMatcher(None, current_page, last_page).quick_ratio() if last_page or current_page else 1.0
 
                         # Only skip if BOTH the code and the page are >85% unchanged
-                        if code_sim > 0.85 and page_sim > 0.85:
+                        if code_sim > 0.95 and page_sim > 0.95:
                             skip_extraction = True
                             print(f"{_YELLOW}[FlushWorker] Area Match: Code={code_sim*100:.1f}%, Page={page_sim*100:.1f}%. Skipping AI extraction.{_RESET}")
                         else:
@@ -259,7 +290,7 @@ class FlushWorker:
                     # Fallback to standard full text matching if not JSON
                     similarity = difflib.SequenceMatcher(None, raw_text, last_raw).quick_ratio()
 
-                    if similarity > 0.85:
+                    if similarity > 0.95:
                         skip_extraction = True
                         print(f"{_YELLOW}[FlushWorker] Screen is {similarity*100:.1f}% unchanged. Skipping AI extraction.{_RESET}")
                 
@@ -294,6 +325,7 @@ class FlushWorker:
                 # Detect IDE source by checking app_name and the raw_text for a file path hint
                 # screen_reader.cpp prepends "FILE_PATH: <path>\n" for IDE captures
                 file_path = None
+                source_url = None
                 ide_apps = {"code.exe", "devenv.exe", "clion64.exe", "idea64.exe", "pycharm64.exe",
                 "rider64.exe", "webstorm64.exe", "sublime_text.exe", "notepad++.exe"}
 
@@ -314,7 +346,7 @@ class FlushWorker:
                     pass
 
                 VERBATIM_TYPES = {"Edit"}
-                CONTENT_TYPES  = {"Document", "Text"}
+                CONTENT_TYPES  = {"Document", "Text", "MainContent"}
 
 
                 if structured_sections is not None:
@@ -332,39 +364,55 @@ class FlushWorker:
                         sec_text = sec.get("text", "").strip()
                         sec_name = sec.get("name", "")
 
+                        total_chunks += 1
+
+                        if ctrl_type == "PageMeta":
+                            # Dedicated section from C++ RootWebArea extraction
+                            raw_url   = sec.get("url", "").strip()
+                            raw_title = sec.get("title", "").strip()
+                            if raw_url:
+                                source_url = raw_url.split("?")[0]  # strip query params
+                            if raw_title:
+                                window_title = raw_title  # override OS title with correct per-tab title
+                            print(f"\033[90m[FlushWorker] PageMeta: title='{window_title}' url='{source_url}'\033[0m")
+                            continue  # not a content section
+
                         if not sec_text:
                             continue
 
-                        total_chunks += 1
-
                         if ctrl_type in VERBATIM_TYPES:
-                            # Heuristic to filter out URL bars (Chrome/Edge Omnibox is type 'Edit')
-                            if "://" in sec_text[:20] or sec_text.startswith("www.") or "leetcode.com" in sec_text[:30] or "github.com" in sec_text[:30] or (len(sec_text.split()) == 1 and "." in sec_text):
-                                print(f"\033[90m[FlushWorker] Skipping Edit control (looks like a URL): {sec_text[:50]}\033[0m")
-                                continue
-
+                            # Always treat code editor sections as verbatim code
                             lang_tags = _detect_code_tags(sec_text)
                             section_extractions.append({
                                 "content":      sec_text,
                                 "tags":         lang_tags,
                                 "mini_summary": f"Code from {sec_name or 'editor'}",
                                 "verbatim":     True,
+                                "full_buffer":  sec.get("full_buffer", False)
                             })
                         
-                            print(f"{_CYAN}[FlushWorker] Edit ({len(sec_text)} chars) → verbatim [{', '.join(lang_tags)}]{_RESET}")
+                            print(f"{_CYAN}[FlushWorker] Edit ({len(sec_text)} chars) → verbatim [{', '.join(lang_tags)}] (full_buffer: {sec.get('full_buffer', False)}){_RESET}")
 
                         elif ctrl_type in CONTENT_TYPES:
-                            print(f"{_CYAN}[FlushWorker] {ctrl_type} ({len(sec_text)} chars) → Gemma{_RESET}")
-                            result = self._engine.extract_section(sec_text[:3000], ctrl_type)
+                            # Clean the full text — no LLM needed for content, just strip UI chrome
+                            clean_sec_text = _preprocess_ocr(sec_text[:10000])
+                            if not clean_sec_text:
+                                continue
+                            print(f"{_CYAN}[FlushWorker] {ctrl_type} ({len(clean_sec_text)} chars) → Gemma (metadata only){_RESET}")
+                            # Send a 3000-char window to Gemma for context, but store the FULL cleaned text
+                            # Gemma only extracts TOPIC + TAGS + NOTES (not CONTENT) → tiny output, always fits
+                            result = self._engine.extract_section(clean_sec_text[:3000], ctrl_type, cleaned_content = clean_sec_text)
 
                             if result:
                                 section_extractions.append(result)
+                            else:
+                                print(f"\033[33m[FlushWorker] Gemma returned NONE for {ctrl_type} ({len(clean_sec_text)} chars) — all UI chrome or empty content.\033[0m")
                     
                     if section_extractions:
                         combined_raw = "\n\n".join(e["content"] for e in section_extractions)
 
                         self._embedder.save_memory(
-                            app_name = app_name, window_title = app_name,
+                            app_name = app_name, window_title = window_title,
                             text_content = combined_raw, file_path = None
                         )
 
@@ -385,7 +433,7 @@ class FlushWorker:
                     if chunks:
                         combined = "\n\n".join(chunks)
                         self._embedder.save_memory(
-                            app_name=app_name, window_title=app_name,
+                            app_name=app_name, window_title=window_title,
                             text_content=combined, file_path=None
                         )
                         pseudo_ext = {"content": combined, "tags": ["ocr"], "notes": "", "topic": "OCR Capture", "verbatim": False}
@@ -437,13 +485,20 @@ class FlushWorker:
                 # --- PHASE 4: Save all docs ─────────────────────────────────────────
                 if doc_dicts:
                     for doc_dict in doc_dicts:
+                        # Pass the window_title forward to the embedder!
+                        doc_dict["window_title"] = window_title 
+                        
                         print(f"\n{_YELLOW}━━━ SYNTHESIZED KNOWLEDGE DOC ━━━{_RESET}")
                         print(f"{_GREEN}TOPIC: {doc_dict.get('topic','')}{_RESET}")
                         print(f"{_CYAN}TAGS:  {', '.join(doc_dict.get('tags', []))}{_RESET}")
-                        print(f"{_CYAN}SOURCE: {doc_dict.get('source_type','')} | PATH: {doc_dict.get('file_path') or 'none'}{_RESET}")
+                        print(f"{_CYAN}SOURCE: {doc_dict.get('source_type','')} | PATH: {doc_dict.get('file_path') or 'none'} | URL: {doc_dict.get('source_url') or 'none'}{_RESET}")
                         print(f"{_GREEN}SUMMARY: {doc_dict.get('summary','')[:200]}{_RESET}")
                         print(f"{_GREEN}{doc_dict.get('content','')[:300]}...{_RESET}")
                         print(f"{_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{_RESET}\n")
+
+                        # Stamp the captured URL onto the doc before saving
+                        if source_url and not doc_dict.get("source_url"):
+                            doc_dict["source_url"] = source_url
 
                         saved = self._embedder.save_knowledge_doc(app_name, doc_dict, self._engine)
                         if saved:

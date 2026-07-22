@@ -987,3 +987,19 @@ These traps were discovered during the implementation of the Zero-IPC architectu
 ### Trap N-3: The Cleanup Deadlock on Hibernating Threads
 **Problem:** `WinMonitor::Cleanup()` attempted to `WaitForSingleObject` on the background threads before signaling them to shut down. Since the threads were parked infinitely waiting for `hDeepWorkEvent` (because the user was currently in a non-work app), they never woke up to see the `isRunning = false` flag, causing a shutdown hang and a violent thread termination.
 **Fix:** The shutdown sequence must follow "Signal-Before-Wait". `Cleanup()` now calls `SetEvent(hDeepWorkEvent)` *before* waiting on the thread handles. This instantly unblocks them so they can exit gracefully.
+
+---
+
+## Group O: Phase 5 C++ UIA & Python Pipeline Traps
+
+### Trap O-1: The ARIA DFS Invisible DOM Explosion
+**Problem:** `IUIAutomation` reading the raw DOM of Chrome fetches hundreds of off-screen, hidden, or purely structural `div` elements. Without filtering, this exploded the JSON payload size to 200KB+, stalling the IPC pipe and destroying the LLM context window with invisible UI noise.
+**Fix:** Implemented an aggressive ARIA DFS Pruning pass in `screen_reader.cpp`. We check `get_CurrentIsOffscreen()` to skip invisible elements. We also explicitly skip structural nodes (like `UIA_GroupControlTypeId`, `UIA_PaneControlTypeId`) unless they contain meaningful `Name` attributes, compressing the UIA tree size by 90%.
+
+### Trap O-2: The `difflib` Delete Opcode Scroll Loss
+**Problem:** When a user scrolls down in VSCode, the top 50 lines of code fall out of the UIA viewport. When merging the new partial capture with the existing OKF document, `difflib` naturally emits a `delete` opcode for the missing top lines. The naive merge algorithm executed this deletion, permanently erasing code the user had written.
+**Fix:** Explicitly intercepted `difflib.SequenceMatcher` opcodes in `embedder.py` (`_merge_code_diff`). The policy is now: **Never delete from knowledge, only add.** The only time a deletion is respected is when the C++ Ghost Clipboard guarantees a `full_buffer` read.
+
+### Trap O-3: The Vector Semantic Identity Fallacy
+**Problem:** Relying purely on `e5-small` vector cosine distance (<0.30) to establish document *identity*. Two captures of the exact same LeetCode problem might receive slightly different AI-generated `topic` strings (e.g., "Two Sum Problem" vs "Solving Two Sum in C++"). The vector distance pushed to 0.35, failing the threshold and causing the system to duplicate the memory rather than merge it.
+**Fix:** Vector distance is terrible for identity. Implemented hard-deterministic anchors in `embedder.py`. We now execute an exact SQL lookup for `window_title` or `file_path` first. If an anchor matches exactly, we bypass the semantic search completely and merge the document, guaranteeing zero duplication for identical source files.

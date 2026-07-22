@@ -1,5 +1,6 @@
 #include "monitor/clipboard_manager.h"
 #include "server/ipc_server.h"
+#include "monitor/screen_reader.h"   // for g_ghostClipboardActive
 #include<iostream>
 
 namespace Jugnu
@@ -110,6 +111,9 @@ namespace Jugnu
 
     void ClipboardManager::ProcessClipboardContent()
     {
+        // Suppress during Jugnu's own Ghost Clipboard extraction and for 1s after.
+        // g_ghostClipboardIgnoreUntilTick is raised in GhostClipboard().
+        if (GetTickCount64() < Jugnu::g_ghostClipboardIgnoreUntilTick) return;
         if(!OpenClipboard(NULL)) return;
 
         // Try getting Unicode text (UTF - 16)
