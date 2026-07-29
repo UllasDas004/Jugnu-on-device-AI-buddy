@@ -125,6 +125,7 @@ Beyond screen reading, the C++ daemon tracks other context signals natively:
 ### ✅ Non-Intrusive UI & Anti-Spam Cooldown
 A major problem with AI companions is notification fatigue. Jugnu implements a strict **Cooldown System**: if you decline an idle nudge, it goes completely silent for **15 minutes**. If you accept and get an insight, it sleeps for **20 minutes**. 
 Furthermore, the glassmorphic interaction UI spawns via a multiprocess `subprocess.Popen` in a detached PowerShell window, ensuring the main background daemon never blocks while waiting for your input.
+
 ---
 
 ## 🚧 What Needs Polishing — Gemma Response Quality
