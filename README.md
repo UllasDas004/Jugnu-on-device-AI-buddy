@@ -68,6 +68,27 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 
 ## 🚀 What Is Built & Working
 
+### ✅ Socratic Practice Mode (Phase 8)
+Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot.
+- **State Machine Engine:** Maintains a `practice_sessions` table in SQLite with a 2-hour TTL to track your current "hint level" on specific problems.
+- **Zero-LLM Heuristics:** Uses fast substring parsing to distinguish when you are just reading (suppressing the AI) versus actively writing control flow logic.
+- **Progressive Hint Escalation:** Hints start as open Socratic questions (Level 0) and escalate to pinpointing specific buggy variables (Level 3) without *ever* writing syntax or giving away the full solution.
+- **"Ghost Hint" Prevention:** Automatically detects "Accepted" success footprints to flip the solved state and reset the hint level for future attempts.
+
+### ✅ Memory Determinism & Zero-Overhead Telemetry (Phase 7)
+We completely eliminated vector-identity hallucination and token-budget limits:
+- **Deterministic Anchors:** Bypasses fuzzy vector search for exact `window_title` / `file_path` matches, guaranteeing identical code files are merged, never duplicated.
+- **Union Merge (Scroll-Loss Fix):** `difflib` deletes are explicitly ignored via a "Never Delete, Only Add" policy, preventing code loss when scrolling in VSCode.
+- **Ghost Clipboard Bypass:** A native C++ `WM_CLIPBOARDUPDATE` hook intercepts CTRL+C actions, bypassing the 60-second idle timer to inject pristine, 100% complete `full_buffer` file reads directly into the DB.
+- **Zero-Overhead Token Budget:** Gemma is no longer forced to generate the `CONTENT` block itself. The raw C++ UIA payload is piped directly through Python to the database, saving massive LLM output tokens and preventing generation cutoffs.
+
+### ✅ Advanced RAG Pipeline (Phase 6)
+We overhauled the RAG engine to prevent VRAM crashes and improve answer quality:
+- **Blended Re-Ranking & Topic Dedup:** We mathematically mutate vector cosine distance using exponential time decay and logarithmic frequency tracking to surface the *most relevant* memories, while purely discarding identical topic matches.
+- **Tiered Token Budgeting:** Slices screen context to 3000 chars, code context to 2500, and supporting docs to 800 to mathematically guarantee it fits inside a strict 8192 token window.
+- **Situation-Aware Prompting:** Dynamically swaps the system persona based on telemetry (e.g., if a user has struggled on the same topic 4 times, Jugnu injects a `REPEATED_STRUGGLE` persona to stop giving generic tutorials).
+- **JSON Sanitization & Area-Wise Matching:** Strips `\ufffc` null bytes from UIA to prevent llama.cpp stack buffer overflows, and decouples Code vs Prose similarity checks to save GPU time safely.
+
 ### ✅ Predictive OS Telemetry & Kernel Pre-warming
 Jugnu is not just a passive chatbot; it actively profiles system-level behavioral patterns. Every time you switch windows, the C++ engine updates a **Markov Chain transition matrix** to predict exactly which application you will switch to next. Simultaneously, an **Exponential Moving Average (EMA)** governor tracks the frequency, duration, and priority of your app usage over time. 
 **Why this matters:** By understanding your usage habits at the kernel level, Jugnu acts as a predictive system optimizer. It dynamically pre-warms resources for your predicted next app and throttles background distractor apps during deep work. This yields deep analytical insights into user behavior and proves that Jugnu is a deeply integrated Windows telemetry engine, not just a high-level API wrapper.
@@ -104,27 +125,6 @@ Beyond screen reading, the C++ daemon tracks other context signals natively:
 ### ✅ Non-Intrusive UI & Anti-Spam Cooldown
 A major problem with AI companions is notification fatigue. Jugnu implements a strict **Cooldown System**: if you decline an idle nudge, it goes completely silent for **15 minutes**. If you accept and get an insight, it sleeps for **20 minutes**. 
 Furthermore, the glassmorphic interaction UI spawns via a multiprocess `subprocess.Popen` in a detached PowerShell window, ensuring the main background daemon never blocks while waiting for your input.
-
-### ✅ Advanced RAG Pipeline (Phase 6)
-We overhauled the RAG engine to prevent VRAM crashes and improve answer quality:
-- **Blended Re-Ranking & Topic Dedup:** We mathematically mutate vector cosine distance using exponential time decay and logarithmic frequency tracking to surface the *most relevant* memories, while purely discarding identical topic matches.
-- **Tiered Token Budgeting:** Slices screen context to 3000 chars, code context to 2500, and supporting docs to 800 to mathematically guarantee it fits inside a strict 8192 token window.
-- **Situation-Aware Prompting:** Dynamically swaps the system persona based on telemetry (e.g., if a user has struggled on the same topic 4 times, Jugnu injects a `REPEATED_STRUGGLE` persona to stop giving generic tutorials).
-- **JSON Sanitization & Area-Wise Matching:** Strips `\ufffc` null bytes from UIA to prevent llama.cpp stack buffer overflows, and decouples Code vs Prose similarity checks to save GPU time safely.
-
-### ✅ Memory Determinism & Zero-Overhead Telemetry (Phase 7)
-We completely eliminated vector-identity hallucination and token-budget limits:
-- **Deterministic Anchors:** Bypasses fuzzy vector search for exact `window_title` / `file_path` matches, guaranteeing identical code files are merged, never duplicated.
-- **Union Merge (Scroll-Loss Fix):** `difflib` deletes are explicitly ignored via a "Never Delete, Only Add" policy, preventing code loss when scrolling in VSCode.
-- **Ghost Clipboard Bypass:** A native C++ `WM_CLIPBOARDUPDATE` hook intercepts CTRL+C actions, bypassing the 60-second idle timer to inject pristine, 100% complete `full_buffer` file reads directly into the DB.
-- **Zero-Overhead Token Budget:** Gemma is no longer forced to generate the `CONTENT` block itself. The raw C++ UIA payload is piped directly through Python to the database, saving massive LLM output tokens and preventing generation cutoffs.
-
-### ✅ Socratic Practice Mode (Competitive Programming)
-Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot.
-- **State Machine Engine:** Maintains a `practice_sessions` table in SQLite with a 2-hour TTL to track your current "hint level" on specific problems.
-- **Zero-LLM Heuristics:** Uses fast substring parsing to distinguish when you are just reading (suppressing the AI) versus actively writing control flow logic.
-- **Progressive Hint Escalation:** Hints start as open Socratic questions (Level 0) and escalate to pinpointing specific buggy variables (Level 3) without *ever* writing syntax or giving away the full solution.
-- **"Ghost Hint" Prevention:** Automatically detects "Accepted" success footprints to flip the solved state and reset the hint level for future attempts.
 ---
 
 ## 🚧 What Needs Polishing — Gemma Response Quality
@@ -188,7 +188,7 @@ This decoupled storage allows:
 
 ## 📅 Development Roadmap
 
-### ✅ Phase 1–7 (Completed)
+### ✅ Phase 1–8 (Completed)
 - Full C++/Python dual-process architecture
 - Zero-Overhead Hibernation with Win32 Events
 - UIA Structured JSON extraction pipeline (DFS + ARIA Pruning)
@@ -205,13 +205,13 @@ This decoupled storage allows:
 - Ghost Clipboard Native Bypass
 - Socratic Practice Engine (State Machine, Hint Escalation, Active Code Heuristics)
 
-### 🔧 Phase 7 — Gemma Response Polishing (In Progress)
+### 🔧 Phase 9 — Gemma Response Polishing (In Progress)
 - [ ] Refine few-shot prompting to force Gemma to respect brevity instructions
 - [ ] Implement strict output parsing to prevent code hallucination mutations
 - [ ] Fix PowerShell markdown rendering for code blocks
 - [ ] Add Gemini API fallback when the local 4B model lacks confidence
 
-### 🔮 Phase 8 — Native UI & Expansion
+### 🔮 Phase 10 — Native UI & Expansion
 - [ ] Port the PowerShell terminal UI to a native C++ WebView2 borderless window
 
 ---
