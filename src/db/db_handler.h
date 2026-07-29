@@ -13,16 +13,10 @@ namespace Jugnu
         // Safety close the database
         static void Cleanup();
 
-        // Save a raw window switch event
-        static bool LogAppSwitch(const std::string& processName, const std::string& windowTitle);
-
         // Load permanent Markov edges from SQLite on boot
         static std::unordered_map<std::string, std::unordered_map<std::string, int>> LoadMarkovEdges();
         // Update the permanent Markov table
         static bool FlushMarkovEdges(const std::unordered_map<std::string, std::unordered_map<std::string, int>>& edges);
-
-        // Delete raw logs to save space
-        static bool ClearAppLogs();
 
         // EMA Scores (Priority)
         static std::unordered_map<std::string, float> LoadEMAScores();

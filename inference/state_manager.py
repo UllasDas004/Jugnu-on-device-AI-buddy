@@ -1,7 +1,6 @@
 import sqlite3
 import os
 import time
-import sqlite3
 import json
 
 class StateManager:
@@ -106,10 +105,20 @@ class StateManager:
         def _format_uia_payload(raw_payload: str) -> str:
             try:
                 sections = json.loads(raw_payload)
+                # P0-FIX: Preserve PageMeta URL and Title for deterministic anchors and platform detection!
+                urls = [sec.get("url", "").strip() for sec in sections if sec.get("type") == "PageMeta" and sec.get("url")]
+                titles = [sec.get("title", "").strip() for sec in sections if sec.get("type") == "PageMeta" and sec.get("title")]
                 edits = [sec.get("text", "").strip() for sec in sections if sec.get("type") == "Edit" and sec.get("text", "").strip()]
                 docs = [sec.get("text", "").strip() for sec in sections if sec.get("type") != "Edit" and sec.get("text", "").strip()]
 
                 combined = ""
+                if urls:
+                    combined += f"[URL: {urls[0]}]\n"
+                if titles:
+                    combined += f"[TITLE: {titles[0]}]\n"
+                if combined:
+                    combined += "\n"
+
                 # Prioritize Editor Content at the top!
                 if edits:
                     combined += "--- Editor Content ---\n" + "\n\n".join(edits) + "\n\n"

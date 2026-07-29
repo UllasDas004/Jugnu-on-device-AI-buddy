@@ -49,7 +49,7 @@ namespace Jugnu
 
         // TRAP FIX: Ignore all Explorer.EXE windows (Taskbar, Alt-Tab overlay, File Explorer)
         // so it doesn't pollute the Markov Chain predictions!
-        if(processName == "Explorer.EXE" || processName == "explorer.exe") return;
+        if(processName == "explorer.exe" || processName == "Explorer.EXE") return;
 
         if(!lastApp.empty() && lastApp != processName) UpdateMarkov(lastApp, processName);
 
@@ -198,7 +198,7 @@ namespace Jugnu
         if(hFile != INVALID_HANDLE_VALUE)
         {
             // 3. Read a tiny 4KB chunk of the binary file!
-            // This forces the Windows OS Kernel to pull the ENTIRE eecutable
+            // This forces the Windows OS Kernel to pull the ENTIRE executable
             // from the slow SSD into the ultra-fast Standby RAM Cache!
 
             char buffer[4096];

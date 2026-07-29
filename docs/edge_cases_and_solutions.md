@@ -612,3 +612,19 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 ### EC-OKF14 — The "OCR-to-UIA Upgrade" Path
 **Situation:** UIA fails to read a window, so Jugnu falls back to WinRT OCR. The resulting text is messy and tagged with `ocr`. Minutes later, the user interacts with the window, and UIA successfully captures pristine text for the exact same topic.
 **Solution:** The merge logic in `embedder.py` explicitly checks tags (`is_old_ocr` and `not is_new_ocr`). If a pristine UIA capture matches a dirty OCR document, we completely overwrite the old OCR text with the pixel-perfect UIA strings, seamlessly upgrading the knowledge quality in real-time.
+
+---
+
+## Category 11: Practice Mode Edge Cases (Phase 6)
+
+### EC-PM1 — The "Active Read-Only Tab" Pollution
+**Situation:** User gets stuck and opens the "Solutions" or "Editorial" tab on LeetCode. UIA captures the perfect solution code on the screen. `flush_worker` saves this to the database, overwriting the user's authentic (but flawed) attempt with the perfect solution, ruining the practice history.
+**Solution:** Added `read_only_tabs` regexes to the `CP_PLATFORMS` registry. `flush_worker` checks the `window_title`. If it matches a read-only tab, it actively strips the `code_snippet` from the capture, acting as a defensive read-only safeguard.
+
+### EC-PM2 — The "Passive Reader" False STUCK
+**Situation:** User opens a problem. The editor pre-fills with boilerplate (e.g., `class Solution { public: vector<int> twoSum(...) { } };`). The user spends 3 minutes just reading the problem. The idle timer fires. Jugnu thinks they are stuck coding and gives them a hint, even though they haven't written a single line of logic.
+**Solution:** Developed the `_has_meaningful_code()` zero-LLM heuristic in `ipc_client`. It strips out common boilerplate keywords and scans for explicit control flow (`if`, `for`, `while`, `return`). If none exists, telemetry is forked to `CP_READING` (which suppresses the AI) rather than `CP_STUCK`.
+
+### EC-PM3 — The "Ghost Hint" Trap (Persistent State)
+**Situation:** User gets stuck at hint level 3 and eventually solves the problem. A month later, they return to practice the exact same problem. Jugnu remembers `hint_level = 3` from the database and instantly blurts out the final solution on their very first idle trigger, ruining the new practice attempt.
+**Solution:** Fast substring heuristic for "Accepted" or "beats X%" footprints. When detected, `flush_worker` flips `is_solved=True` and resets the hint level to 0 in the SQLite `practice_sessions` table, guaranteeing a clean slate for future attempts.

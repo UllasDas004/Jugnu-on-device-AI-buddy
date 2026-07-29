@@ -1003,3 +1003,27 @@ These traps were discovered during the implementation of the Zero-IPC architectu
 ### Trap O-3: The Vector Semantic Identity Fallacy
 **Problem:** Relying purely on `e5-small` vector cosine distance (<0.30) to establish document *identity*. Two captures of the exact same LeetCode problem might receive slightly different AI-generated `topic` strings (e.g., "Two Sum Problem" vs "Solving Two Sum in C++"). The vector distance pushed to 0.35, failing the threshold and causing the system to duplicate the memory rather than merge it.
 **Fix:** Vector distance is terrible for identity. Implemented hard-deterministic anchors in `embedder.py`. We now execute an exact SQL lookup for `window_title` or `file_path` first. If an anchor matches exactly, we bypass the semantic search completely and merge the document, guaranteeing zero duplication for identical source files.
+
+---
+
+### Trap O-4: The Write-Only SQLite Telemetry Bottleneck
+**Problem:** The C++ `WinMonitor` logged every single window switch event to an `app_log` table in SQLite, and the `FlushWorker` periodically deleted these logs to save space. However, absolutely nothing in the C++ or Python codebase ever read from the `app_log` table. It was a 100% write-only telemetry feature that caused continuous disk I/O, SQLite file locking, and SSD wear for zero benefit.
+**Non-obvious:** Because it was wrapped in an asynchronous background thread and WAL mode handled the locks, the performance hit wasn't a hard crash, but rather a silent, continuous drain on system resources and battery life.
+**Fix:** Completely eradicated the `app_log` table, the `LogAppSwitch()` function, and the `ClearAppLogs()` sweeps. The true intelligence of the system (Markov edges and EMA scores) relies purely on RAM-based state tracking that flushes to disk cleanly, making raw row-by-row telemetry logging obsolete.
+
+---
+
+## Group P: Phase 6 Practice Mode Traps
+
+### Trap P-1: The "Active Read-Only Tab" Pollution
+**Problem:** A user gets stuck and opens the "Solutions" or "Editorial" tab in LeetCode. The UIA captures the solution code. If saved to the DB, we overwrite the user's authentic attempt with a perfect solution, corrupting the practice history.
+**Non-obvious:** We *want* to capture the text of the editorial to learn from it, but we *don't* want to attribute the code inside it to the user.
+**Fix:** Declarative `CP_PLATFORM` registry with `read_only_tabs`. `flush_worker` detects if the user is on one of these tabs and actively sets `snippet = ""` before saving, preserving the user's actual code state.
+
+### Trap P-2: The "Passive Reader" False CP_STUCK
+**Problem:** A user opens a problem, the editor pre-fills with boilerplate. They read for 3 minutes. The idle timer fires. Jugnu assumes they are stuck coding and gives a hint, but they haven't written a single line!
+**Fix:** `_has_meaningful_code` zero-LLM heuristic. Scans the code for control flow keywords (`if`, `for`, `while`, `return`). Accurately forks telemetry into `CP_READING` (user hasn't started) vs `CP_STUCK`.
+
+### Trap P-3: The Ghost Hint Trap (Persistent State)
+**Problem:** User reaches hint level 3, solves the problem, and comes back next month to practice again. Jugnu remembers hint level 3 and instantly barks the final solution at them.
+**Fix:** Fast substring heuristic for "Accepted". Flips `is_solved=True` in the SQLite `practice_sessions` table, automatically resetting the hint level to 0 for their next attempt.

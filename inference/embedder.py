@@ -3,7 +3,6 @@ import sqlite3
 import struct
 import time
 import sqlite_vec
-import numpy as np
 from sentence_transformers import SentenceTransformer
 import json
 import datetime
@@ -126,8 +125,8 @@ class Embedder:
           - Stored passages must use prefix: "passage: <text>"
           - Search queries must use prefix:  "query: <text>"
         """
-        # SentenceTransformer returns a numpy float32 array
-        embedding: np.ndarray = self._model.encode(f"passage: {text}", normalize_embeddings=True)
+        # SentenceTransformer returns a numpy float32 array or a Tensor
+        embedding = self._model.encode(f"passage: {text}", normalize_embeddings=True)
         return embedding.tolist()
 
     
@@ -273,10 +272,11 @@ class Embedder:
         source_type = doc.get("source_type", "browser")
         window_title= doc.get("window_title", "")
 
-        # Embedding anchor = topic + stable content text (NOT the AI-generated summary).
+        # Embedding anchor = window_title + stable content text (NOT the AI-generated summary).
         # Summary changes every Gemma run (temperature > 0) → different vector each capture → merge fails.
-        # Content is verbatim-extracted, stable across captures of the same page.
-        embed_text = f"{topic}. {content[:300]}" if content else topic
+        # Content and window_title are verbatim-extracted from UIA, 100% stable across captures.
+        anchor_prefix = window_title if window_title else topic
+        embed_text = f"{anchor_prefix}. {content[:500]}" if content else anchor_prefix
 
         try:
             cursor = self._conn.cursor()
@@ -370,6 +370,8 @@ class Embedder:
                         final_content = content
                         final_notes = notes
                         final_code = code_snippet
+                        # BUGFIX: Also overwrite the summary during the upgrade!
+                        ext_summary = summary if summary else ext_summary
                         changed = True
                         if "ocr" in old_tags:
                             old_tags.remove("ocr")
@@ -379,9 +381,15 @@ class Embedder:
                             final_topic = ext_topic
 
                         is_full_buffer = doc.get("full_buffer", False)
+                        is_already_solved = any(t in old_tags for t in ("solved", "accepted", "fresh_submission"))
+                        is_fresh_submission = "fresh_submission" in doc.get("tags", [])
 
                         # ── Code merge: union-merge via diff opcodes ─────────────────
-                        if is_full_buffer:
+                        if is_already_solved and not is_fresh_submission:
+                            print(f"{_CYAN}[Embedder] Problem is already SOLVED in DB! Locking reference code_snippet (no overwrite by practice attempt).{_RESET}")
+                            final_code = ext_code
+                            changed = False
+                        elif is_full_buffer:
                             # We have the 100% accurate full file from Ghost Clipboard.
                             # No diff needed — overwrite with truth, allowing deletions.
                             final_code = code_snippet
@@ -391,7 +399,7 @@ class Embedder:
                             final_code, merged_changed = _merge_code_diff(ext_code or "", code_snippet)
                             changed = changed or merged_changed
 
-                        # Fuzzy Paragraph Dedup: prefer longer version of near-dupes
+                        # Fuzzy Paragraph Dedup (0.55 threshold catches re-extractions of the same text)
                         old_paras = [p.strip() for p in (ext_content or "").split("\n\n") if p.strip()]
                         new_paras = [p.strip() for p in content.split("\n\n") if p.strip()]
                         for np in new_paras:
@@ -400,7 +408,7 @@ class Embedder:
                                 r = difflib.SequenceMatcher(None, np, op).ratio()
                                 if r > best_ratio:
                                     best_ratio, best_idx = r, i
-                            if best_ratio > 0.85:
+                            if best_ratio > 0.55:
                                 if len(np) > len(old_paras[best_idx]):
                                     old_paras[best_idx] = np
                                     changed = True
@@ -409,33 +417,33 @@ class Embedder:
                                 changed = True
                         final_content = "\n\n".join(old_paras)
 
-                        # Notes Fuzzy Paragraph Dedup
+                        # Notes Fuzzy Paragraph Dedup (0.55 threshold prevents 3x duplication of algorithmic notes)
                         old_notes = [p.strip() for p in (ext_notes or "").split("\n\n") if p.strip()]
                         new_notes_paras = [p.strip() for p in notes.split("\n\n") if p.strip()]
                         for nnp in new_notes_paras:
-                            is_dup = any(difflib.SequenceMatcher(None, nnp, onp).ratio() > 0.85 for onp in old_notes)
-                            if not is_dup:
+                            best_ratio, best_idx = 0.0, -1
+                            for i, onp in enumerate(old_notes):
+                                r = difflib.SequenceMatcher(None, nnp, onp).ratio()
+                                if r > best_ratio:
+                                    best_ratio, best_idx = r, i
+                            if best_ratio > 0.55:
+                                # Replace with longer/richer note instead of appending duplicates
+                                if len(nnp) > len(old_notes[best_idx]):
+                                    old_notes[best_idx] = nnp
+                                    changed = True
+                            else:
                                 old_notes.append(nnp)
                                 changed = True
                         final_notes = "\n\n".join(old_notes)
-
-                    # Notes Fuzzy Paragraph Dedup
-                    old_notes = [p.strip() for p in (ext_notes or "").split("\n\n") if p.strip()]
-                    new_notes_paras = [p.strip() for p in notes.split("\n\n") if p.strip()]
-                    for nnp in new_notes_paras:
-                        is_dup = any(difflib.SequenceMatcher(None, nnp, onp).ratio() > 0.85 for onp in old_notes)
-                        if not is_dup:
-                            old_notes.append(nnp)
-                            changed = True
-                    final_notes = "\n\n".join(old_notes)
 
                     merged_tags = list(dict.fromkeys(old_tags + doc.get("tags", [])))
 
                     new_count = ext_count + 1 if (changed or len(final_content) > len(ext_content or "") + 100) else ext_count
 
-                    # Safe summary regen: only on every 3rd capture
+                    # Safe summary regen: only if content grew significantly (>200 chars) or summary is missing
                     final_summary = ext_summary
-                    if self._should_update_summary(new_count) and engine is not None:
+                    content_grew = len(final_content) > len(ext_content or "") + 200
+                    if (content_grew or not ext_summary) and self._should_update_summary(new_count) and engine is not None:
                         print(f"{_CYAN}[Embedder] Re-calculating semantic summary anchor...{_RESET}")
                         final_summary = engine.generate_summary(topic, final_content, final_code)
 
@@ -454,7 +462,8 @@ class Embedder:
 
                     # Re-embed with the stable content anchor if content changed
                     if changed:
-                        merged_vec = self._model.encode(f"passage: {final_topic}. {final_content[:300]}", normalize_embeddings=True)
+                        anchor_prefix = window_title if window_title else final_topic
+                        merged_vec = self._model.encode(f"passage: {anchor_prefix}. {final_content[:500]}", normalize_embeddings=True)
                         cursor.execute("UPDATE vec_knowledge SET embedding=? WHERE rowid=?;", (self._serialize_vector(merged_vec.tolist()), existing_id))
 
                     self._conn.commit()
@@ -498,7 +507,7 @@ class Embedder:
         
         return sorted(docs, key=lambda x: x['final_score'])
 
-    def search_knowledge_docs(self, query_text: str, limit: int = 3) -> list[dict]:
+    def search_knowledge_docs(self, query_text: str, limit: int = 3, required_tag: str | None = None) -> list[dict]:
         """
         Semantic search over the OKF knowledge_docs table.
         Returns full structured dicts — no flattening.
@@ -519,17 +528,24 @@ class Embedder:
             # Fetch +1 extra to absorb dedup losses
             fetch_limit = limit + 2
 
-            cursor.execute(
-                """
+            sql = """
                 SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes,
                    kd.capture_count, kd.last_updated, kd.source_type, distance
                 FROM vec_knowledge vk
                 INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                 WHERE vk.embedding MATCH ? AND k = ?
-                ORDER BY distance ASC;
-                """,
-                (query_blob, fetch_limit)
-            )
+            """
+            params = [query_blob, fetch_limit]
+
+            # Domain-isolation filter: push tag check directly into SQL query
+            if required_tag:
+                sql += " AND kd.tags LIKE ?"
+                params.append(f'%"{required_tag}"%')
+                # Increase candidate pool so HNSW finds enough tagged items without missing any
+                params[1] = max(fetch_limit, 25)
+
+            sql += " ORDER BY distance ASC;"
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
 
             # Build raw result dicts — all fields separate, no flattening

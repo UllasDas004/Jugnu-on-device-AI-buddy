@@ -93,9 +93,6 @@ namespace Jugnu
         if(!scores.empty()) Jugnu::DBHandler::FlushEMAScores(scores);
 
 
-        // 3. Delete the raw logs to save space
-        Jugnu::DBHandler::ClearAppLogs();
-
         std::cout << "\033[1;34m[FlushWorker]\033[0m Memory Flush Complete. Going back to sleep.\n\n";
     }
 }

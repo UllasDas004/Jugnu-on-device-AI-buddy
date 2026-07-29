@@ -118,6 +118,13 @@ We completely eliminated vector-identity hallucination and token-budget limits:
 - **Union Merge (Scroll-Loss Fix):** `difflib` deletes are explicitly ignored via a "Never Delete, Only Add" policy, preventing code loss when scrolling in VSCode.
 - **Ghost Clipboard Bypass:** A native C++ `WM_CLIPBOARDUPDATE` hook intercepts CTRL+C actions, bypassing the 60-second idle timer to inject pristine, 100% complete `full_buffer` file reads directly into the DB.
 - **Zero-Overhead Token Budget:** Gemma is no longer forced to generate the `CONTENT` block itself. The raw C++ UIA payload is piped directly through Python to the database, saving massive LLM output tokens and preventing generation cutoffs.
+
+### ✅ Socratic Practice Mode (Competitive Programming)
+Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot.
+- **State Machine Engine:** Maintains a `practice_sessions` table in SQLite with a 2-hour TTL to track your current "hint level" on specific problems.
+- **Zero-LLM Heuristics:** Uses fast substring parsing to distinguish when you are just reading (suppressing the AI) versus actively writing control flow logic.
+- **Progressive Hint Escalation:** Hints start as open Socratic questions (Level 0) and escalate to pinpointing specific buggy variables (Level 3) without *ever* writing syntax or giving away the full solution.
+- **"Ghost Hint" Prevention:** Automatically detects "Accepted" success footprints to flip the solved state and reset the hint level for future attempts.
 ---
 
 ## 🚧 What Needs Polishing — Gemma Response Quality
@@ -196,6 +203,7 @@ This decoupled storage allows:
 - Situation-Aware Prompt Engineering & Blended Re-Ranking
 - Deterministic Vector Anchors & Union Merging
 - Ghost Clipboard Native Bypass
+- Socratic Practice Engine (State Machine, Hint Escalation, Active Code Heuristics)
 
 ### 🔧 Phase 7 — Gemma Response Polishing (In Progress)
 - [ ] Refine few-shot prompting to force Gemma to respect brevity instructions

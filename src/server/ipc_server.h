@@ -22,8 +22,9 @@ namespace Jugnu
             // Handle to the Named Pipe allocated by the OS
             static HANDLE hPipe;
 
-            // Atomic flag to control the while-loop in the listener thread
-            static bool isRunning;
+            // Atomic flag to control the while-loop in the listener thread.
+            // Must be atomic: written by Stop() (main thread) and read by PipeListnerThread (background thread).
+            static std::atomic<bool> isRunning;
             static std::atomic<bool> isClientConnected;
 
             static std::mutex pipeMutex;

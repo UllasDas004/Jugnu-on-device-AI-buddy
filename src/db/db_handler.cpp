@@ -44,16 +44,7 @@ namespace Jugnu
         ExecuteSQL("PRAGMA journal_mode=WAL;");
         ExecuteSQL("PRAGMA synchronous=NORMAL;");
 
-        // Create the App Usage Log Table
-        std::string create_app_log_sql = R"(
-            CREATE TABLE IF NOT EXISTS app_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                process_name TEXT NOT NULL,
-                window_title TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        )";
-        if(!ExecuteSQL(create_app_log_sql)) return false;
+
 
         // Create the App Priorities Table
         std::string create_priorities_sql = R"(
@@ -155,6 +146,28 @@ namespace Jugnu
             );
         )";
         if(!ExecuteSQL(create_vec_knowledge_sql)) return false;
+
+        // Practice mode: tracks per-problem hint progression state.
+        // One row = one question per session.
+        // A "session" expires when last_seen > 2h ago OR is_solved = 1.
+        // hint_level 0-3 controls how much Gemma reveals each stuck trigger.
+        std::string create_practice_sessions_sql = R"(
+            CREATE TABLE IF NOT EXISTS practice_sessions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                problem_slug      TEXT NOT NULL,
+                platform          TEXT NOT NULL,
+                session_start     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen         DATETIME DEFAULT CURRENT_TIMESTAMP,
+                hint_level        INTEGER DEFAULT 0,
+                last_hint_text    TEXT,
+                code_snapshot     TEXT,
+                detected_approach TEXT,
+                stuck_count       INTEGER DEFAULT 0,
+                is_solved         INTEGER DEFAULT 0
+            );
+        )";
+        if(!ExecuteSQL(create_practice_sessions_sql)) return false;
+        
         return true;
     }
 
@@ -168,25 +181,7 @@ namespace Jugnu
         }
     }
 
-    bool DBHandler::LogAppSwitch(const std::string& processName, const std::string& windowTitle)
-    {
-        if(!db) return false;
 
-        // Use prepared statements to prevent SQL injection and handle weird characters in Window Titles
-        sqlite3_stmt* stmt;
-        std::string sql = "INSERT INTO app_log (process_name, window_title) VALUES (?, ?);";
-
-        int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL);
-        if(rc != SQLITE_OK) return false;
-
-        sqlite3_bind_text(stmt, 1, processName.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, windowTitle.c_str(), -1, SQLITE_TRANSIENT);
-
-        rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-
-        return (rc == SQLITE_DONE);
-    }
 
     bool DBHandler::ExecuteSQL(const std::string& sql)
     {
@@ -264,13 +259,7 @@ namespace Jugnu
         return true;
     }
 
-    bool DBHandler::ClearAppLogs()
-    {
-        if(!db) return false;
 
-        std::cout << "\033[1;33m[DB]\033[0m Clearing raw app logs...\n";
-        return ExecuteSQL("DELETE FROM app_log;");
-    }
 
     std::unordered_map<std::string, float> DBHandler::LoadEMAScores()
     {

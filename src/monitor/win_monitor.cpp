@@ -84,7 +84,6 @@ namespace Jugnu
         // Save current foreground process for the Stuck Timer thread
         currentForegroundProcess = processName;
 
-        DWORD ownPid = GetCurrentProcessId();
         DWORD windowPid;
         GetWindowThreadProcessId(hwnd, &windowPid);
 
@@ -107,11 +106,6 @@ namespace Jugnu
             }
         }
         
-        if (ownPid == windowPid) {
-            std::cout << "\033[90m[Debug] Ignored because ownPid == windowPid\033[0m\n";
-            return;
-        }
-
         // Ignore invisible OS panels, taskbars, and ghost windows
         if(windowTitle.empty()) {
             std::cout << "\033[90m[Debug] Ignored because windowTitle is empty\033[0m\n";
@@ -127,7 +121,6 @@ namespace Jugnu
         }
         
         // SAVE TO THE DATABASE
-        Jugnu::DBHandler::LogAppSwitch(processName, windowTitle);
         Jugnu::MemoryManager::ProcessAppSwitch(processName, windowTitle);
 
         
@@ -143,9 +136,9 @@ namespace Jugnu
         if(hDeepWorkEvent) SetEvent(hDeepWorkEvent);
         std::cout << "\033[1;32m[Jugnu]\033[0m Focus zone active: \'" << processName << "\' - monitoring threads are live.\n";
 
-        // All filters passed — this is a real user-focused Deep Work app. Safe to use in idle payload.
-        // FIX ST-1: But DO NOT let terminals overwrite the work context!
-        if (processName != "WindowsTerminal.exe" && processName != "pwsh.exe") {
+        // FIX ST-1: Don't let terminals overwrite the work context.
+        // Must match the Python-side filter in ipc_client.py.
+        if (processName != "WindowsTerminal.exe" && processName != "pwsh.exe" && processName != "cmd.exe") {
             lastMeaningfulApp = processName;
         }
 

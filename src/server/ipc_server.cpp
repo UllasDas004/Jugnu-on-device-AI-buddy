@@ -1,11 +1,11 @@
 #include "ipc_server.h"
 #include <iostream>
-#include <windows.h>
+// <windows.h> is already included transitively via ipc_server.h
 
 namespace Jugnu
 {
     HANDLE IPCServer::hPipe = INVALID_HANDLE_VALUE;
-    bool IPCServer::isRunning = false;
+    std::atomic<bool> IPCServer::isRunning{false};
     std::atomic<bool> IPCServer::isClientConnected{false};
     std::mutex IPCServer::pipeMutex;
     HANDLE IPCServer::hConnectEvent = INVALID_HANDLE_VALUE;
@@ -37,23 +37,31 @@ namespace Jugnu
     void IPCServer::Stop()
     {
         isRunning = false;
+
+        // Signal the thread to exit FIRST — unconditionally, regardless of pipe state.
+        // Old code gated this inside `if(hPipe != INVALID_HANDLE_VALUE)`, which meant
+        // Stop() called before the thread got to CreateNamedPipeA left the thread stuck
+        // in WaitForMultipleObjects forever.
+        if(hStopEvent != INVALID_HANDLE_VALUE) SetEvent(hStopEvent);
+
+        // Disconnect and close the pipe handle to free OS resources
         if(hPipe != INVALID_HANDLE_VALUE)
         {
-            if(hStopEvent) SetEvent(hStopEvent); // Wake up WaitForMultipleObjects
-            // Disconnect and close the handle to free OS resources
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
             hPipe = INVALID_HANDLE_VALUE;
-            if(hConnectEvent)
-            {
-                CloseHandle(hConnectEvent);
-                hConnectEvent = NULL;
-            }
-            if(hStopEvent)
-            {
-                CloseHandle(hStopEvent);
-                hStopEvent = NULL;
-            }
+        }
+
+        // Clean up event handles independently of the pipe
+        if(hConnectEvent != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(hConnectEvent);
+            hConnectEvent = INVALID_HANDLE_VALUE;
+        }
+        if(hStopEvent != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(hStopEvent);
+            hStopEvent = INVALID_HANDLE_VALUE;
         }
 
         std::cout << "\033[1;33m[IPCServer]\033[0m Stopped.\n";

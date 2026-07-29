@@ -210,10 +210,14 @@ The database is organized into tiers by permanence:
 | 0.5 (staging) | `ocr_buffer` | Cleared every cycle | C++ writes, Python clears |
 | 1 (episodic) | `episodic_memories` + `vec_episodic` | Rolling 5,000-row cap | Python on events |
 | 2 (knowledge) | `knowledge_docs` + `vec_knowledge` | Never evicted, only merged | Python FlushWorker |
+| 2.5 (practice)| `practice_sessions` | Rolling 2-hour window | Python (FlushWorker & IPC) |
 | 3 (persona) | `core_persona` | Permanent | Written at onboarding |
 
 **The Column-Split OKF Schema**: 
 Previously, `knowledge_docs` stored a massive stringified JSON blob which caused severe CPU bottlenecks during Python parsing on every search. In Phase 3, this was refactored into dedicated SQLite columns (`topic`, `content`, `code_snippet`, `notes`, `tags`). Now, the C-powered SQLite engine handles the parsing and filtering, and Python simply fetches the raw strings for the RAG payload, drastically reducing CPU overhead.
+
+**Practice Mode Session State (`practice_sessions`)**: 
+In Phase 6, we introduced a dedicated SQLite table to track the user's active CP sessions. This table acts as a pedagogical state machine, locking the `is_solved` state and the current `hint_level` (0-3). Sessions are automatically pruned if unsolved for over 2 hours, preventing the AI from dragging stale context across days of work.
 
 Knowledge documents are never deleted or evicted — they only grow richer through merging. The episodic log rolls over (oldest rows pruned) to keep the database size bounded. The OKF vault is the long-term brain.
 
@@ -232,6 +236,23 @@ When the user asks a question, context is assembled through a rigorous four-stag
 4. **Situation-Aware Prompt Engineering**: Based on the `capture_count` telemetry of the retrieved topic, Jugnu dynamically swaps its core persona. If `capture_count >= 4`, Jugnu shifts into a `REPEATED_STRUGGLE` mode, altering its system prompt to stop giving generic tutorials and instead strictly cross-check the user's code against their own historically documented edge cases and constraints, providing the one precise insight that will unblock them.
 
 The answer is then grounded in the user's own past learning history and precisely tuned to their current level of frustration, not just general knowledge.
+
+---
+
+## The Socratic Practice Engine (Phase 6)
+
+In addition to acting as a passive knowledge base, Jugnu includes an active **Practice Mode** specifically designed for Competitive Programming (CP) and algorithm training (LeetCode, Codeforces, etc.).
+
+### Architecture of Practice Mode
+
+Instead of generic RAG retrieval, Practice Mode relies on deterministic state tracking and pedagogical hint escalation to simulate a real human interviewer.
+
+1. **Deterministic Topic Anchoring:** To prevent URL mismatches when the user switches between their browser and their IDE, Jugnu parses the exact CP platform and problem slug directly from the Vector DB's retrieved OKF `topic` (e.g. `Leetcode: two-sum`).
+2. **The "Meaningful Code" Heuristic:** The IPC listener uses a lightning-fast substring parser to check if the user is actively writing code (detecting control flow like `if`, `for`, `while`) or if they are just staring at the platform's default boilerplate. This forks the telemetry into `CP_STUCK` vs `CP_READING`.
+3. **Escalating Hint Engine:** If the user triggers the idle timer, Jugnu computes a `difflib.SequenceMatcher` delta against their last code snapshot.
+   - If the code has changed significantly (user is iterating), the AI suppresses itself or maintains its hint level.
+   - If the similarity is `>= 0.70`, the user is truly stuck. Jugnu automatically advances the `hint_level` (0 to 3), escalating from gentle Socratic questions (Level 1) to direct bug-fixes (Level 3).
+4. **Anti-Pollution & Solved State Reset:** The `FlushWorker` uses declarative regex registries to identify read-only tabs (like Editorials or Solutions) and strips the code snippet from the capture to protect the user's authentic attempt history. When the user successfully solves the problem (e.g., detecting the "Accepted" text footprint), Jugnu resets the database `is_solved` state so the hint level resets for their next attempt.
 
 ---
 

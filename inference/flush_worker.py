@@ -22,6 +22,8 @@ import time
 import ctypes
 import re
 import json
+from typing import TypedDict
+import datetime
 
 _CYAN   = "\033[1;36m"
 _GREEN  = "\033[1;32m"
@@ -163,6 +165,207 @@ def _detect_code_tags(code: str) -> list[str]:
         tags.append("dynamic programming")
     return tags or ["code"]
 
+# Declarative registry: Add any competitive programming platform here without changing code logic
+class CPPlatform(TypedDict):
+    name: str
+    domain_regex: str
+    path_regex: str
+    read_only_tabs: set[str]
+
+CP_PLATFORMS: list[CPPlatform] = [
+    {
+        "name": "leetcode",
+        "domain_regex": r"leetcode\.(?:com|cn)",
+        "path_regex": r"/problems/([a-z0-9-]+)(?:/([a-z]+))?",
+        "read_only_tabs": {"editorial", "solutions", "solution", "discussion", "comments"}
+    },
+    {
+        "name": "codeforces",
+        "domain_regex": r"codeforces\.com",
+        "path_regex": r"/(?:contest|problemset/problem)/(\d+)/([a-z0-9]+)",
+        "read_only_tabs": {"tutorial", "status", "standings"}
+    },
+    {
+        "name": "atcoder",
+        "domain_regex": r"atcoder\.jp",
+        "path_regex": r"/contests/([a-z0-9-_]+)/tasks/([a-z0-9-_]+)",
+        "read_only_tabs": {"editorial", "standings", "submissions"}
+    },
+    {
+        "name": "codechef",
+        "domain_regex": r"codechef\.com",
+        "path_regex": r"/(?:problems|submit)/([a-z0-9-_]+)",
+        "read_only_tabs": {"editorial", "solutions", "discuss"}
+    }
+]
+def _parse_cp_url(url: str | None) -> dict | None:
+    """
+    Generalized regex parser for competitive programming platforms.
+    Returns domain metadata and read-only tab status without hardcoding.
+    """
+
+    if not url:
+        return None
+
+    url_lower = url.lower()
+
+    for plat in CP_PLATFORMS:
+        if re.search(plat["domain_regex"], url_lower):
+            match = re.search(plat["path_regex"], url_lower)
+            if match:
+                # Combine regex groups to form a unique problem slug (e.g., 'two-sum' or '1234-a')
+                slug = "-".join([g for g in match.groups() if g]).rstrip("-")
+                # Detect tab if present in path, otherwise default to coding workspace
+                last_grp = match.group(len(match.groups())) if len(match.groups()) > 1 else None
+                tab = last_grp or "workspace"
+                
+                is_read_only = any(ro in url_lower for ro in plat["read_only_tabs"])
+                return {
+                    "platform": plat["name"],
+                    "slug": slug,
+                    "tab": tab,
+                    "is_read_only": is_read_only
+                }
+    return None
+            
+# ─────────────────────────────────────────────────────────────────────────────
+# PRACTICE MODE SESSION MANAGEMENT
+# Called from ipc_client.py when CP_STUCK fires on a solved problem.
+# Each function opens and closes its own short-lived SQLite connection to avoid
+# cross-thread lock conflicts with FlushWorker's own conn.
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_or_create_practice_session(slug: str, platform: str) -> dict | None:
+    """
+    Returns the active practice session for this problem slug.
+    Active = exists AND last_seen within 2h AND is_solved == 0.
+    Creates a fresh session row if none found.
+    Returns None on DB error.
+    """
+    TWO_HOURS_AGO = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    ).isoformat()
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id, problem_slug, platform, hint_level, last_hint_text,
+                   code_snapshot, detected_approach, stuck_count, is_solved
+            FROM practice_sessions
+            WHERE problem_slug = ?
+              AND is_solved    = 0
+              AND last_seen    > ?
+            ORDER BY last_seen DESC
+            LIMIT 1
+            """,
+            (slug, TWO_HOURS_AGO)
+        )
+        row = cur.fetchone()
+
+        if row:
+            session = dict(row)
+            print(f"{_CYAN}[Practice] Resumed session for '{slug}' "
+                  f"(hint_level={session['hint_level']}, "
+                  f"stuck_count={session['stuck_count']}){_RESET}")
+
+            conn.close()
+            return session
+
+        # No active session — create a fresh one
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cur.execute(
+            """
+            INSERT INTO practice_sessions
+                (problem_slug, platform, session_start, last_seen,
+                 hint_level, stuck_count, is_solved)
+            VALUES (?, ?, ?, ?, 0, 0, 0)
+            """,
+            (slug, platform, now, now)
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+        print(f"{_GREEN}[Practice] New session #{new_id} created for '{slug}'{_RESET}")
+        conn.close()
+        return {
+            "id": new_id, "problem_slug": slug, "platform": platform,
+            "hint_level": 0, "last_hint_text": None,
+            "code_snapshot": None, "detected_approach": None,
+            "stuck_count": 0, "is_solved": 0,
+        }
+    except Exception as e:
+        print(f"{_RED}[Practice] _get_or_create_practice_session error: {e}{_RESET}")
+        return None
+
+def _compute_hint_level(session: dict, current_code: str, new_approach: str) -> tuple[int, bool, float]:
+    """
+    Decides the hint level for this trigger based purely on code similarity:
+      - Code barely changed (similarity >= 0.70) → advance level (genuinely stuck)
+      - Code changed significantly → re-assess at same level (user is iterating)
+    Approach changes are handled implicitly by the code diff.
+    Returns: (final_hint_level, should_update_db)
+    """
+    stored_snapshot = session.get("code_snapshot") or ""
+    current_level   = session.get("hint_level", 0)
+    MAX_LEVEL       = 3
+
+    if stored_snapshot and current_code:
+        similarity = difflib.SequenceMatcher(
+            None, stored_snapshot, current_code, autojunk=False
+        ).ratio()
+        print(f"\033[90m[Practice] Code similarity vs last snapshot: {similarity:.2f}\033[0m")
+
+        if similarity >= 0.70:
+            new_level = min(current_level + 1, MAX_LEVEL)
+            print(f"{_YELLOW}[Practice] Code unchanged (sim={similarity:.2f}). "
+                  f"Advancing: {current_level} → {new_level}{_RESET}")
+            return new_level, True, similarity
+        else:
+            print(f"{_YELLOW}[Practice] Code changed (sim={similarity:.2f}). "
+                  f"Re-assessing at level {current_level}.{_RESET}")
+            return current_level, False, similarity
+
+    return 0, True, 0.0  # First hint ever
+
+def _update_practice_session(
+    session_id:        int,
+    hint_level:        int,
+    hint_text:         str,
+    current_code:      str,
+    detected_approach: str,
+    is_solved:         bool = False,
+) -> None:
+    """
+    Persists session state back to DB after a hint trigger.
+    Increments stuck_count. Called AFTER generate_practice_hint() returns.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        conn.execute(
+            """
+            UPDATE practice_sessions
+            SET hint_level        = ?,
+                last_hint_text    = ?,
+                code_snapshot     = ?,
+                detected_approach = ?,
+                last_seen         = ?,
+                is_solved         = ?,
+                stuck_count       = stuck_count + 1
+            WHERE id = ?
+            """,
+            (hint_level, (hint_text or "")[:2000], (current_code or "")[:3000],
+             detected_approach, now, 1 if is_solved else 0, session_id)
+        )
+        conn.commit()
+        conn.close()
+        print(f"{_GREEN}[Practice] Session #{session_id} updated "
+              f"(level={hint_level}, solved={is_solved}){_RESET}")
+    except Exception as e:
+        print(f"{_RED}[Practice] _update_practice_session error: {e}{_RESET}")
+
 # ── FlushWorker Class ────────────────────────────────────────────────────────
 
 class FlushWorker:
@@ -175,6 +378,10 @@ class FlushWorker:
         self._embedder = embedder
         self._engine   = engine
         self._state    = state  # StateManager ref — used to cache latest screen text
+        # Per-app dedup caches — track last seen code/page text to skip unchanged screens
+        self._last_raw_by_app:  dict[str, str] = {}
+        self._last_code_by_app: dict[str, str] = {}
+        self._last_page_by_app: dict[str, str] = {}
         self._thread   = threading.Thread(
             target=self._run,
             daemon=True,       # dies automatically when main thread exits
@@ -244,13 +451,6 @@ class FlushWorker:
                 # Strip null bytes and Unicode replacement chars that crash the C++ LLM tokenizer
                 raw_text = raw_text.replace('\ufffc', '').replace('\x00', '')
 
-                # --- PHASE 1: Pre-Gemma Area-Wise Deduplication ---
-                if not hasattr(self, '_last_raw_by_app'):
-                    self._last_raw_by_app = {}
-                if not hasattr(self, '_last_code_by_app'):
-                    self._last_code_by_app = {}
-                if not hasattr(self, '_last_page_by_app'):
-                    self._last_page_by_app = {}
                 # P1-FIX: Cap cache size to prevent unbounded memory growth.
                 # OCR blobs are ~2000 chars each; 20 entries = ~40KB max.
                 MAX_CACHE = 20
@@ -266,6 +466,8 @@ class FlushWorker:
                 skip_extraction = False
                 current_code = ""
                 current_page = ""
+                code_sim = 0.0
+                page_sim = 0.0
 
                 try:
                     parsed = json.loads(raw_text)
@@ -394,6 +596,11 @@ class FlushWorker:
                             print(f"{_CYAN}[FlushWorker] Edit ({len(sec_text)} chars) → verbatim [{', '.join(lang_tags)}] (full_buffer: {sec.get('full_buffer', False)}){_RESET}")
 
                         elif ctrl_type in CONTENT_TYPES:
+                            # If page text is unchanged (>95% similarity), skip spinning up Gemma for notes/tags!
+                            if page_sim > 0.95 and last_page:
+                                print(f"{_YELLOW}[FlushWorker] Page text unchanged ({page_sim*100:.1f}%). Skipping Gemma metadata synthesis.{_RESET}")
+                                continue
+
                             # Clean the full text — no LLM needed for content, just strip UI chrome
                             clean_sec_text = _preprocess_ocr(sec_text[:10000])
                             if not clean_sec_text:
@@ -420,27 +627,6 @@ class FlushWorker:
                         doc_dicts = [doc] if doc else []
                     else:
                         doc_dicts = []
-                    
-                elif "===SECTION===" in raw_text:
-                    # ── LEGACY: Old ===SECTION=== flat string ─────────────────────────
-                    raw_sections = [s.strip() for s in raw_text.split("===SECTION===") if s.strip()]
-                    chunks = []
-                    for i, sec in enumerate(raw_sections):
-                        if not sec.splitlines(): continue
-                        print(f"{_CYAN}[FlushWorker] Legacy Section {i+1}/{len(raw_sections)} ({len(sec)} chars){_RESET}")
-                        chunks.append(sec[:3000])  # truncate, never split
-                    total_chunks += len(chunks)
-                    if chunks:
-                        combined = "\n\n".join(chunks)
-                        self._embedder.save_memory(
-                            app_name=app_name, window_title=window_title,
-                            text_content=combined, file_path=None
-                        )
-                        pseudo_ext = {"content": combined, "tags": ["ocr"], "notes": "", "topic": "OCR Capture", "verbatim": False}
-                        doc_dicts = [self._engine.combine_sections([pseudo_ext], file_path=file_path)]
-                    else:
-                        doc_dicts = []
-
                     
                 else:
                     # ── OCR FALLBACK: noisy text, must extract with AI first ───────────
@@ -472,7 +658,7 @@ class FlushWorker:
                         combined = "\n\n".join(all_ocr_extractions)
                         self._embedder.save_memory(
                             app_name=app_name,
-                            window_title=app_name,
+                            window_title=window_title,
                             text_content=combined,
                             file_path=None
                         )
@@ -499,6 +685,71 @@ class FlushWorker:
                         # Stamp the captured URL onto the doc before saving
                         if source_url and not doc_dict.get("source_url"):
                             doc_dict["source_url"] = source_url
+
+                        # ── CP PARTNER STEP 1: Anti-Pollution & Domain Tagging ──
+                        cp_info = _parse_cp_url(source_url)
+                        if cp_info:
+                            slug = cp_info["slug"]
+                            print(f"{_CYAN}[FlushWorker] Detected {cp_info['platform']} problem: '{slug}' (tab: {cp_info['tab']}){_RESET}")
+                            
+                            # Anti-pollution rule: If viewing editorial/solutions, strip code to protect user attempt history
+                            if cp_info["is_read_only"]:
+                                print(f"{_YELLOW}[FlushWorker] Read-only tab detected ({cp_info['tab']}) — stripping code snippet to protect user attempt history.{_RESET}")
+                                doc_dict["code_snippet"] = ""
+                                doc_dict["full_buffer"] = False
+
+                            # Inject domain tags for isolated RAG retrieval in Step 2
+                            existing_tags = doc_dict.get("tags", [])
+                            cp_tags = [cp_info["platform"], "cp", slug, f"tab-{cp_info['tab']}"]
+
+                            # Detect Accepted submission state or Solved badge from raw screen text / URL
+                            raw_lower = raw_text.lower()
+                            is_sub_url = cp_info["tab"] in ("submissions", "submission", "status", "detail") or "/submissions/" in (source_url or "")
+                            has_lc_accepted = "accepted" in raw_lower and any(w in raw_lower for w in ("beats", "runtime", "memory", "testcases", "submitted", "submission result"))
+                            has_cc_accepted = "correct answer" in raw_lower or "verdict: accepted" in raw_lower
+
+                            # Check for LeetCode's green Solved badge on Description tab (e.g. standalone "Solved" UI item or next to Easy/Medium/Hard)
+                            has_solved_badge = False
+                            try:
+                                parsed_json = json.loads(raw_text)
+                                if isinstance(parsed_json, list):
+                                    for sec in parsed_json:
+                                        t = sec.get("text", "").strip().lower()
+                                        if t in ("solved", "solved ✓", "status: solved", "verdict: accepted", "accepted"):
+                                            has_solved_badge = True
+                                            break
+                            except Exception:
+                                pass
+                            if not has_solved_badge:
+                                has_solved_badge = bool(re.search(r'\b(?:solved|accepted)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:easy|medium|hard)\b|\b(?:easy|medium|hard)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:solved|accepted)\b', raw_lower))
+
+                            if is_sub_url or has_lc_accepted or has_cc_accepted:
+                                print(f"{_GREEN}[FlushWorker] FRESH ACCEPTED submission detected! Tagging '{slug}' as SOLVED & FRESH_SUBMISSION.{_RESET}")
+                                cp_tags.extend(["solved", "fresh_submission"])
+                                # Mark active practice session as solved so hint_level resets next open
+                                try:
+                                    active_session = _get_or_create_practice_session(slug, cp_info["platform"])
+                                    if active_session and not active_session.get("is_solved"):
+                                        _update_practice_session(
+                                            session_id        = active_session["id"],
+                                            hint_level        = active_session.get("hint_level", 0),
+                                            hint_text         = active_session.get("last_hint_text") or "",
+                                            current_code      = active_session.get("code_snapshot") or "",
+                                            detected_approach = active_session.get("detected_approach") or "unknown",
+                                            is_solved         = True,
+                                        )
+                                        print(f"{_GREEN}[Practice] Session marked SOLVED for '{slug}'{_RESET}")
+                                except Exception as _pe:
+                                    print(f"{_RED}[Practice] Could not mark session solved: {_pe}{_RESET}")
+                            elif has_solved_badge:
+                                print(f"{_GREEN}[FlushWorker] SOLVED badge detected! Tagging problem '{slug}' as SOLVED.{_RESET}")
+                                cp_tags.append("solved")
+
+                            doc_dict["tags"] = list(dict.fromkeys(cp_tags + existing_tags))
+                            # Standardize topic name so all attempts anchor to the exact same problem
+                            doc_dict["topic"] = f"{cp_info['platform'].capitalize()}: {slug}"
+                        # ────────────────────────────────────────────────────────
+
 
                         saved = self._embedder.save_knowledge_doc(app_name, doc_dict, self._engine)
                         if saved:

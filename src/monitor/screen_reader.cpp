@@ -98,7 +98,7 @@ namespace Jugnu
     struct UiaSection
     {
         std::wstring typeName;      // "Edit", "Document", "Text"
-        std::wstring automationId;  // smantic role hint from the UIA tree
+        std::wstring automationId;  // semantic role hint from the UIA tree
         std::wstring text;          // verbatim extracted content
         bool fullBuffer = false;
     };
@@ -875,7 +875,8 @@ namespace Jugnu
                 Sleep(timeRemaining);
             }
         }
-        CoUninitialize();   // Cleanup COM on thread exit
+        // COM/WinRT cleanup: winrt::init_apartment() manages its own apartment lifetime.
+        // The OS automatically cleans up the thread's COM state on thread exit.
         return 0;
     }
 }
