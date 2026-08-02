@@ -14,12 +14,14 @@ namespace Jugnu
             static void Start();
             static void Stop();
 
+            static std::string GetLastCodeBuffer();
+
         private:
             static DWORD WINAPI ReaderThread(LPVOID lpParam);
 
             // PRIMARY: Reads exact text from the app's accessibility tree (UIA).
             // Zero OCR errors. Works for Chrome, VS Code, Edge, Cursor, Antigravity IDE.
-            static std::wstring ExtractTextViaUIA(HWND targetWindow);
+            static std::wstring ExtractTextViaUIA(HWND targetWindow, bool allowGhostClipboard = true);
 
             // FALLBACK: Takes a screenshot and runs WinRT OCR on it.
             // Only used if UIA returns empty (e.g., app has no accessibility tree).

@@ -530,7 +530,7 @@ class Embedder:
 
             sql = """
                 SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes,
-                   kd.capture_count, kd.last_updated, kd.source_type, distance
+                   kd.capture_count, kd.last_updated, kd.source_type, distance, kd.is_solved
                 FROM vec_knowledge vk
                 INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                 WHERE vk.embedding MATCH ? AND k = ?
@@ -551,7 +551,7 @@ class Embedder:
             # Build raw result dicts — all fields separate, no flattening
             raw_results = []
             
-            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated, source_type, distance in rows:
+            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated, source_type, distance, is_solved in rows:
                 try:
                     tags = json.loads(tags_str) if tags_str else []
                 except Exception:
@@ -577,6 +577,7 @@ class Embedder:
                     "last_updated_ts": last_updated_ts,
                     "source_type":    source_type or "browser",
                     "distance":       distance or 1.0,
+                    "is_solved":      is_solved or 0,
                 })
 
             # Layer 3 Hard Deduplication — skip docs whose topic is too similar
@@ -653,6 +654,27 @@ class Embedder:
             return []
 
     
+    def mark_problem_solved(self, slug: str, platform: str) -> bool:
+        """
+        Sets is_solved=1 on knowledge_docs for a given problem slug.
+        Uses a LIKE query against source_url, e.g., '%leetcode.com/problems/slug%'.
+        """
+        try:
+            cursor = self._conn.cursor()
+            pattern = f"%{platform}.com/problems/{slug}%"
+            cursor.execute(
+                "UPDATE knowledge_docs SET is_solved = 1 WHERE source_url LIKE ?",
+                (pattern,)
+            )
+            self._conn.commit()
+            if cursor.rowcount > 0:
+                print(f"{_GREEN}[Embedder] Marked knowledge_docs as solved for '{slug}'.{_RESET}")
+                return True
+            return False
+        except Exception as e:
+            print(f"{_RED}[Embedder] mark_problem_solved error: {e}{_RESET}")
+            return False
+
     def close(self):
         """Cleanly close the SQLite connection."""
         if self._conn:

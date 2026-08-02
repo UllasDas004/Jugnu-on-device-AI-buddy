@@ -139,6 +139,21 @@ query_prefixed = f"query: {query_text}"
 
 ---
 
+## 2.6 The Phase 6 Zero-DB IPC Code Hot-Path (Practice Mode)
+
+While Phase 5 eliminated the IPC bottleneck for massive OCR background dumps by using the `ocr_buffer` DB, Practice Mode requires absolute freshness. 
+
+### The Stale DB Race Condition
+If the user stops typing, the 3-minute idle timer fires and Python attempts to give a hint. Previously, Python queried SQLite for the latest code. However, because `FlushWorker` only runs every 60s, the DB was often up to 59 seconds out of date, causing the AI to give hints for bugs the user had already fixed.
+
+### The Hot-Path Solution (Gear 2)
+We introduced a **Zero-DB IPC Pipeline** exclusively for active code:
+1. **Gear 2 RAM Cache (C++):** While the user actively types (accumulating 60s of typing time), the Screen Reader waits for a 5-second pause. When it detects this pause, it fires Ghost Clipboard and saves the code strictly into a volatile `g_lastCodeBuffer` in RAM. It explicitly skips inserting into the SQLite DB to avoid VRAM/CPU churn.
+2. **IPC Injection:** When `StuckTimerThread` fires (after 3 minutes of total idle time), it grabs this hot RAM buffer, strictly escapes it (handling quotes, backslashes, tabs, and newlines), and injects it directly into the `USER_IDLE` JSON payload.
+3. **Python Bypass:** `ipc_client.py` receives the `ipc_code`. If present, it completely bypasses the SQLite Database retrieval (`state.generate_prompt_context()`), saving 100-200ms of latency and guaranteeing 0ms staleness for the Gemma context window.
+
+---
+
 ## 2.5 The Phase 5 OKF Read Pipeline (The RAG Engine)
 
 When the user asks for help (via `jugnu_interact.py`), Jugnu transitions from a passive observer to an active assistant.

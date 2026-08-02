@@ -1,7 +1,18 @@
+import sqlite3
+import difflib
 import ollama
 import os
 from datetime import datetime, timezone
+import re
+import sqlite3
+from pathlib import Path
+from typing import Dict
+import difflib
 
+# ----------------------------------------------------------------------
+# Path to the SQLite jugnu.db that the C++ side also uses.
+DB_PATH = Path(__file__).resolve().parents[1] / "jugnu.db"
+# ----------------------------------------------------------------------
 class AIEngine:
     def __init__(self):
         self.model_name = "gemma4:e2b"
@@ -482,160 +493,25 @@ class AIEngine:
             pass
         return topic
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PRACTICE MODE METHODS
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def detect_approach(self, current_code: str) -> str:
+    def check_code_correctness(self, code: str, content: str) -> str:
         """
-        Describes the algorithmic approach in the current code in ~5-10 words.
-        Used as context for generate_practice_hint — NOT for hard approach-change detection.
-        Approach changes are handled by code-diff similarity in _compute_hint_level.
-        Returns a short free-form string like 'two nested loops brute force O(n²)'
-        or 'hashmap storing complement values' or 'unknown' if code is too sparse.
+        Fast LLM gate to check if the code correctly solves the problem.
+        Returns 'correct' or 'incomplete'.
         """
-        if not current_code or len(current_code.strip()) < 20:
-            return "unknown"
-
         prompt = (
-            "In 5-10 words, describe the algorithmic technique this code is attempting. "
-            "Be specific. Examples: 'hashmap storing seen values for O(n) lookup', "
-            "'two nested loops brute force', 'recursive dfs with memoization array'. "
-            "Output ONLY the short description. No explanation, no preamble.\n"
-            f"Code:\n{current_code[:1500]}"
+            f"Problem:\n{content[:400]}\n\n"
+            f"Code:\n{code[:600]}\n\n"
+            "Does this code correctly solve the problem? Answer ONLY with the word 'correct' or 'incomplete'."
         )
-
         try:
             response = ollama.chat(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                think=False,
-                options={
-                    "num_ctx":     2048,
-                    "num_predict":  25,    # 5-10 words max
-                    "temperature": 0.1,   # near-deterministic
-                    "flash_attn":  False,
-                }
+                model=self.model_name, messages=[{"role": "user", "content": prompt}], think=False,
+                options={"num_ctx": 1536, "num_predict": 10, "temperature": 0.0, "flash_attn": False}
             )
             if hasattr(response, 'message') and response.message:
-                raw = (response.message.content or '').strip()
-                # Safety: cap at 80 chars so the DB field stays clean
-                return raw[:80] if raw else "unknown"
+                ans = (response.message.content or '').strip().lower()
+                if "correct" in ans and "incomplete" not in ans:
+                    return "correct"
         except Exception as e:
-            print(f"\033[1;31m[AIEngine] detect_approach error: {e}\033[0m")
-        return "unknown"
-
-
-    def generate_practice_hint(
-        self,
-        problem_content:   str,
-        problem_notes:     str,
-        current_code:      str,
-        hint_level:        int,
-        last_hint:         str,
-        detected_approach: str,
-    ) -> str:
-        """
-        Generates a progressive, interview-style hint for a CP problem.
-        Levels:
-          0 — Socratic opening. No algorithm names. No correctness judgment.
-          1 — Validate correct parts first. Then nudge the gap with a question.
-          2 — Algorithm name revealed. WHY it applies. No code written.
-          3 — Pinpoint the exact line/variable that is wrong. Still a question.
-        STRICT RULE: NEVER write code, syntax, or complete solutions at any level.
-        """
-
-        # Hard caps — protect VRAM from KV-cache overrun
-        problem_content   = (problem_content   or "")[:1500]
-        problem_notes     = (problem_notes     or "")[:500]
-        current_code      = (current_code      or "")[:2500]
-        last_hint         = (last_hint         or "")[:300]
-
-        level_instruction = {
-            0: (
-                "The developer just started or hasn't made much progress. "
-                "Ask ONE open socratic question about their current approach or what state "
-                "they are trying to track. Do NOT mention any algorithm name. "
-                "Do NOT judge whether they are right or wrong yet. Keep it to 2 sentences max."
-            ),
-            1: (
-                "Read their current code carefully. "
-                "First, explicitly validate ONE thing that IS correct in their approach — "
-                "be specific, not generic. "
-                "Then, if there is a gap or flaw, point to WHAT concept or WHAT input case "
-                "their logic doesn't handle. Frame it as a question: "
-                "'What happens when X?' or 'Have you considered Y?'. "
-                "Do NOT name the full algorithm. Do NOT say 'you should use X data structure'. "
-                "Keep it to 3 sentences. Tone: senior dev pair programming, not a lecturer."
-            ),
-            2: (
-                "Reveal the algorithm/paradigm name this problem requires. "
-                "Explain in ONE sentence WHY this paradigm fits the problem constraints. "
-                "Then ask how that paradigm would change their current state management "
-                "or data structure choice. "
-                "Do NOT write any code. 3 sentences max."
-            ),
-            3: (
-                "Look at their code very carefully. Identify the ONE specific line, condition, "
-                "or variable that is incorrect or missing. Reference it by name or by what it does. "
-                "Ask a single targeted question that forces them to think about that exact spot. "
-                "Example: 'Your condition in the inner loop — what does it return when left == right?' "
-                "Do NOT write any code. Do NOT give the fix directly. 2-3 sentences max."
-            ),
-        }
-
-        level_instruction = level_instruction.get(hint_level, level_instruction[3])
-
-        last_hint_section = ""
-        if last_hint:
-            last_hint_section = (
-                f"\nYour LAST hint to this developer was:\n\"{last_hint}\"\n"
-                "Do NOT repeat this. Build on it or go one level deeper.\n"
-            )
-        
-        approach_section = ""
-        if detected_approach and detected_approach != "unknown":
-            approach_section = (
-                f"\nThe developer appears to be attempting a "
-                f"{detected_approach.replace('_', ' ')} approach.\n"
-            )
-        
-        prompt = (
-            f"You are Jugnu, a senior competitive programming coach running a mock interview.\n"
-            f"The developer is STUCK on this problem and needs a HINT — not a solution.\n\n"
-            f"PROBLEM STATEMENT:\n{problem_content}\n\n"
-            f"ALGORITHMIC INSIGHT (FOR YOUR EYES ONLY — DO NOT REVEAL THIS DIRECTLY):\n"
-            f"{problem_notes if problem_notes else 'Not available yet.'}\n\n"
-            f"DEVELOPER'S CURRENT CODE:\n```\n{current_code}\n```\n"
-            f"{approach_section}"
-            f"{last_hint_section}\n"
-            f"HINT LEVEL {hint_level}/3 — YOUR INSTRUCTION:\n{level_instruction}\n\n"
-            f"ABSOLUTE RULES (violating these fails the interview):\n"
-            f"1. DO NOT write any code, pseudocode, or syntax.\n"
-            f"2. DO NOT give the complete solution or the full algorithm.\n"
-            f"3. DO NOT say 'you should implement X' — ask 'what would happen if X?'\n"
-            f"4. End with exactly ONE question.\n\n"
-            f"Your hint:"
-        )
-
-        try:
-            response = ollama.chat(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                think=False,
-                options={
-                    "num_ctx":     8192,
-                    "num_predict":  250,
-                    "temperature":  0.4,
-                    "flash_attn":  False,
-                }
-            )
-            if hasattr(response, 'message') and response.message:
-                content = (response.message.content or '').strip()
-                return content if content else "What's your current thinking on the approach?"
-            return "What's your current thinking on the approach?"
-        except Exception as e:
-            print(f"\033[1;31m[AIEngine] generate_practice_hint error: {e}\033[0m")
-            return "You seem stuck — what state are you trying to track in this problem?"
-
-    
+            print(f"\033[1;31m[AIEngine] check_code_correctness error: {e}\033[0m")
+        return "incomplete"

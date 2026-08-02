@@ -628,3 +628,23 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 ### EC-PM3 — The "Ghost Hint" Trap (Persistent State)
 **Situation:** User gets stuck at hint level 3 and eventually solves the problem. A month later, they return to practice the exact same problem. Jugnu remembers `hint_level = 3` from the database and instantly blurts out the final solution on their very first idle trigger, ruining the new practice attempt.
 **Solution:** Fast substring heuristic for "Accepted" or "beats X%" footprints. When detected, `flush_worker` flips `is_solved=True` and resets the hint level to 0 in the SQLite `practice_sessions` table, guaranteeing a clean slate for future attempts.
+
+### EC-PM4 — The "JSON Control Character Crash" Problem (Zero-DB IPC)
+**Situation:** The ghost clipboard reads raw code from the active editor buffer and injects it into the `USER_IDLE` JSON payload to send over the IPC pipe.
+**Problem:** Code strings routinely contain unescaped quotes (`"`), backslashes (`\`), newlines (`\n`), and tabs (`\t`). Injecting raw code directly into a JSON string breaks the JSON format instantly, crashing Python's `json.loads` upon receipt.
+**Solution:** We added explicit string escaping in C++ before building the JSON payload in `win_monitor.cpp`. Every `\`, `"`, `\n`, `\r`, `\t` character is replaced with its escaped equivalent, and unprintable ASCII control characters (`< 0x20`) are stripped out.
+
+### EC-PM5 — The "Multi-Replace Tool Deletion" Bug
+**Situation:** When migrating `ipc_client.py`'s `_idle_handler_background` to accept `ipc_code` and prioritize it over the database snippet, an automated string replacement target was too broad.
+**Problem:** The replacement logic unintentionally matched a broader block of code and deleted the core attempt detector (`if not _has_meaningful_code(editor_section):`) entirely.
+**Solution:** Reverted and used exact line-number bound replacement targets to carefully weave `ipc_code` into the extraction fallback logic without nuking surrounding domain logic.
+
+### EC-PM6 — The "GetLastCodeBuffer C++ Build Failure"
+**Situation:** The `GetLastCodeBuffer()` method was added to the `ScreenReader` class to allow `StuckTimerThread` to access the RAM cache.
+**Problem:** The method was added, but placed outside the `public:` access specifier block in `screen_reader.h`. The C++ compiler threw an access violation error during build because `win_monitor.cpp` could not call a private method.
+**Solution:** Moved the static method definition explicitly under the `public:` block in the header file.
+
+### EC-PM7 — The "LLM False Negative on Correct Logic" Problem
+**Situation:** The user wrote a perfectly correct Minimax algorithm for LeetCode 486 (Predict the Winner), explicitly tracking `isPlayer1` state.
+**Problem:** Gemma (`gemma4:e2b`) failed to recognize the logic as correct because it deviated from the typical condensed single-state textbook solution. Furthermore, Gemma hallucinated a constraint, insisting Player 1 needed a "strictly greater" score, when the problem explicitly stated ties go to Player 1.
+**Solution:** This reinforces a critical architectural rule: Small, local LLMs cannot be trusted as authoritative code correctness validators for complex logic without explicit execution contexts. They hallucinate constraints. The `Practice Mode` should rely primarily on actual UIA "Accepted" badges for authoritative solve detection, and prompts must explicitly instruct the LLM to carefully verify against the provided problem statement before claiming code is incorrect.

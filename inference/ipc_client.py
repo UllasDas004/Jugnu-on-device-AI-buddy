@@ -1,3 +1,5 @@
+import difflib
+import sqlite3
 import threading
 import win32file
 import win32pipe
@@ -9,14 +11,19 @@ import time
 import json
 import notification
 from state_manager import StateManager
-from ai_engine import AIEngine
+from ai_engine import AIEngine, DB_PATH
 from embedder import Embedder
 from flush_worker import (
     FlushWorker,
-    _parse_cp_url,
-    _get_or_create_practice_session,
-    _compute_hint_level,
-    _update_practice_session,
+    _parse_cp_url
+)
+from practice_mode import (
+    classify_state, 
+    get_or_create_session, 
+    get_last_hints, 
+    get_last_hint_id,
+    update_session,
+    log_hint
 )
 from sentence_transformers import SentenceTransformer
 import ollama
@@ -195,7 +202,7 @@ def _has_meaningful_code(editor_text: str) -> bool:
     # At least 2 actual statements/expressions needed to be considered "coding"
     return meaningful_lines >= 2
 
-def _idle_handler_background(state, engine, embedder, screen_context):
+def _idle_handler_background(state, engine, embedder, screen_context, ipc_code="", target_app=""):
     """
     Runs in a background thread. Keeps the IPC listener free.
     Does: LLM query generation → KNN search → situation detection → notification.
@@ -235,11 +242,12 @@ def _idle_handler_background(state, engine, embedder, screen_context):
     context_chunks  = []
     sources         = []
     situation_type  = "NO_MEMORY"
-
+    editor_section = ""
     if is_cp_session:
         # Check if user has written actual code vs staring at default boilerplate
-        editor_section = ""
-        if "--- Editor Content ---" in screen_context:
+        if ipc_code:
+            editor_section = ipc_code
+        elif "--- Editor Content ---" in screen_context:
             after_editor = screen_context.split("--- Editor Content ---")[1]
             editor_section = after_editor.split("--- Page Content ---")[0].strip() if "--- Page Content ---" in after_editor else after_editor.strip()
         
@@ -289,7 +297,7 @@ def _idle_handler_background(state, engine, embedder, screen_context):
     if (situation_type in ("CP_STUCK", "STUCK_ON_OWN_CODE") and knowledge_docs):
         top_doc = knowledge_docs[0]
         top_tags = top_doc.get("tags", [])
-        is_practice_mode = any(t in top_tags for t in ("solved", "accepted", "fresh_submission"))
+        is_practice_mode = "cp" in top_tags
 
         if is_practice_mode:
             print(f"{_GREEN}[IPC-BG] PRACTICE MODE — routing to progressive hint system.{_RESET}")
@@ -310,62 +318,155 @@ def _idle_handler_background(state, engine, embedder, screen_context):
                 slug = cp_info.get("slug", "unknown")
                 platform = cp_info.get("platform", "unknown")
 
-            current_code = top_doc.get("code_snippet", "") or ""
+            # Prioritize live code currently visible on screen; fallback to DB snippet if obscured
+            current_code = ""
+            if ipc_code:
+                current_code = ipc_code
+            elif 'editor_section' in locals() and editor_section.strip():
+                current_code = editor_section
+            else:
+                current_code = top_doc.get("code_snippet", "") or ""
             
             if not current_code.strip():
                 print(f"{_YELLOW}[IPC-BG] Practice mode: no code snapshot yet. Skipping hint.{_RESET}")
             else:
-                # Step 1: Get or create session (fast SQLite lookup)
-                session = _get_or_create_practice_session(slug, platform)
-
-                if session:
-                    # Step 2: Decide hint level (code diff + approach change check)
-                    hint_level, should_advance, similarity = _compute_hint_level(
-                        session, current_code, ""
+                # --- LLM CORRECTNESS GATE ---
+                # Check if the code is actually correct before we try to give a hint.
+                # This catches the edge case where the user solved it, but hasn't submitted yet,
+                # or submitted but the UIA hasn't captured the 'Accepted' badge yet.
+                correctness = engine.check_code_correctness(current_code, top_doc.get("content", ""))
+                if correctness == "correct":
+                    print(f"{_GREEN}[IPC-BG] Gemma verified code is CORRECT! Marking '{slug}' as solved and generating efficiency review.{_RESET}")
+                    embedder.mark_problem_solved(slug, platform)
+                    # Generate efficiency review instead of practice hint
+                    import practice_mode
+                    review_text = practice_mode.generate_efficiency_review(
+                        problem_content = top_doc.get("content", ""),
+                        current_code = current_code,
+                        problem_slug = slug,
+                        platform = platform,
                     )
-                    # Step 3: Detect approach ONLY if code changed significantly or it's the first time
-                    if similarity >= 0.70 and session.get("detected_approach"):
-                        detected_approach = session.get("detected_approach")
-                        print(f"{_CYAN}[IPC-BG] Code unchanged. Reusing approach: {detected_approach}{_RESET}")
-                    else:
-                        detected_approach = engine.detect_approach(current_code)
-                        print(f"{_CYAN}[IPC-BG] New approach detected: {detected_approach}{_RESET}")
-                    # Step 4: Generate the progressive hint
-                    hint_text = engine.generate_practice_hint(
-                        problem_content   = top_doc.get("content", ""),
-                        problem_notes     = top_doc.get("notes", ""),
-                        current_code      = current_code,
-                        hint_level        = hint_level,
-                        last_hint         = session.get("last_hint_text") or "",
-                        detected_approach = detected_approach,
-                    )
-                    # Step 5: Display via normal notification flow
-                    # The hint is pre-generated — pass it in context_chunks so
-                    # notification.py uses the 'context_chunks' path directly
-                    # without calling Gemma again.
-                    practice_sources = [
-                        f"{platform.capitalize()}: {slug} "
-                        f"(Practice — Hint Level {hint_level}/3)"
-                    ]
+                    
+                    practice_sources = [f"{platform.capitalize()}: {slug} (Efficiency Review)"]
                     notification.trigger_flow(
                         state, engine, embedder,
                         search_query   = search_query,
-                        context_chunks = [hint_text],
+                        context_chunks = [review_text],
                         knowledge_docs = [],
                         sources        = practice_sources,
                         screen_context = screen_context,
-                        situation_type = "CP_STUCK",
+                        situation_type = "GENERAL", # Use general so it doesn't trigger the 1/2/3 practice menu
                     )
-                    # Step 6: Persist session state
-                    _update_practice_session(
-                        session_id        = session["id"],
-                        hint_level        = hint_level,
-                        hint_text         = hint_text,
-                        current_code      = current_code,
-                        detected_approach = detected_approach,
-                        is_solved         = False,
-                    )
-            return   # always return — don't fall through to generic flow
+                    # We still want to update the session code snapshot
+                    session = get_or_create_session(slug, platform)
+                    if session:
+                        update_session(slug=slug, platform=platform, code_snapshot=current_code, is_solved=1)
+                        practice_mode.flush_session_to_db(slug)
+                    
+                    return # always return if we handled practice flow
+                else:
+                    # Step 1: Get or create session (fast SQLite lookup)
+                    session = get_or_create_session(slug, platform)
+
+                    if session:
+                        session_id = session["id"]
+
+                        # Layer 1: Lightweight state gate
+                        last_snapshot = session.get("code_snapshot")
+                        user_state = classify_state(current_code, last_snapshot)
+                        print(f"{_CYAN}[IPC-BG] User state: {user_state}{_RESET}")
+
+                        if user_state == "READING":
+                            print(f"{_YELLOW}[IPC-BG] Not enough code yet — skipping hint.{_RESET}")
+                        else:
+                            # Update snapshot so NEXT cycle compares against THIS code
+                            update_session(slug=slug, platform=platform, code_snapshot=current_code)
+
+                            # Layer 2: Fetch hint history + last feedback
+                            hint_type_history = []
+                            try:
+                                hint_type_history = json.loads(session.get("hint_type_history") or "[]")
+                            except Exception:
+                                hint_type_history = []
+
+                            last_feedback = None
+                            try:
+                                lhid = get_last_hint_id(session_id)
+                                if lhid:
+                                    conn_tmp = sqlite3.connect(DB_PATH, timeout=5.0)
+                                    row_tmp = conn_tmp.execute(
+                                        "SELECT user_feedback FROM practice_hints WHERE id = ?", (lhid,)
+                                    ).fetchone()
+                                    conn_tmp.close()
+                                    if row_tmp:
+                                        last_feedback = row_tmp[0]
+                            except Exception:
+                                pass
+
+                            # Fetch conversation history (last 3 hints)
+                            hint_history = get_last_hints(session_id, n=3)
+
+                            # Single Gemma call: evaluates code direction & generates hint text
+                            import practice_mode
+                            hint_type, hint_text, approach, is_solved = practice_mode.generate_practice_hint(
+                                problem_content = top_doc.get("content", ""),
+                                problem_notes   = top_doc.get("notes", ""),
+                                current_code    = current_code,
+                                hint_history    = hint_history,
+                                last_feedback   = last_feedback,
+                                user_state      = user_state,
+                            )
+                            print(f"{_CYAN}[IPC-BG] Hint generated with type: {hint_type}{_RESET}")
+                            # Log the hint and get hint_id for feedback tracking
+                            hint_id = log_hint(
+                                session_id    = session_id,
+                                hint_type     = hint_type,
+                                hint_text     = hint_text,
+                                user_state    = user_state,
+                                code_snapshot = current_code,
+                                approach      = approach,
+                            )
+
+                            # Update hint_type_history in session
+                            hint_type_history.append(hint_type)
+                            update_session(
+                                slug = slug,
+                                platform = platform,
+                                last_hint_type = hint_type,
+                                hint_type_history = json.dumps(hint_type_history[-10:]),
+                                detected_approach = approach,
+                                is_solved = is_solved
+                            )
+                            practice_mode.flush_session_to_db(slug)
+
+                            # Display
+                            practice_sources = [
+                                f"{platform.capitalize()}: {slug} "
+                                f"(Practice — {hint_type.replace('_', ' ').title()} | {user_state})"
+                            ]
+                            fb_result = notification.trigger_flow(
+                                state, engine, embedder,
+                                search_query   = search_query,
+                                context_chunks = [hint_text],
+                                knowledge_docs = [],
+                                sources        = practice_sources,
+                                screen_context = screen_context,
+                                situation_type = "CP_STUCK",
+                                session_id     = session_id,
+                                hint_id        = hint_id,
+                            )
+                            # If the user clicked "3" (Go Deeper), instantly fire the next hint cycle
+                            if fb_result == "escalate":
+                                print(f"{_YELLOW}[Practice] Escalate triggered. Firing next hint immediately...{_RESET}")
+                                threading.Thread(
+                                    target=_idle_handler_background,
+                                    args=(state, engine, embedder, screen_context),
+                                    daemon=True
+                                ).start()
+
+                        return   # always return if we handled practice flow — don't fall through to generic flow
+                    
+                    
     # ── NORMAL FLOW (CP_READING, unsolved problems, non-CP sessions) ───────
     notification.trigger_flow(
         state, engine, embedder,
@@ -476,10 +577,16 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         # Take an instant snapshot — no LLM calls on the IPC thread
                                         # FIX IPC-2: Trust the payload provided by C++!
                                         idle_app = payload.get('current_app', state.last_coding_app)
-                                        screen_context_snapshot = state.generate_prompt_context(embedder=None, target_app = idle_app)
+                                        ipc_code = payload.get('code', '')
+
+                                        screen_context_snapshot = ""
+                                        # Only generate heavy context if we don't have fresh code over IPC
+                                        if not ipc_code:
+                                            screen_context_snapshot = state.generate_prompt_context(embedder=None, target_app = idle_app)
+                                        
                                         threading.Thread(
                                             target=_idle_handler_background,
-                                            args=(state, engine, embedder, screen_context_snapshot),
+                                            args=(state, engine, embedder, screen_context_snapshot, ipc_code, idle_app),
                                             daemon=True
                                         ).start()
                                     else:
@@ -507,6 +614,72 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
             print(f"\n[Python] Unexpected error in reader: {e}", flush=True)
             return
 
+def _practice_session_tracker_daemon(state, engine, embedder):
+    """
+    Background daemon that checks `practice_sessions` every 60s.
+    If a session hasn't been updated in 3 minutes (last_seen > 180s), the user is stuck.
+    """
+    print("[Python] Code-Progression Tracker Daemon started.")
+
+    while not _stop_event.is_set():
+        time.sleep(60) # Run every 60 seconds
+
+        try:
+            # 3 minute ago
+            threshold_time = (time.time() - 180)
+            conn = sqlite3.connect(DB_PATH, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # Find any unsolved sessions that haven't been updated in 3 minutes
+            cur.execute(
+                """
+                SELECT problem_slug, platform, code_snapshot
+                FROM practice_sessions 
+                WHERE is_solved = 0 
+                  AND strftime('%s', last_seen) < ?
+                """,
+                (int(threshold_time),)
+            )
+            stuck_sessions = cur.fetchall()
+            conn.close()
+            for row in stuck_sessions:
+                slug = row["problem_slug"]
+                platform = row["platform"]
+
+                # REVISING VS AFK LOGIC: Check if it's already in knowledge_docs
+                # If they are just staring at the fully solved code, they are AFK.
+                docs = embedder.search_knowledge_docs(f"{platform.capitalize()}: {slug}", limit = 1)
+
+                is_revising = True
+                if docs and "solved" in docs[0].get("tags", []):
+                    solved_code = docs[0].get("code_snippet", "")
+                    current_code = row["code_snapshot"] or ""
+
+                    if current_code and solved_code:
+                        ratio = difflib.SequenceMatcher(None, solved_code, current_code).ratio()
+                        if ratio > 0.95:
+                            is_revising = False # Code matches perfectly. They are just AFK
+                
+                if not is_revising:
+                    print(f"\033[90m[Tracker] '{slug}' code matches solved state perfectly. User is AFK/Reading. Ignoring.\033[0m")
+                    continue
+
+                print(f"{_YELLOW}[Tracker] User stuck on '{slug}' for 3 minutes! Triggering AI...{_RESET}")
+                
+                # Generate a pseudo-context to trigger the existing IPC pipeline
+                # Must include a valid URL format so _idle_handler_background detects it as a CP session!
+                dummy_url = f"https://{platform}.com/problems/{slug}/"
+                pseudo_context = f"[URL: {dummy_url}]\n[TITLE: {platform.capitalize()}: {slug}]\n--- Editor Content ---\n{row['code_snapshot']}"
+                
+                threading.Thread(
+                    target=_idle_handler_background,
+                    args=(state, engine, embedder, pseudo_context),
+                    daemon=True
+                ).start()
+                
+        except Exception as e:
+            print(f"{_RED}[Tracker] Error in tracker loop: {e}{_RESET}")
 
 def pipe_listener_main(state, engine, embedder):
     handle = connect_to_pipe()
@@ -518,6 +691,14 @@ def pipe_listener_main(state, engine, embedder):
         daemon=True  # Dies automatically if main thread exits
     )
     reader.start()
+
+    # Start the idle tracker daemon
+    tracker = threading.Thread(
+        target=_practice_session_tracker_daemon,
+        args=(state, engine, embedder),
+        daemon=True
+    )
+    tracker.start()
 
     # Main thread stays free — its only job is to catch KeyboardInterrupt
     try:

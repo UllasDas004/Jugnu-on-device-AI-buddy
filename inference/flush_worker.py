@@ -23,7 +23,7 @@ import ctypes
 import re
 import json
 from typing import TypedDict
-import datetime
+from practice_mode import update_session, flush_session_to_db
 
 _CYAN   = "\033[1;36m"
 _GREEN  = "\033[1;32m"
@@ -36,6 +36,17 @@ FLUSH_INTERVAL_S = 60   # seconds between flush cycles
 STALE_MINUTES    = 10   # rows older than this are deleted without processing
 CHUNK_SIZE       = 500  # characters per chunk sent to Gemma
 MIN_CHUNK_WORDS  = 8    # gate: skip chunks with fewer than this many words
+
+# Submission result phrases → internal outcome tag.
+# Kept at module level — defined once, not recreated every 60-second flush cycle.
+_SUBMISSION_OUTCOMES: dict[str, str] = {
+    "wrong answer":          "wrong_answer",
+    "time limit exceeded":   "tle",
+    "runtime error":         "runtime_error",
+    "memory limit exceeded": "mle",
+    "compile error":         "compilation_error",
+    "compilation error":     "compilation_error",
+}
 
 def _preprocess_ocr(text: str) -> str:
     """
@@ -228,143 +239,6 @@ def _parse_cp_url(url: str | None) -> dict | None:
                 }
     return None
             
-# ─────────────────────────────────────────────────────────────────────────────
-# PRACTICE MODE SESSION MANAGEMENT
-# Called from ipc_client.py when CP_STUCK fires on a solved problem.
-# Each function opens and closes its own short-lived SQLite connection to avoid
-# cross-thread lock conflicts with FlushWorker's own conn.
-# ─────────────────────────────────────────────────────────────────────────────
-def _get_or_create_practice_session(slug: str, platform: str) -> dict | None:
-    """
-    Returns the active practice session for this problem slug.
-    Active = exists AND last_seen within 2h AND is_solved == 0.
-    Creates a fresh session row if none found.
-    Returns None on DB error.
-    """
-    TWO_HOURS_AGO = (
-        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
-    ).isoformat()
-
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT id, problem_slug, platform, hint_level, last_hint_text,
-                   code_snapshot, detected_approach, stuck_count, is_solved
-            FROM practice_sessions
-            WHERE problem_slug = ?
-              AND is_solved    = 0
-              AND last_seen    > ?
-            ORDER BY last_seen DESC
-            LIMIT 1
-            """,
-            (slug, TWO_HOURS_AGO)
-        )
-        row = cur.fetchone()
-
-        if row:
-            session = dict(row)
-            print(f"{_CYAN}[Practice] Resumed session for '{slug}' "
-                  f"(hint_level={session['hint_level']}, "
-                  f"stuck_count={session['stuck_count']}){_RESET}")
-
-            conn.close()
-            return session
-
-        # No active session — create a fresh one
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        cur.execute(
-            """
-            INSERT INTO practice_sessions
-                (problem_slug, platform, session_start, last_seen,
-                 hint_level, stuck_count, is_solved)
-            VALUES (?, ?, ?, ?, 0, 0, 0)
-            """,
-            (slug, platform, now, now)
-        )
-        conn.commit()
-        new_id = cur.lastrowid
-        print(f"{_GREEN}[Practice] New session #{new_id} created for '{slug}'{_RESET}")
-        conn.close()
-        return {
-            "id": new_id, "problem_slug": slug, "platform": platform,
-            "hint_level": 0, "last_hint_text": None,
-            "code_snapshot": None, "detected_approach": None,
-            "stuck_count": 0, "is_solved": 0,
-        }
-    except Exception as e:
-        print(f"{_RED}[Practice] _get_or_create_practice_session error: {e}{_RESET}")
-        return None
-
-def _compute_hint_level(session: dict, current_code: str, new_approach: str) -> tuple[int, bool, float]:
-    """
-    Decides the hint level for this trigger based purely on code similarity:
-      - Code barely changed (similarity >= 0.70) → advance level (genuinely stuck)
-      - Code changed significantly → re-assess at same level (user is iterating)
-    Approach changes are handled implicitly by the code diff.
-    Returns: (final_hint_level, should_update_db)
-    """
-    stored_snapshot = session.get("code_snapshot") or ""
-    current_level   = session.get("hint_level", 0)
-    MAX_LEVEL       = 3
-
-    if stored_snapshot and current_code:
-        similarity = difflib.SequenceMatcher(
-            None, stored_snapshot, current_code, autojunk=False
-        ).ratio()
-        print(f"\033[90m[Practice] Code similarity vs last snapshot: {similarity:.2f}\033[0m")
-
-        if similarity >= 0.70:
-            new_level = min(current_level + 1, MAX_LEVEL)
-            print(f"{_YELLOW}[Practice] Code unchanged (sim={similarity:.2f}). "
-                  f"Advancing: {current_level} → {new_level}{_RESET}")
-            return new_level, True, similarity
-        else:
-            print(f"{_YELLOW}[Practice] Code changed (sim={similarity:.2f}). "
-                  f"Re-assessing at level {current_level}.{_RESET}")
-            return current_level, False, similarity
-
-    return 0, True, 0.0  # First hint ever
-
-def _update_practice_session(
-    session_id:        int,
-    hint_level:        int,
-    hint_text:         str,
-    current_code:      str,
-    detected_approach: str,
-    is_solved:         bool = False,
-) -> None:
-    """
-    Persists session state back to DB after a hint trigger.
-    Increments stuck_count. Called AFTER generate_practice_hint() returns.
-    """
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5.0)
-        conn.execute(
-            """
-            UPDATE practice_sessions
-            SET hint_level        = ?,
-                last_hint_text    = ?,
-                code_snapshot     = ?,
-                detected_approach = ?,
-                last_seen         = ?,
-                is_solved         = ?,
-                stuck_count       = stuck_count + 1
-            WHERE id = ?
-            """,
-            (hint_level, (hint_text or "")[:2000], (current_code or "")[:3000],
-             detected_approach, now, 1 if is_solved else 0, session_id)
-        )
-        conn.commit()
-        conn.close()
-        print(f"{_GREEN}[Practice] Session #{session_id} updated "
-              f"(level={hint_level}, solved={is_solved}){_RESET}")
-    except Exception as e:
-        print(f"{_RED}[Practice] _update_practice_session error: {e}{_RESET}")
 
 # ── FlushWorker Class ────────────────────────────────────────────────────────
 
@@ -689,7 +563,17 @@ class FlushWorker:
                         # ── CP PARTNER STEP 1: Anti-Pollution & Domain Tagging ──
                         cp_info = _parse_cp_url(source_url)
                         if cp_info:
-                            slug = cp_info["slug"]
+                            # Derive the canonical slug from the window title, NOT the URL path.
+                            # The URL path can include tab suffixes like /description/ or /editorial/
+                            # which would pollute the slug (e.g. "predict-the-winner-description").
+                            # The window title e.g. "Predict the Winner - LeetCode" is always clean.
+                            title_slug = ""
+                            if window_title:
+                                # Strip platform suffix: "Predict the Winner - LeetCode" → "predict-the-winner"
+                                title_part = re.split(r'\s*[-|]\s*(LeetCode|Codeforces|CodeChef|AtCoder)', window_title, flags=re.IGNORECASE)[0].strip()
+                                title_slug = re.sub(r'[^a-z0-9]+', '-', title_part.lower()).strip('-')
+                            
+                            slug = title_slug if title_slug else cp_info["slug"]
                             print(f"{_CYAN}[FlushWorker] Detected {cp_info['platform']} problem: '{slug}' (tab: {cp_info['tab']}){_RESET}")
                             
                             # Anti-pollution rule: If viewing editorial/solutions, strip code to protect user attempt history
@@ -705,49 +589,55 @@ class FlushWorker:
                             # Detect Accepted submission state or Solved badge from raw screen text / URL
                             raw_lower = raw_text.lower()
                             is_sub_url = cp_info["tab"] in ("submissions", "submission", "status", "detail") or "/submissions/" in (source_url or "")
-                            has_lc_accepted = "accepted" in raw_lower and any(w in raw_lower for w in ("beats", "runtime", "memory", "testcases", "submitted", "submission result"))
+                            
+                            has_lc_accepted = "accepted" in raw_lower and (
+                                ("beats" in raw_lower and "runtime" in raw_lower) or 
+                                "submission result" in raw_lower
+                            )
                             has_cc_accepted = "correct answer" in raw_lower or "verdict: accepted" in raw_lower
 
-                            # Check for LeetCode's green Solved badge on Description tab (e.g. standalone "Solved" UI item or next to Easy/Medium/Hard)
+                            # Check for LeetCode's green Solved badge on Description tab
                             has_solved_badge = False
                             try:
                                 parsed_json = json.loads(raw_text)
                                 if isinstance(parsed_json, list):
                                     for sec in parsed_json:
                                         t = sec.get("text", "").strip().lower()
-                                        if t in ("solved", "solved ✓", "status: solved", "verdict: accepted", "accepted"):
+                                        if len(t) < 30 and t in ("solved", "solved ✓", "status: solved", "verdict: accepted"):
                                             has_solved_badge = True
                                             break
                             except Exception:
                                 pass
                             if not has_solved_badge:
-                                has_solved_badge = bool(re.search(r'\b(?:solved|accepted)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:easy|medium|hard)\b|\b(?:easy|medium|hard)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:solved|accepted)\b', raw_lower))
+                                has_solved_badge = bool(re.search(r'\b(?:solved)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:easy|medium|hard)\b|\b(?:easy|medium|hard)\b\s*(?:\r?\n|\s){1,5}\s*\b(?:solved)\b', raw_lower))
 
                             if is_sub_url or has_lc_accepted or has_cc_accepted:
                                 print(f"{_GREEN}[FlushWorker] FRESH ACCEPTED submission detected! Tagging '{slug}' as SOLVED & FRESH_SUBMISSION.{_RESET}")
                                 cp_tags.extend(["solved", "fresh_submission"])
-                                # Mark active practice session as solved so hint_level resets next open
-                                try:
-                                    active_session = _get_or_create_practice_session(slug, cp_info["platform"])
-                                    if active_session and not active_session.get("is_solved"):
-                                        _update_practice_session(
-                                            session_id        = active_session["id"],
-                                            hint_level        = active_session.get("hint_level", 0),
-                                            hint_text         = active_session.get("last_hint_text") or "",
-                                            current_code      = active_session.get("code_snapshot") or "",
-                                            detected_approach = active_session.get("detected_approach") or "unknown",
-                                            is_solved         = True,
-                                        )
-                                        print(f"{_GREEN}[Practice] Session marked SOLVED for '{slug}'{_RESET}")
-                                except Exception as _pe:
-                                    print(f"{_RED}[Practice] Could not mark session solved: {_pe}{_RESET}")
+                                self._embedder.mark_problem_solved(slug, cp_info["platform"])
                             elif has_solved_badge:
                                 print(f"{_GREEN}[FlushWorker] SOLVED badge detected! Tagging problem '{slug}' as SOLVED.{_RESET}")
                                 cp_tags.append("solved")
-
+                                self._embedder.mark_problem_solved(slug, cp_info["platform"])
+                            
+                            # ── Submission outcome detection (WA / TLE / RE / CE) ──────────────
+                            # exact moment they request a hint.
                             doc_dict["tags"] = list(dict.fromkeys(cp_tags + existing_tags))
                             # Standardize topic name so all attempts anchor to the exact same problem
                             doc_dict["topic"] = f"{cp_info['platform'].capitalize()}: {slug}"
+
+                            # ── Update practice session to bump last_seen! ──
+                            if doc_dict.get("code_snippet"):
+                                try:
+                                    update_session(
+                                        slug = slug,
+                                        platform = cp_info["platform"],
+                                        code_snapshot = doc_dict["code_snippet"],
+                                        is_solved = 1 if "solved" in cp_tags else None
+                                    )
+                                    flush_session_to_db(slug)
+                                except Exception as e:
+                                    print(f"{_RED}[FlushWorker] Failed to update session: {e}{_RESET}")
                         # ────────────────────────────────────────────────────────
 
 

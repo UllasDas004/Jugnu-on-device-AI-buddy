@@ -54,6 +54,31 @@ def main():
 
     result = {"action": "cancel", "custom_problem": ""}
 
+    mode      = state.get("mode", "general")
+    hint_text = state.get("hint_text", "")
+    if mode == "practice_hint" and hint_text:
+        sources_str = ", ".join(state.get("sources", []))
+        _print_box(
+            f"🧠  Jugnu — Practice Hint",
+            [
+                f"\033[90m{sources_str}\033[0m" if sources_str else "",
+                "",
+                hint_text,
+                "",
+                "\033[1;32m[1]\033[0m  ✓  Helpful — got it, let me try",
+                "\033[1;31m[2]\033[0m  ✗  Not helpful — different angle please",
+                "\033[1;33m[3]\033[0m  ↓  Go deeper — still stuck",
+                "\033[90m[N]\033[0m  Dismiss",
+            ],
+            color="36"
+        )
+        ans = _ask("\n  Your choice (1/2/3/N) [default: N]: ", ["1", "2", "3", "n"])
+        fb_map = {"1": 1, "2": 0, "3": "escalate", "n": "dismiss"}
+        feedback = fb_map.get(ans, "dismiss")
+        result = {"action": "hint_feedback", "feedback": feedback}
+        _write_and_exit(result, result_path)
+        return
+
     # ── Stage 1: Nudge ─────────────────────────────────────────────────
     _print_box("🧠  Jugnu — Your AI Coding Buddy", [
         "You've been working for a while.",

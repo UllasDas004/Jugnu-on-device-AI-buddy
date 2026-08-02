@@ -95,9 +95,12 @@ On each switch, the monitor:
 
 ## Screen Capture (`screen_reader.cpp`)
 
-### The Three-Tier Capture Strategy
+### The Hybrid Capture Timer (Gear 1 & Gear 2)
+Instead of a fixed polling timer, Jugnu uses a context-aware hybrid capture engine to drastically reduce CPU and DB overhead:
+- **Gear 1: Tab/Window Switch (10s Debounce):** When the user switches to a new file or tab in the IDE, Jugnu waits exactly 10 seconds. If they don't switch away (preventing Alt-Tab spam), it fires exactly ONE full UIA scan (combining the UI accessibility tree + Ghost Clipboard) and writes it to the SQLite `ocr_buffer`. This captures the full problem description and initial code state.
+- **Gear 2: Active Typing Threshold (60s + 5s Pause):** While the user is coding, Jugnu accumulates active keystroke time. If the user hits 60 seconds of active typing and then pauses to think for 5 seconds, Jugnu triggers a Ghost Clipboard extraction. Crucially, this bypasses the UIA COM thread and the SQLite database entirely, storing the fresh code directly into the volatile `g_lastCodeBuffer` in RAM.
 
-When the user has been idle for 60 seconds inside a Focus App, the Screen Reader captures context. It tries three strategies in order, falling back to the next if the previous yields nothing.
+### The Three-Tier Capture Strategy
 
 **Tier 1: IUIAutomation (UIA)**
 
@@ -248,11 +251,12 @@ In addition to acting as a passive knowledge base, Jugnu includes an active **Pr
 Instead of generic RAG retrieval, Practice Mode relies on deterministic state tracking and pedagogical hint escalation to simulate a real human interviewer.
 
 1. **Deterministic Topic Anchoring:** To prevent URL mismatches when the user switches between their browser and their IDE, Jugnu parses the exact CP platform and problem slug directly from the Vector DB's retrieved OKF `topic` (e.g. `Leetcode: two-sum`).
-2. **The "Meaningful Code" Heuristic:** The IPC listener uses a lightning-fast substring parser to check if the user is actively writing code (detecting control flow like `if`, `for`, `while`) or if they are just staring at the platform's default boilerplate. This forks the telemetry into `CP_STUCK` vs `CP_READING`.
-3. **Escalating Hint Engine:** If the user triggers the idle timer, Jugnu computes a `difflib.SequenceMatcher` delta against their last code snapshot.
+2. **The Zero-DB IPC Code Pipeline:** Previously, Python queried the SQLite DB to find the user's latest code snippet when the idle timer fired. This caused race conditions where the C++ `flush_worker` hadn't synced the active buffer to disk yet, resulting in stale hints. We built a **Zero-DB IPC Pipeline**: C++ caches the active screen text in a volatile RAM buffer (`g_lastCodeBuffer`) and injects the meticulously escaped code directly into the `USER_IDLE` JSON payload sent over the Named Pipe. Python skips the DB entirely and feeds this hot context directly to the LLM.
+3. **The "Meaningful Code" Heuristic:** The IPC listener uses a lightning-fast substring parser to check if the user is actively writing code (detecting control flow like `if`, `for`, `while`) or if they are just staring at the platform's default boilerplate. This forks the telemetry into `CP_STUCK` vs `CP_READING`.
+4. **Escalating Hint Engine:** If the user triggers the idle timer, Jugnu computes a `difflib.SequenceMatcher` delta against their last code snapshot.
    - If the code has changed significantly (user is iterating), the AI suppresses itself or maintains its hint level.
    - If the similarity is `>= 0.70`, the user is truly stuck. Jugnu automatically advances the `hint_level` (0 to 3), escalating from gentle Socratic questions (Level 1) to direct bug-fixes (Level 3).
-4. **Anti-Pollution & Solved State Reset:** The `FlushWorker` uses declarative regex registries to identify read-only tabs (like Editorials or Solutions) and strips the code snippet from the capture to protect the user's authentic attempt history. When the user successfully solves the problem (e.g., detecting the "Accepted" text footprint), Jugnu resets the database `is_solved` state so the hint level resets for their next attempt.
+5. **Anti-Pollution & Solved State Reset:** The `FlushWorker` uses declarative regex registries to identify read-only tabs (like Editorials or Solutions) and strips the code snippet from the capture to protect the user's authentic attempt history. When the user successfully solves the problem (e.g., detecting the "Accepted" text footprint), Jugnu resets the database `is_solved` state so the hint level resets for their next attempt.
 
 ---
 

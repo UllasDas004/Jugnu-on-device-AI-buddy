@@ -23,33 +23,38 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 │                    C++ Telemetry Engine (Native Daemon)             │
 │                                                                     │
 │  WinMonitor (SetWinEventHook)                                       │
-│     └─ Fires on every foreground window change                      │
-│     └─ Manages hDeepWorkEvent (manual-reset Win32 Event)            │
+│     └─ Fires on foreground window change (hDeepWorkEvent)           │
 │                                                                     │
-│  ScreenReader Thread (hibernates on hDeepWorkEvent)                 │
-│     └─ Wakes ONLY when user is in a whitelisted work app            │
-│     └─ Extracts via UIA (DFS ARIA Pruning) → JSON [{type, text}]    │
-│     └─ Falls back to WinRT OCR if UIA returns nothing               │
-│     └─ Writes result to SQLite ocr_buffer (zero IPC overhead)       │
+│  Hybrid Capture Engine (ScreenReader)                               │
+│     └─ Gear 1 (Passive): Fires UIA on tab-switch (10s debounce)     │
+│        └─ Writes baseline context & code to SQLite ocr_buffer       │
+│     └─ Gear 2 (Active): 60s typing threshold + 5s pause triggers    │
+│        a silent Ghost Clipboard (CTRL+C) for pristine code fetch    │
+│        └─ Saves pristine code to RAM cache (g_lastCodeBuffer)       │
 │                                                                     │
-│  ClipboardMonitor (WM_CLIPBOARDUPDATE)                              │
-│     └─ Ghost Clipboard bypasses 60s timer → pristine full_buffer    │
-│                                                                     │
-│  StuckTimer Thread (hibernates on hDeepWorkEvent)                   │
-│     └─ Fires USER_IDLE event to Python after 3 min AFK              │
+│  StuckTimer Thread                                                  │
+│     └─ Monitors AFK/Idle time (3 minutes)                           │
+│     └─ Fires USER_IDLE event via Named Pipe IPC                     │
+│        └─ Embeds RAM-cached code directly in the JSON payload       │
 └─────────────────────────────────────────────────────────────────────┘
-                                │
-              SQLite ocr_buffer │ Named Pipe IPC
-                                ▼
+                 │                             │
+ SQLite ocr_buffer writes              Named Pipe IPC 
+ (Baseline Context Path)               (Zero-DB Code Hot-Path)
+                 ▼                             ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Python Inference Engine (uv venv)                │
 │                                                                     │
 │  FlushWorker (every 60s, AC power only)                             │
-│     └─ Area-Wise Dedup (>95% match for Code & Page independently)   │
+│     └─ Consumes ocr_buffer & Area-Wise Dedup (>95% match)           │
 │     └─ UIA JSON Path:                                               │
 │         Edit controls  → verbatim code, heuristic tag detection     │
 │         Document/Text  → Gemma extraction (TOPIC, TAGS, NOTES only) │
-│     └─ OKF Synthesis → C++ payload passed directly, saving tokens   │
+│     └─ OKF Synthesis → Writes episodic memories to vector DB        │
+│                                                                     │
+│  IPC Client Daemon & Practice Engine (practice_mode.py)             │
+│     └─ Receives USER_IDLE event + fresh code from C++               │
+│     └─ Evaluates active code from IPC against DB context            │
+│     └─ Single-Call Gemma Hint Generation (Approach, Type, Hint)     │
 │                                                                     │
 │  AIEngine (Ollama / Gemma4:e2b)                                     │
 │     └─ Situation-Aware Prompting (REPEATED_STRUGGLE)                │
@@ -58,9 +63,8 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 │  Embedder (multilingual-e5-small)                                   │
 │     └─ Deterministic Anchors (exact window_title / file_path match) │
 │     └─ Union Merge ("Never Delete, Only Add" scroll-loss fix)       │
-│     └─ OCR-to-UIA Upgrade & full_buffer override                    │
 │                                                                     │
-│  StateManager ─→ ipc_client ─→ Terminal / WebView2 UI              │
+│  StateManager ─→ Terminal / WebView2 UI                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,18 +73,18 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 ## 🚀 What Is Built & Working
 
 ### ✅ Socratic Practice Mode (Phase 8)
-Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot.
-- **State Machine Engine:** Maintains a `practice_sessions` table in SQLite with a 2-hour TTL to track your current "hint level" on specific problems.
-- **Zero-LLM Heuristics:** Uses fast substring parsing to distinguish when you are just reading (suppressing the AI) versus actively writing control flow logic.
-- **Progressive Hint Escalation:** Hints start as open Socratic questions (Level 0) and escalate to pinpointing specific buggy variables (Level 3) without *ever* writing syntax or giving away the full solution.
-- **"Ghost Hint" Prevention:** Automatically detects "Accepted" success footprints to flip the solved state and reset the hint level for future attempts.
+Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot. The entire practice mode operates through a strict multi-layer pipeline:
+- **Layer 1: Deterministic Context Retrieval:** Uses the exact window title and UIA page content to instantly anchor and retrieve the correct problem description from the vector database, preventing CP problem hallucination.
+- **Layer 2: Zero-LLM Active Coding Detection:** A fast, language-agnostic parser distinguishes when you are just reading boilerplates (`CP_READING`) versus actively writing control flow logic (`CP_STUCK`). This prevents premature AI interruptions while you're still reading.
+- **Layer 3: The Correctness Gate:** Before offering a hint, Gemma explicitly verifies if your code already solves the problem. If it's correct, Jugnu skips the hint and generates a final congratulatory **Efficiency Review** breaking down time/space complexity and optimization potential.
+- **Layer 4: Unified Socratic Hint Engine:** If you are truly stuck, Jugnu uses a single dynamic Gemma prompt incorporating your code snapshot, hint history, and past feedback. It simultaneously evaluates your algorithmic approach, the specific flaw in your logic, and generates a progressive, interview-style question without *ever* writing syntax.
+- **Layer 5: Session State Machine:** Maintains a `practice_sessions` and `practice_hints` table in SQLite to track your code evolution, storing hint history and explicit user feedback to adjust the AI's teaching style over time.
 
-### ✅ Memory Determinism & Zero-Overhead Telemetry (Phase 7)
-We completely eliminated vector-identity hallucination and token-budget limits:
-- **Deterministic Anchors:** Bypasses fuzzy vector search for exact `window_title` / `file_path` matches, guaranteeing identical code files are merged, never duplicated.
-- **Union Merge (Scroll-Loss Fix):** `difflib` deletes are explicitly ignored via a "Never Delete, Only Add" policy, preventing code loss when scrolling in VSCode.
-- **Ghost Clipboard Bypass:** A native C++ `WM_CLIPBOARDUPDATE` hook intercepts CTRL+C actions, bypassing the 60-second idle timer to inject pristine, 100% complete `full_buffer` file reads directly into the DB.
-- **Zero-Overhead Token Budget:** Gemma is no longer forced to generate the `CONTENT` block itself. The raw C++ UIA payload is piped directly through Python to the database, saving massive LLM output tokens and preventing generation cutoffs.
+### ✅ Hybrid Capture Engine & Zero-DB Hot-Paths (Phase 7)
+We overhauled the OS telemetry engine to capture pristine data without spamming COM APIs or SQLite:
+- **Hybrid Capture (Gear 1 & Gear 2):** C++ operates in two gears. Gear 1 uses a 10-second debounce for passive tab switches, saving the baseline problem statement and initial code to the SQLite `ocr_buffer`. Gear 2 tracks active typing (60s threshold + 5s pause) to fire a silent Ghost Clipboard (CTRL+C), capturing pristine code into RAM without heavy OCR or UIA tree walking.
+- **Zero-DB IPC Code Hot-Path:** While the initial page context populates `knowledge_docs` via the standard DB pipeline, your *active keystrokes* bypass the DB entirely. When you're stuck, the C++ StuckTimer sends the RAM-cached code directly to Python over Named Pipes. This guarantees the AI sees your absolute freshest code instantaneously without waiting for the 60s DB flush cycle.
+- **Deterministic Anchors & Union Merge:** Bypasses fuzzy vector search for exact window/file anchors and ignores `difflib` deletes (Never Delete, Only Add) to prevent code loss when scrolling in IDEs.
 
 ### ✅ Advanced RAG Pipeline (Phase 6)
 We overhauled the RAG engine to prevent VRAM crashes and improve answer quality:
@@ -138,6 +142,7 @@ Jugnu currently:
 - Forces the context into a strictly budgeted token window to prevent OOMs.
 
 **What is not polished yet:**
+- **Socratic Practice Hints (Phase 8):** While the C++ telemetry perfectly captures the code state, and the Python pipeline flawlessly tracks the active-coding session and formats the final prompt, **the actual hints generated by Gemma are often unsatisfactory**. Small 4B local models struggle with deep algorithmic reasoning and judging complex code logic. I am aggressively tuning the system prompts to improve this, but interviewers should note that the *system architecture* (tracking, parsing, routing) is fully robust, even if the raw LLM output quality still requires a more capable model.
 - **LLM Prose Quality:** Gemma (especially smaller 3-4B variants) sometimes ignores the strict instructions to "be brief" or outputs clunky phrasing despite the high-quality context. 
 - **Code Hallucinations:** Even when provided with the exact code snippet, small local models sometimes slightly mutate the syntax in their response.
 - **Formatting Issues:** The PowerShell CLI output can sometimes mangle the markdown code blocks returned by Gemma.

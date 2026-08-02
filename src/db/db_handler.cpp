@@ -135,7 +135,8 @@ namespace Jugnu
                 code_snippet  TEXT,                      -- Verbatim code
                 first_seen    DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_updated  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                capture_count INTEGER DEFAULT 1
+                capture_count INTEGER DEFAULT 1,
+                is_solved     INTEGER DEFAULT 0
             );
         )";
         if(!ExecuteSQL(create_knowledge_docs_sql)) return false;
@@ -151,6 +152,10 @@ namespace Jugnu
         // One row = one question per session.
         // A "session" expires when last_seen > 2h ago OR is_solved = 1.
         // hint_level 0-3 controls how much Gemma reveals each stuck trigger.
+        //
+        // BUG FIX #2: UNIQUE(problem_slug, platform) is REQUIRED for the Python UPSERT to work.
+        // Without it, SQLite silently ignores the ON CONFLICT clause and creates a new duplicate
+        // row on every hint trigger, so hint_level resets to 0 every single time.
         std::string create_practice_sessions_sql = R"(
             CREATE TABLE IF NOT EXISTS practice_sessions (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,16 +163,46 @@ namespace Jugnu
                 platform          TEXT NOT NULL,
                 session_start     DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_seen         DATETIME DEFAULT CURRENT_TIMESTAMP,
-                hint_level        INTEGER DEFAULT 0,
-                last_hint_text    TEXT,
                 code_snapshot     TEXT,
                 detected_approach TEXT,
-                stuck_count       INTEGER DEFAULT 0,
-                is_solved         INTEGER DEFAULT 0
+                approach_confidence REAL,          -- 0.0-1.0 from the LLM (or heuristic)
+                is_solved         INTEGER DEFAULT 0,
+                user_state          TEXT DEFAULT 'READING',
+                last_hint_type      TEXT,
+                hint_type_history   TEXT DEFAULT '[]'
             );
         )";
         if(!ExecuteSQL(create_practice_sessions_sql)) return false;
-        
+
+        // Index for fast session expiry queries (WHERE last_seen and is_solved)
+        std::string create_practice_idx_sql = R"(
+            CREATE INDEX IF NOT EXISTS idx_practice_sessions_lookup
+            ON practice_sessions(problem_slug, platform, is_solved, last_seen);
+        )";
+        if(!ExecuteSQL(create_practice_idx_sql)) return false;
+
+        std::string create_practice_hints_sql = R"(
+            CREATE TABLE IF NOT EXISTS practice_hints (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id            INTEGER NOT NULL,
+                timestamp             DATETIME DEFAULT CURRENT_TIMESTAMP,
+                hint_type             TEXT NOT NULL,
+                hint_text             TEXT NOT NULL,
+                user_state            TEXT,
+                code_snapshot         TEXT,
+                approach_at_hint      TEXT,
+                user_feedback         INTEGER,
+                implicit_code_changed INTEGER,
+                test_outcome_after    TEXT
+            );
+        )";
+        if(!ExecuteSQL(create_practice_hints_sql)) return false;
+        std::string create_hints_idx_sql = R"(
+            CREATE INDEX IF NOT EXISTS idx_practice_hints_session
+            ON practice_hints(session_id, timestamp DESC);
+        )";
+        if(!ExecuteSQL(create_hints_idx_sql)) return false;
+          
         return true;
     }
 

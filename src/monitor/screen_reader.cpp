@@ -35,6 +35,13 @@ namespace Jugnu
     HANDLE ScreenReader::hThread = NULL;
     static winrt::Windows::Media::Ocr::OcrEngine g_ocrEngine = nullptr;
 
+    static std::string g_lastCodeBuffer = "";
+
+    std::string ScreenReader::GetLastCodeBuffer()
+    {
+        return g_lastCodeBuffer;
+    }
+
     void ScreenReader::Start()
     {
         if(isRunning) return;
@@ -145,6 +152,56 @@ namespace Jugnu
         return out;
     }
 
+    static RECT g_lastMonacoRect = {0};
+    static std::wstring g_lastPageUrl = L"";
+    static std::wstring g_lastPageTitle = L"";
+
+    // Fast bounded Levenshtein sequence matcher for C++. 
+    // Returns a ratio 0.0 to 1.0. Aborts early if > 2% diff.
+    static double BoundedSimilarityRatio(const std::string& s1, const std::string& s2)
+    {
+        if(s1 == s2) return 1.0;
+        int len1 = (int)s1.length();
+        int len2 = (int)s2.length();
+        if(len1 == 0 || len2 == 0) return 0.0;
+        
+        int maxLen = max(len1, len2);
+        int maxDiffsAllowed = (int)(maxLen * 0.02); // 98% similarity threshold
+
+        if(std::abs(len1 - len2) > maxDiffsAllowed) return 0.0;
+        
+        std::vector<int> prev(len2 + 1), curr(len2 + 1);
+
+        for(int j=0;j<=len2;j++) prev[j] = j;
+        for(int i=1;i<=len1;i++)
+        {
+            curr[0] = i;
+            int startJ = max(1, i - maxDiffsAllowed);
+            int endJ = min(len2, i + maxDiffsAllowed);
+
+            if(startJ > 1) curr[startJ - 1] = maxDiffsAllowed + 1;
+            if(endJ < len2) curr[endJ + 1] = maxDiffsAllowed + 1;
+
+            int minVal = maxDiffsAllowed + 1;
+            for(int j=startJ;j<=endJ;j++)
+            {
+                if(s1[i-1] == s2[j-1]) curr[j] = prev[j-1];
+                else
+                {
+                    int minPrev = min(prev[j], prev[j-1]);
+                    curr[j] = 1 + min(minPrev, curr[j-1]);
+                }
+
+                if(curr[j] < minVal) minVal = curr[j];
+            }
+            if(minVal > maxDiffsAllowed) return 0.0;
+            prev = curr;
+        }
+        int edits = prev[len2];
+        if(edits > maxDiffsAllowed) return 0.0;
+        return 1.0 - ((double)edits / maxLen);
+    }
+
     // ── Ghost Clipboard: Full Code Buffer Extraction ──────────────────────────
     // Calls SetFocus() on the Monaco editor element via UIA accessibility API,
     // then synthesizes Ctrl+A + Ctrl+C to read Monaco's full JS model from clipboard.
@@ -152,17 +209,20 @@ namespace Jugnu
     // Only called during 60s idle — user is not typing, safe to synthesize input.
     // Returns empty wstring if SetFocus fails and bounding-rect fallback also fails.
     // ─────────────────────────────────────────────────────────────────────────────
-    static std::wstring GhostClipboard(IUIAutomationElement* pMonacoEl)
+    static std::wstring GhostClipboard(IUIAutomationElement* pMonacoEl, const RECT* pRect = nullptr)
     {
         // Step 1: Force focus onto Monaco via UIA.
         // Chrome bridges SetFocus() → DOM focus() on the renderer element.
-        HRESULT hr = pMonacoEl->SetFocus();
-        if(FAILED(hr))
+        bool focusSuccess = false;
+        if(pMonacoEl && SUCCEEDED(pMonacoEl->SetFocus())) focusSuccess = true;
+        if(!focusSuccess)
         {
-            // Fallback: synthetic click at the center of the editor's bounding rect.
             RECT rect{};
-            if(SUCCEEDED(pMonacoEl->get_CurrentBoundingRectangle(&rect)))
+            if(pMonacoEl && SUCCEEDED(pMonacoEl->get_CurrentBoundingRectangle(&rect))) {}
+            else if(pRect && pRect->right > pRect->left) rect = *pRect;
+            if(rect.right > rect.left)
             {
+                // Fallback: synthetic click at the center of the editor's bounding rect.
                 int cx = rect.left + (rect.right - rect.left) / 2;
                 int cy = rect.top + (rect.bottom - rect.top) / 2;
                 INPUT inputs[2] = {};
@@ -285,7 +345,7 @@ namespace Jugnu
         return codeBuffer; // empty string if anything failed
     }
 
-    std::wstring ScreenReader::ExtractTextViaUIA(HWND targetWindow)
+    std::wstring ScreenReader::ExtractTextViaUIA(HWND targetWindow, bool allowGhostClipboard)
     {
         // 1. Initialize the UIA COM factory.
         //    CoCreateInstance is the standard way to create a COM object.
@@ -435,48 +495,53 @@ namespace Jugnu
                 size_t min_required = (type == UIA_EditControlTypeId) ? 20 : 100;
                 if(text.length() >= min_required && text.length() <= 150000)
                 {
-                                std::wstring autoId;
-                                BSTR bId = nullptr;
-                                if(SUCCEEDED(pNode->get_CurrentAutomationId(&bId)) && bId)
-                                {
-                                    autoId = std::wstring(bId, SysStringLen(bId));
-                                    SysFreeString(bId);
-                                }
-                                std::wstring typeNameForJson = isMainContent ? L"MainContent" : ControlTypeName(type);
-                                UiaSection sec{ typeNameForJson, autoId, text };
+                    std::wstring autoId;
+                    BSTR bId = nullptr;
+                    if(SUCCEEDED(pNode->get_CurrentAutomationId(&bId)) && bId)
+                    {
+                        autoId = std::wstring(bId, SysStringLen(bId));
+                        SysFreeString(bId);
+                    }
+                    std::wstring typeNameForJson = isMainContent ? L"MainContent" : ControlTypeName(type);
+                    UiaSection sec{ typeNameForJson, autoId, text };
 
-                                // Dedup logic
-                                bool absorbed = false;
-                                for(auto& existing : candidates)
-                                {
-                                    // Protect Edit controls from being absorbed or absorbing others
-                                    if(existing.typeName == L"Edit" && sec.typeName != L"Edit") continue;
-                                    if(sec.typeName == L"Edit" && existing.typeName != L"Edit") continue;
-                                    
-                                    // Protect MainContent from being absorbed by Document
-                                    if(existing.typeName == L"MainContent" && sec.typeName != L"MainContent") continue;
-                                    if(sec.typeName == L"MainContent" && existing.typeName != L"MainContent") continue;
+                    // Dedup logic
+                    bool absorbed = false;
+                    for(auto& existing : candidates)
+                    {
+                        // Protect Edit controls from being absorbed or absorbing others
+                        if(existing.typeName == L"Edit" && sec.typeName != L"Edit") continue;
+                        if(sec.typeName == L"Edit" && existing.typeName != L"Edit") continue;
+                        
+                        // Protect MainContent from being absorbed by Document
+                        if(existing.typeName == L"MainContent" && sec.typeName != L"MainContent") continue;
+                        if(sec.typeName == L"MainContent" && existing.typeName != L"MainContent") continue;
 
-                                    if(text.find(existing.text) != std::wstring::npos) {
-                                        existing = sec; absorbed = true; break;
-                                    }
-                                    if(existing.text.find(text) != std::wstring::npos) {
-                                        absorbed = true; break;
-                                    }
-                                }
-                                if(!absorbed) candidates.push_back(sec);
-                                
-                                if (isMainContent) foundMainLandmark = true;
-                                // Save Edit for Ghost Clipboard
-                                if(type == UIA_EditControlTypeId && text.length() > largestMonacoLen)
-                                {
-                                    if(pMonacoEl) pMonacoEl->Release();
-                                    pMonacoEl = pNode;
-                                    pMonacoEl->AddRef();
-                                    largestMonacoLen = text.length();
-                                }
-                            }
-
+                        if(text.find(existing.text) != std::wstring::npos)
+                        {
+                            existing = sec;
+                            absorbed = true;
+                            break;
+                        }
+                        if(existing.text.find(text) != std::wstring::npos)
+                        {
+                            absorbed = true;
+                            break;
+                        }
+                    }
+                    if(!absorbed) candidates.push_back(sec);
+                    
+                    if(isMainContent) foundMainLandmark = true;
+                    // Save Edit for Ghost Clipboard
+                    if(type == UIA_EditControlTypeId && text.length() > largestMonacoLen)
+                    {
+                        if(pMonacoEl) pMonacoEl->Release();
+                        pMonacoEl = pNode;
+                        pMonacoEl->AddRef();
+                        pMonacoEl->get_CurrentBoundingRectangle(&g_lastMonacoRect);
+                        largestMonacoLen = text.length();
+                    }
+                }
             }
             // ── 5. ENQUEUE CHILDREN (DFS Reverse Order) ──
             IUIAutomationElement* pChild = nullptr;
@@ -491,7 +556,7 @@ namespace Jugnu
                     pChild = pNext;
                 }
                 // Push in reverse order so the topmost visual child is popped FIRST
-                for (auto it = children.rbegin(); it != children.rend(); ++it)
+                for(auto it = children.rbegin(); it != children.rend(); ++it)
                 dfsStack.push(*it);
             }
             pNode->Release();
@@ -513,10 +578,11 @@ namespace Jugnu
             if(SUCCEEDED(pRootWebArea->get_CurrentName(&bTitle)) && bTitle)
             {
                 pageTitle = std::wstring(bTitle, SysStringLen(bTitle));
+                g_lastPageTitle = pageTitle;
                 SysFreeString(bTitle);
             }
 
-            // Get the URL from LegacuIAccessible value
+            // Get the URL from LegacyIAccessible value
             IUIAutomationLegacyIAccessiblePattern* pLegacy = nullptr;
             if(SUCCEEDED(pRootWebArea->GetCurrentPattern(UIA_LegacyIAccessiblePatternId, (IUnknown**)&pLegacy)) && pLegacy)
             {
@@ -524,6 +590,7 @@ namespace Jugnu
                 if(SUCCEEDED(pLegacy->get_CurrentValue(&bUrl)) && bUrl)
                 {
                     pageUrl = std::wstring(bUrl, SysStringLen(bUrl));
+                    g_lastPageUrl = pageUrl;
                     SysFreeString(bUrl);
                 }
                 pLegacy->Release();
@@ -550,7 +617,10 @@ namespace Jugnu
         if(foundMainLandmark)
         {
             candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                [](const UiaSection& s) { return s.typeName == L"Document"; }), 
+                [](const UiaSection& s)
+                {
+                    return s.typeName == L"Document";
+                }),
                 candidates.end());
         }
         
@@ -587,7 +657,7 @@ namespace Jugnu
         }
 
         // ── Ghost Clipboard: override Edit section with full Monaco buffer ────────
-        if(pMonacoEl)
+        if(pMonacoEl && allowGhostClipboard)
         {
             std::cout << "\033[90m[ScreenReader] Ghost Clipboard: extracting full code buffer...\033[0m\n";
             std::wstring fullCode = GhostClipboard(pMonacoEl);
@@ -605,7 +675,7 @@ namespace Jugnu
                     if(c.typeName == L"Edit" && fullCode.length() < c.text.length())
                     {
                         valid = false;
-                        std::cout << "\033[33m[ScreenReader] Ghost Clipboard shorter than UIA — keeping UIA window text.\033[0m\n";
+                        std::cout << "\033[33m[ScreenReader] Ghost Clipboard shorter than UIA - keeping UIA window text.\033[0m\n";
                         break;
                     }
                 }
@@ -734,6 +804,14 @@ namespace Jugnu
         bool hasOcredWhileIdle = false;
         bool wasHibernating = true;
         std::string lastOcredApp = "";
+        std::string lastWindowTitle = "";
+        std::string lastCodeBuffer = "";
+        std::string lastProblemTitle = ""; // For Practice_Abandoned tracking
+        std::unordered_set<std::string> seenSubmissions; // Hash deduplication
+        DWORD activeInputMs = 0;
+
+        DWORD tabSwitchTime = 0;
+        bool waitingForExtraction = false;
 
         while(isRunning)
         {
@@ -749,131 +827,114 @@ namespace Jugnu
                 std::cout << "\033[1;32m[ScreenReader]\033[0m Focus session detected - screen capture guard is live.\n";
                 wasHibernating = false;
             }
-
-            // PHASE 2: User is in a Deep Work app. Use dynamic math.
-            LASTINPUTINFO lii;
-            lii.cbSize = sizeof(LASTINPUTINFO);
-            if(!GetLastInputInfo(&lii))
+            else if(WaitForSingleObject(Jugnu::hDeepWorkEvent, 0) == WAIT_TIMEOUT)  // Check if we lost the focus zone (user Alt-Tabbed to Spotify, etc.)
             {
-                Sleep(2000);
+                wasHibernating = true;
+                lastOcredApp = "";
+                lastWindowTitle = "";
+                activeInputMs = 0;
+                waitingForExtraction = false;
+                std::cout << "\033[90m[ScreenReader]\033[0m Left focus zone. Entering standby.\n";
                 continue;
             }
+
+            // PHASE 2: Track Active Keypresses
+            LASTINPUTINFO lii;
+            lii.cbSize = sizeof(LASTINPUTINFO);
+            DWORD timeSinceInput = 0;
+            if(GetLastInputInfo(&lii))
+            {
+                DWORD currentTick = GetTickCount();
+                timeSinceInput = currentTick - lii.dwTime;
+                DWORD timeSinceGhost = (lii.dwTime >= Jugnu::g_lastGhostClipboardInputTime) ? (lii.dwTime - Jugnu::g_lastGhostClipboardInputTime) : (Jugnu::g_lastGhostClipboardInputTime - lii.dwTime);
+                // Accumulate active typing time (must be recent, and ignore GhostClipboard synthetic inputs)
+                if (timeSinceInput < 1000 && timeSinceGhost > 500) activeInputMs += 1000;
+            }
             
-            DWORD idleTime;
-            DWORD timeSinceGhost = 0;
-            if (lii.dwTime >= Jugnu::g_lastGhostClipboardInputTime) {
-                timeSinceGhost = lii.dwTime - Jugnu::g_lastGhostClipboardInputTime;
-            } else {
-                timeSinceGhost = Jugnu::g_lastGhostClipboardInputTime - lii.dwTime;
-            }
-
-            // If the last OS input event matches our GhostClipboard timestamp (within 500ms),
-            // it means the user hasn't touched the computer since we ran GhostClipboard.
-            if (timeSinceGhost < 500) {
-                // OS timer was hijacked by GhostClipboard. Force it to remain in the idle block.
-                idleTime = 60000;
-            } else {
-                idleTime = GetTickCount() - lii.dwTime;
-            }
-
-            if(idleTime >= 60000)   // 60 seconds idle → capture screen
+            HWND hwnd = GetForegroundWindow();
+            if(!hwnd)
             {
-                HWND hwnd = GetForegroundWindow();
-                if(!hwnd)
+                Sleep(1000);
+                continue;
+            }
+            std::string currentApp = WinMonitor::GetProcessName(hwnd);
+            std::string windowTitle = WinMonitor::GetWindowTextString(hwnd);
+
+            // GEAR 1: Tab/Window Switch (Fast UIA Scan with Ghost Clipboard)
+            bool tabChanged = (currentApp != lastOcredApp || windowTitle != lastWindowTitle);
+
+            if(tabChanged)
+            {
+                // 🚨 THE "RAGE-QUIT" / ABANDON CATCHER 🚨
+                if(!lastProblemTitle.empty() && windowTitle != lastProblemTitle)
                 {
-                    Sleep(2000);
-                    continue;
+                    std::string payload = "{\"type\": \"PRACTICE_ABANDONED\", \"title\": \"" + lastProblemTitle + "\", \"code\": \"" + lastCodeBuffer + "\"}";
+                    Jugnu::IPCServer::SendMessageToPython(payload);
+                    lastProblemTitle = ""; // Reset
                 }
-                std:: string currentApp = WinMonitor::GetProcessName(hwnd);
-                std::string windowTitle = WinMonitor::GetWindowTextString(hwnd);
 
-                // [MID-IDLE APP SWITCHING LOGIC]
-                // If a user sits idle in VS Code for 60s, we capture it and set hasOcredWhileIdle = true.
-                // If they then Alt-Tab to Chrome without touching the mouse, system idleTime stays > 60s.
-                // By checking if currentApp changed, we instantly drop the lock to capture the new window.
-                if(currentApp != lastOcredApp) hasOcredWhileIdle = false;
-                
-                if(!hasOcredWhileIdle)
+                lastOcredApp = currentApp;
+                lastWindowTitle = windowTitle;
+                activeInputMs = 0; // Reset active typing when tab switches
+
+                lastCodeBuffer = "";
+
+                if(ShouldCapture(currentApp))
                 {
-                    hasOcredWhileIdle = true;
-                    
-                    // Mark this app as captured so we don't spam it in a loop
-                    lastOcredApp = currentApp;
+                    // Debounce: wait 10 seconds to ensure the user actually intends to stay on this tab.
+                    // This prevents heavy UIA/Ghost Clipboard operations during rapid Alt-Tabbing.
+                    tabSwitchTime = GetTickCount();
+                    waitingForExtraction = true;
+                }
+                else
+                {
+                    waitingForExtraction = false;
+                }
+            }
 
-                    // Only capture if the app supports UIA extraction
-                    if(ShouldCapture(currentApp))
+            if(waitingForExtraction && (GetTickCount() - tabSwitchTime >= 10000))
+            {
+                waitingForExtraction = false;
+                // Double check we are still on the same tab
+                if (currentApp == lastOcredApp && windowTitle == lastWindowTitle)
+                {
+                    std::cout << "\033[1;36m[ScreenReader]\033[0m Tab switch settled in '" << currentApp << "'. Full UIA scan with Ghost Clipboard...\n";
+                    std::wstring text = ExtractTextViaUIA(hwnd, true); // true = Use Ghost Clipboard to get full buffer
+                    if(!text.empty())
                     {
-                        std::cout << "\033[1;36m[ScreenReader]\033[0m 60s idle detected in '" << currentApp << "' - reading screen context...\n";
-
-                        // ── PRIMARY: Try UIA first ────────────────────────────────
-                        std::cout << "\033[90m[ScreenReader]\033[0m Trying UIA for " << currentApp << "...\n";
-                        std::wstring text = ExtractTextViaUIA(hwnd);
-                        if(!text.empty())
-                        {
-                            std::cout << "\033[32m[ScreenReader]\033[0m UIA extracted "
-                                    << text.length() << " chars from " << currentApp << ".\n";
-                        }
-                        else
-                        {
-                            // ── FALLBACK: OCR if UIA returned nothing ─────────────
-                            std::cout << "\033[33m[ScreenReader]\033[0m UIA returned nothing - falling back to OCR for "
-                                    << currentApp << "...\n";
-                            text = CaptureAndOCR(hwnd);
-                        }
-
-                        if(!text.empty())
-                        {
-                            // Convert UTF-16 wide string to UTF-8 standard string for JSON compatibility
-                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0, NULL, NULL);
-                            std::string utf8_text(size_needed, 0);
-                            WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), &utf8_text[0], size_needed, NULL, NULL);
-
-                            // ARCHITECTURE CHANGE: Write directly to SQLite ocr_buffer.
-                            // No JSON escaping needed — SQLite prepared statements handle all special chars safely.
-                            // No IPC pipe involved — large OCR text blobs never travel over Named Pipes.
-                            // Python's FlushWorker will read this table every 60s and clean it with Gemma.
-
-                            if(DBHandler::BufferOCR(currentApp, windowTitle, utf8_text))
-                            {
-                                std::cout << "\033[32m[ScreenReader]\033[0m Queued " 
-                                        << utf8_text.length() << " chars from " 
-                                        << currentApp << " pending synthesis by Gemma.\n";
-                            }
-                        }
-                        else
-                        {
-                            std::cout << "\033[33m[ScreenReader]\033[0m Both UIA and OCR returned empty for " << currentApp << ". Nothing buffered.\n";
-                        }
-                    }
-                    else
-                    {
-                        std::cout << "\033[90m[ScreenReader]\033[0m '" << currentApp << "' is not in the capture list \u2014 skipping context read.\n";
+                        int size_needed = WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0, NULL, NULL);
+                        std::string utf8_text(size_needed, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, &text[0], (int)text.size(), &utf8_text[0], size_needed, NULL, NULL);
+                        DBHandler::BufferOCR(currentApp, windowTitle, utf8_text);
                     }
                 }
-                Sleep(2000);    // Stay in slow loop while they remain idle
-            }
-            else
-            {
-                // User is active. Check if we left the focus zone.
-                DWORD eventState = WaitForSingleObject(Jugnu::hDeepWorkEvent, 0);
-                if(eventState == WAIT_TIMEOUT)
+                else
                 {
-                    std::cout << "\033[90m[ScreenReader]\033[0m Left the focus zone screen capture entering standby.\n";
-                    wasHibernating = true;
-                    hasOcredWhileIdle = false;
-                    lastOcredApp = "";
-                    continue;
+                    std::cout << "\033[90m[ScreenReader]\033[0m Transient tab switch ignored.\n";
                 }
-
-
-
-                hasOcredWhileIdle = false;
-                lastOcredApp = "";
-                DWORD timeRemaining = 60000 - idleTime;
-                std::cout << "\033[90m[ScreenReader]\033[0m User is active. Screen guard sleeping for "
-                          << (timeRemaining / 1000) << "s.\n";
-                Sleep(timeRemaining);
             }
+
+            // GEAR 2: Active Typing Threshold Reached + 5s Pause
+            if(activeInputMs >= 60000 && timeSinceInput >= 5000)
+            {
+                activeInputMs = 0;  // reset
+                if(ShouldCapture(currentApp))
+                {
+                    std::wstring rawCode = GhostClipboard(nullptr, &g_lastMonacoRect);
+                    if(!rawCode.empty())
+                    {
+                        // Convert to UTF-8 and save to RAM cache ONLY! No database spam!
+                        int raw_size = WideCharToMultiByte(CP_UTF8, 0, &rawCode[0], (int)rawCode.size(), NULL, 0, NULL, NULL);
+                        std::string utf8_raw(raw_size, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, &rawCode[0], (int)rawCode.size(), &utf8_raw[0], raw_size, NULL, NULL);
+                        
+                        g_lastCodeBuffer = utf8_raw; 
+                        lastCodeBuffer = utf8_raw; // Update local scope tracking variable too
+                        std::cout << "\033[32m[ScreenReader]\033[0m Cached fresh code to RAM.\n";
+                    }
+                }
+            }
+            Sleep(1000); // 1-second background cadence
         }
         // COM/WinRT cleanup: winrt::init_apartment() manages its own apartment lifetime.
         // The OS automatically cleans up the thread's COM state on thread exit.

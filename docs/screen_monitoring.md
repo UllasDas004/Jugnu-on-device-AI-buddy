@@ -16,19 +16,28 @@ Jugnu operates as a background daemon but must strictly avoid stealing CPU cycle
 
 ---
 
-## 2. The 3-Tier Screen Reading Pipeline
+## 2. The Hybrid Capture Engine (Gear 1 & Gear 2)
 
-When a Deep Work app remains idle for 60 seconds, Jugnu attempts to extract text using a cascading system. 
+Previously, Jugnu used a static polling loop that fired a heavy UIA capture every time the user was idle for 60 seconds. This caused COM thread hangs on large files, generated massive SQLite DB spam, and often left the AI with stale context because the Python flush worker only ran every 60 seconds.
 
-### Tier 1: UI Automation (Structured JSON)
-**Technology:** Microsoft `IUIAutomation` COM API.
-This directly asks the active application (like VS Code or Chrome) to hand over its text tree. It uses a **Depth-First Search (DFS)** traversal with aggressive **ARIA Pruning**. It explicitly checks `get_CurrentIsOffscreen()` to skip hidden noise, and prunes purely structural nodes (`Pane`, `Group`) unless they contain meaningful text, compressing the payload size by 90%.
-- **The Output:** It extracts up to 5 of the longest, most meaningful sections on screen. It preserves parent-child relationships (a `Document` node absorbing its child `Text` nodes) but strictly isolates `Edit` nodes (code editors). It returns a structured JSON payload (`[{"type":"Edit", "name":"...", "text":"..."}, ...]`).
-- **Pros:** Instant, flawless accuracy, almost zero CPU overhead. Isolates the code editor from the surrounding prose.
+We replaced this with a highly optimized, context-aware dual-gear system:
+
+### Gear 1: Tab/Window Switch (10s Debounce)
+When the user switches to a new tab or window in a Focus App (like opening a new LeetCode problem), Jugnu waits for exactly 10 seconds.
+- **The Action:** If the user stays on the tab, Jugnu fires exactly ONE full UIA scan (combining the UI accessibility tree + Ghost Clipboard) and writes it to the SQLite `ocr_buffer`. 
+- **Why it's better:** By firing only once per tab switch, we capture the full problem description and initial code state without repeatedly spamming the heavy COM interface. This completely eliminates UI thread hanging during active work.
+
+### Gear 2: Active Typing Hot-Path (60s + 5s Pause)
+While the user is actively coding, Jugnu accumulates keystroke time. If the user hits 60 seconds of active typing and then pauses to think for 5 seconds, Jugnu shifts into Gear 2.
+- **The Action:** Jugnu fires a targeted Ghost Clipboard extraction. Crucially, this bypasses the UIA COM tree entirely, and instead of writing to the SQLite database, it saves the perfectly escaped code directly into a volatile `g_lastCodeBuffer` in RAM.
+- **Why it's better:** 
+  1. **Zero Disk I/O:** No SQLite DB spam, no Python wakeups, no disk writes while the user is in a flow state.
+  2. **Perfect Code Accuracy:** Ghost Clipboard explicitly copies the Monaco/VSCode editor buffer, avoiding UIA truncation or off-screen scroll issues.
+  3. **0ms Staleness:** When the 3-minute Stuck Timer eventually fires, it injects this hot RAM cache directly into the IPC payload. Gemma gets the exact code on screen instantly, completely bypassing the Python DB read pipeline.
 
 ### Tier 2: WGC + OCR (Hardware Accelerated via Native C++)
 **Technology:** Windows Graphics Capture (WGC) + `Windows.Media.Ocr` (MSVC C++/WinRT).
-If Tier 1 fails to find meaningful text, Jugnu takes a high-speed, invisible capture of the window into RAM and processes it directly on the GPU using the native Windows 10/11 OCR engine.
+If UIA fails to find meaningful text, Jugnu takes a high-speed, invisible capture of the window into RAM and processes it directly on the GPU using the native Windows 10/11 OCR engine.
 - **Pros:** Works on literally anything, including images, PDFs, and unsupported UIs.
 - **Cons:** Slightly heavier on the GPU than Tier 1. Produces a flat, unstructured text block.
 

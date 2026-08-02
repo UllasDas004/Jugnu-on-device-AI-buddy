@@ -1027,3 +1027,17 @@ These traps were discovered during the implementation of the Zero-IPC architectu
 ### Trap P-3: The Ghost Hint Trap (Persistent State)
 **Problem:** User reaches hint level 3, solves the problem, and comes back next month to practice again. Jugnu remembers hint level 3 and instantly barks the final solution at them.
 **Fix:** Fast substring heuristic for "Accepted". Flips `is_solved=True` in the SQLite `practice_sessions` table, automatically resetting the hint level to 0 for their next attempt.
+
+---
+
+## Group L: Practice Mode V4 Live-Fire Traps
+
+### Trap L-1: Raw Source Code in IPC JSON Payloads
+**Problem:** Injecting raw C++ or Python code (which inherently contains quotes, backslashes, and newlines) directly into a stringified JSON IPC payload in C++ causes fatal `JSONDecodeError`s on the Python side. 
+**Non-obvious:** A single stray tab or newline in the code buffer will break the entire IPC pipe read cycle.
+**Fix:** Explicit character-by-character escaping loop in C++ `win_monitor.cpp` to sanitize the string into a valid JSON literal before concatenation.
+
+### Trap L-2: Small LLMs Hallucinating Problem Constraints
+**Problem:** Gemma (gemma4:e2b) was fed a correct Minimax implementation for a LeetCode problem. The LLM rejected the code and gave a hint saying the user needed a "strictly greater" score, despite the provided problem text explicitly stating that ties are allowed.
+**Non-obvious:** The LLM's internalized training bias for standard game theory problems overrides the explicit text in its context window. It hallucinated a constraint that didn't exist, leading the user astray.
+**Fix:** Never trust a <10B parameter model as an authoritative code execution verifier. Jugnu's Practice Mode must use the UIA "Accepted" screen badge as the absolute ground truth for problem completion, rather than relying solely on the LLM's `IS_SOLVED` classification.

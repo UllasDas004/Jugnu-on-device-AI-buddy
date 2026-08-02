@@ -1,7 +1,9 @@
 #include "monitor/win_monitor.h"
 #include "monitor/memory_manager.h"
-#include "db/db_handler.h"
+#include "../db/db_handler.h"
 #include "server/ipc_server.h"
+#include "monitor/screen_reader.h"
+#include <iostream>
 #include <psapi.h> // for getWindowTextA
 #include <unordered_set>
 
@@ -293,7 +295,20 @@ namespace Jugnu
                 {
                     std::cout << "\n\033[1;31m[StuckTimer]\033[0m No activity for 3 minutes. Sending focus nudge to Python...\n";
                     const std::string& idleApp = lastMeaningfulApp.empty() ? currentForegroundProcess : lastMeaningfulApp;
-                    std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + idleApp + "\"}";
+                    
+                    std::string rawCode = Jugnu::ScreenReader::GetLastCodeBuffer();
+                    std::string escapedCode = "";
+                    for(char c : rawCode) {
+                        if(c == '\\') escapedCode += "\\\\";
+                        else if(c == '"') escapedCode += "\\\"";
+                        else if(c == '\n') escapedCode += "\\n";
+                        else if(c == '\r') escapedCode += "\\r";
+                        else if(c == '\t') escapedCode += "\\t";
+                        else if(c >= 0x00 && c <= 0x1f) { /* Skip other unprintable control characters */ }
+                        else escapedCode += c;
+                    }
+
+                    std::string idlePayload = "{\"type\": \"USER_IDLE\", \"current_app\": \"" + idleApp + "\", \"code\": \"" + escapedCode + "\"}";
                     Jugnu::IPCServer::SendMessageToPython(idlePayload);
                     hasTriggered = true;
                 }

@@ -32,7 +32,7 @@ class StateManager:
         """Called by FlushWorker after processing a UIA row. Caches the text so
         generate_prompt_context can still read it after ocr_buffer is cleared."""
         if text and text.strip():
-            self._last_screen_text[app_name] = text[:8000]
+            self._last_screen_text[app_name] = text
 
     def was_recently_coding(self, within_minutes = 15):
         """Returns True if user was in a coding app within the last N minutes."""
@@ -131,22 +131,26 @@ class StateManager:
         cached = self._last_screen_text.get(app, "")
         uia_text = ""
 
-        if cached:
-            uia_text = _format_uia_payload(cached)
-        else:
-            try:
-                conn = sqlite3.connect("jugnu.db", timeout=0.5)
-                row = conn.execute("SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
-
-                if not row or not row[0]:
-                    row = conn.execute("SELECT text_content FROM episodic_memories WHERE app_name = ? AND source_type = 'browser' ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
-                conn.close()
-
+        try:
+            conn = sqlite3.connect("jugnu.db", timeout=0.5)
+            # Try to get the absolute freshest from ocr_buffer first (C++ might have just dumped it)
+            row = conn.execute("SELECT raw_text FROM ocr_buffer WHERE app_name = ? ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
+            
+            if row and row[0]:
+                uia_text = _format_uia_payload(row[0])
+            elif cached:
+                # Fallback to the last processed payload in memory
+                uia_text = _format_uia_payload(cached)
+            else:
+                # Absolute last resort: episodic memories
+                row = conn.execute("SELECT text_content FROM episodic_memories WHERE app_name = ? AND source_type = 'browser' ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
                 if row and row[0]:
                     uia_text = _format_uia_payload(row[0])
-            
-            except Exception as e:
-                print(f"[StateManager] DB read error: {e}")
+            conn.close()
+        except Exception as e:
+            print(f"[StateManager] DB read error: {e}")
+            if cached:
+                uia_text = _format_uia_payload(cached)
         
         if uia_text:
             display = uia_text[:4000] + ("\n...[truncated]" if len(uia_text) > 4000 else "")

@@ -28,7 +28,7 @@ def _start_cooldown(seconds: float):
 
 # ── Core: spawn a new terminal window for the interaction ─────────────
 
-def _spawn_interaction_window(context_summary, sources):
+def _spawn_interaction_window(context_summary, sources, situation_type, context_chunks):
     """
     Writes context to a temp file, opens a new PowerShell window running
     jugnu_interact.py, waits for it to finish, reads the result.
@@ -53,7 +53,12 @@ def _spawn_interaction_window(context_summary, sources):
             pass
 
     with open(state_file, "w", encoding="utf-8") as f:
-        json.dump({"summary": context_summary}, f)
+        json.dump({
+            "summary": context_summary,
+            "mode":     "practice_hint" if situation_type == "CP_STUCK" else "general",
+            "hint_text": context_chunks[0] if (situation_type == "CP_STUCK" and context_chunks) else "",
+            "sources":   sources or [],
+            }, f)
 
     # Build the python command (use uv if available, else plain python)
     python_cmd = f'uv run python "{interact_script}" "{state_file}" "{result_file}"'
@@ -90,12 +95,18 @@ def _spawn_interaction_window(context_summary, sources):
 
     return result, proc, done_file
 
-# ── Main Orchestrator ─────────────────────────────────────────────────
+from ai_engine import AIEngine
+from state_manager import StateManager
 
-def trigger_flow(state, engine, embedder,
+def trigger_flow(state: StateManager, engine: AIEngine, embedder: Embedder,
                  search_query=None, context_chunks=None,
                  knowledge_docs=None, sources=None,
-                 screen_context=None, situation_type="GENERAL"):
+                 screen_context=None, situation_type="GENERAL",
+                 session_id=None, hint_id=None):
+    # Tell type checkers these are not None
+    assert engine is not None
+    assert embedder is not None
+
     # P0-FIX: non-blocking acquire — if another thread is already generating, bail out.
     if not _gen_lock.acquire(blocking=False):
         print("\033[90m[Notification] Already generating. Skipping duplicate trigger.\033[0m")
@@ -116,7 +127,7 @@ def trigger_flow(state, engine, embedder,
 
     summary = state.get_context_summary()
 
-    spawn_result = _spawn_interaction_window(summary, sources)
+    spawn_result = _spawn_interaction_window(summary, sources, situation_type, context_chunks)
     if isinstance(spawn_result, dict):
         result    = spawn_result
         proc      = None
@@ -125,6 +136,25 @@ def trigger_flow(state, engine, embedder,
         result, proc, done_file = spawn_result
 
     action = result.get("action", "decline")
+
+    # Handle practice hint feedback
+    if action == "hint_feedback" and hint_id is not None:
+        fb = result.get("feedback")
+
+        # We must import this here to avoid circular imports and fix the orphaned engine call
+        from practice_mode import log_feedback
+
+        if fb in (1, 0):
+            log_feedback(hint_id, user_feedback=fb)
+            _start_cooldown(5 * 60) # 5 minute cooldown for standard CP feedback
+        elif fb == "escalate":
+            log_feedback(hint_id, user_feedback=0)  # treat as "not helpful"
+            _start_cooldown(0) # NO cooldown - user wants immediate deeper help
+            _gen_lock.release()
+            return "escalate" # Return this signal back to ipc_client
+            
+        _gen_lock.release()
+        return fb
 
     if action == "decline":
         _gen_lock.release()
