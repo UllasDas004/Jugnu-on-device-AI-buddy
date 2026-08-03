@@ -1037,7 +1037,15 @@ These traps were discovered during the implementation of the Zero-IPC architectu
 **Non-obvious:** A single stray tab or newline in the code buffer will break the entire IPC pipe read cycle.
 **Fix:** Explicit character-by-character escaping loop in C++ `win_monitor.cpp` to sanitize the string into a valid JSON literal before concatenation.
 
-### Trap L-2: Small LLMs Hallucinating Problem Constraints
-**Problem:** Gemma (gemma4:e2b) was fed a correct Minimax implementation for a LeetCode problem. The LLM rejected the code and gave a hint saying the user needed a "strictly greater" score, despite the provided problem text explicitly stating that ties are allowed.
-**Non-obvious:** The LLM's internalized training bias for standard game theory problems overrides the explicit text in its context window. It hallucinated a constraint that didn't exist, leading the user astray.
-**Fix:** Never trust a <10B parameter model as an authoritative code execution verifier. Jugnu's Practice Mode must use the UIA "Accepted" screen badge as the absolute ground truth for problem completion, rather than relying solely on the LLM's `IS_SOLVED` classification.
+### Trap L-2: Small LLMs Hallucinating Problem Constraints & Formats
+**Problem:** Gemma (gemma4:e2b) was fed a correct Minimax implementation for a LeetCode problem. The LLM rejected the code and gave a hint saying the user needed a "strictly greater" score, despite the provided problem text explicitly stating that ties are allowed. Furthermore, it would sometimes hallucinate the `EFFICIENCY_REVIEW` block even when the code was wrong, causing the regex parser to falsely mark it as solved.
+**Non-obvious:** Small <10B models rely heavily on pattern-matching their training data (standard game theory problems, DP optimization templates) and conversational politeness. If a user provides an $O(N^2)$ solution where $N \le 20$, the model will reject it for not being $O(N)$ because it ignores the constraints in favor of the template.
+**Fix:** 
+1. **Constraint-Aware Prompts:** We explicitly instruct the LLM in the prompt to evaluate the Big-O time and space complexity against the stated problem constraints before deciding if an approach is optimal.
+2. **XML Delimiters:** We wrapped the problem, code, past hints, and feedback in strict `<problem>`, `<code>`, etc. XML tags. This forcibly isolates the context and prevents the small model's attention from bleeding.
+3. **Explicit Binary Flags:** The parser now strictly requires `IS_SOLVED: 1` to be present before it even attempts to parse for an efficiency review, neutralizing conversational hallucinations.
+
+### Trap L-3: The Infinite Redundant DB Write
+**Problem:** When Gemma correctly verified a solution as solved, Python wrote `is_solved = 1` to the SQLite `knowledge_docs` and `practice_sessions` tables. If the user stayed on the same LeetCode page for another 5 minutes reading the editorial, the `USER_IDLE` timer would fire again. Gemma would verify it again, and Python would write to the DB again, pointlessly spinning the SSD and doing repetitive SQLite merges.
+**Fix:** 
+Implemented an in-memory `_SESSION_CACHE` bypass (Lazy DB Writes). Before triggering the DB update, Python checks `db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1`. If true, it skips the DB write completely and directly routes the UI notification.

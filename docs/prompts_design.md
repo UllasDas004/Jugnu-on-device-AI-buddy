@@ -175,65 +175,42 @@ The onboarding is complete. Give a warm, 2-sentence closing statement expressing
 
 ---
 
-## 4. Practice Mode Prompts (Phase 6)
+## 4. Practice Mode Prompts (Phase 8)
 *(Designed for Competitive Programming to simulate a Socratic human interviewer).*
 
-### A. The Unified Socratic Hint Engine
-**Function:** `generate_practice_hint()`
-**Temperature:** 0.2 (with `think=False` and `flash_attn=False`)
-**Purpose:** Replaces the old rigid hint-level system. Uses a single Gemma call to simultaneously evaluate the code, deduce the approach, detect if it's solved, and generate a progressive interview-style hint without writing code.
+### A. The Unified Constraint-Aware Correctness Gate & Hint Engine
+**Function:** `check_code_correctness()`
+**Temperature:** 0.2 (with no strict token truncation to allow full reasoning)
+**Purpose:** A single, unified Gemma call that simultaneously evaluates correctness against problem constraints, deduces the algorithmic approach, detects if it's solved, and generates EITHER an efficiency review OR a progressive interview-style hint. Uses strict XML delimiters to separate context and enforce output formatting.
 
 **Prompt Template:**
 ```text
-You are Jugnu, a senior competitive programming coach running a mock interview.
-Developer state: {user_state}. They need a HINT — not a solution.
+<problem>
+{content}
+</problem>
 
-PROBLEM STATEMENT:
-{problem_content}
+<code>
+{code}
+</code>
 
-ALGORITHMIC INSIGHT (FOR YOUR EYES ONLY — DO NOT REVEAL DIRECTLY):
-{problem_notes}
+<past_hints>
+- {hint_1}
+- {hint_2}
+</past_hints>
 
-DEVELOPER'S CURRENT CODE:
-```
-{current_code}
-```
-{history_section}
-{feedback_str}
+<feedback>
+USER FEEDBACK ON LAST HINT: '{last_feedback}' (Adjust your next hint accordingly!)
+</feedback>
 
-ABSOLUTE RULES:
-1. DO NOT write any code, pseudocode, or syntax in the hint.
-2. Frame your hint as a Socratic question or observation to guide them (1-2 sentences max).
-3. Tailor the hint specifically to their current code and progress. If they are far off track, gently nudge them toward the right approach. If they are close, point out the specific logic flaw.
-4. Output EXACTLY in this format:
-APPROACH: <Describe their current approach in 2-5 words>
-IS_SOLVED: <1 if their code completely and correctly solves the problem, otherwise 0>
-TYPE: <A 1-2 word category for this hint (e.g. Conceptual, Logic Flaw, Edge Case, etc)>
-HINT: <Your 1-2 sentence hint ending with a question>
-```
-
-### B. The Efficiency Reviewer
-**Function:** `generate_efficiency_review()`
-**Temperature:** 0.3
-**Purpose:** Once the C++ tests pass or Gemma detects `IS_SOLVED=1`, this prompt generates a congratulatory code review focusing on time/space complexity and optimization, matching the feeling of finishing an interview.
-
-**Prompt Template:**
-```text
-You are Jugnu, a senior competitive programming coach.
-The developer has just successfully solved the problem '{problem_slug}'.
-
-PROBLEM STATEMENT:
-{problem_content}
-
-DEVELOPER'S CORRECT CODE:
-```
-{current_code}
-```
-
-TASK:
-Provide a brief, encouraging code review.
-1. State the time and space complexity of their solution.
-2. Point out any redundant operations or ways to make it more elegant/optimal.
-3. If it's already optimal, praise them and explain why it's the best approach.
-Keep it concise, max 3-4 sentences. Do NOT write full alternative solutions.
+<task>
+1. Evaluate whether this code produces correct output for ALL valid inputs given the constraints above. You MUST check: (a) Is the algorithm logically correct? (b) Does the solution's time/space complexity fit within the problem's constraints? A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct.
+2. If the code is correct AND efficient enough for the constraints, respond ONLY with these two lines:
+   IS_SOLVED: 1
+   EFFICIENCY_REVIEW: <brief encouraging review covering time/space complexity and any potential optimizations, max 3-4 sentences>
+3. If the code is INCORRECT, has wrong logic, or is too slow/memory-heavy for the stated constraints, respond ONLY with:
+   APPROACH: <Describe their current approach in 2-5 words>
+   IS_SOLVED: 0
+   TYPE: <A 1-2 word hint category>
+   HINT: <Your 1-2 sentence Socratic hint ending with a question. DO NOT repeat past hints!>
+</task>
 ```

@@ -55,8 +55,8 @@ def _spawn_interaction_window(context_summary, sources, situation_type, context_
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump({
             "summary": context_summary,
-            "mode":     "practice_hint" if situation_type == "CP_STUCK" else "general",
-            "hint_text": context_chunks[0] if (situation_type == "CP_STUCK" and context_chunks) else "",
+            "mode":     "practice_hint" if situation_type == "CP_STUCK" else ("practice_solved" if situation_type == "CP_SOLVED" else "general"),
+            "hint_text": context_chunks[0] if (situation_type in ("CP_STUCK", "CP_SOLVED") and context_chunks) else "",
             "sources":   sources or [],
             }, f)
 

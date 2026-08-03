@@ -648,3 +648,27 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 **Situation:** The user wrote a perfectly correct Minimax algorithm for LeetCode 486 (Predict the Winner), explicitly tracking `isPlayer1` state.
 **Problem:** Gemma (`gemma4:e2b`) failed to recognize the logic as correct because it deviated from the typical condensed single-state textbook solution. Furthermore, Gemma hallucinated a constraint, insisting Player 1 needed a "strictly greater" score, when the problem explicitly stated ties go to Player 1.
 **Solution:** This reinforces a critical architectural rule: Small, local LLMs cannot be trusted as authoritative code correctness validators for complex logic without explicit execution contexts. They hallucinate constraints. The `Practice Mode` should rely primarily on actual UIA "Accepted" badges for authoritative solve detection, and prompts must explicitly instruct the LLM to carefully verify against the provided problem statement before claiming code is incorrect.
+
+---
+
+## Category 11: LLM Prompting & Practice Mode Traps
+
+### EC-PM1 — The "Hallucinated Success" Problem
+**Situation:** Small 4B parameter models like Gemma are heavily instruction-tuned for conversational politeness. If a user provided an obviously wrong $O(N^3)$ solution to a problem, Gemma would correctly identify the logic flaw, but end its message with: *"Great attempt! Here is your EFFICIENCY_REVIEW: This solution uses $O(N^3)$ time..."* The Python regex parser saw `EFFICIENCY_REVIEW` and instantly flagged the problem as solved.
+**Solution:**
+- We introduced strict structural gates via XML delimiters `<task>`.
+- The prompt explicitly forces the model to output a binary commit: `IS_SOLVED: 1` or `IS_SOLVED: 0` on the very first line of its reasoning block.
+- The Python parser now strictly requires `IS_SOLVED: 1` to be present before it even attempts to parse for the `EFFICIENCY_REVIEW` block, completely neutralizing conversational hallucinations.
+
+### EC-PM2 — The "Template Pattern Matching" Problem
+**Situation:** User submitted an $O(N^2)$ dynamic programming solution for LeetCode's *Stone Game*. The problem constraints explicitly state $N \le 20$. The LLM rejected the code, saying *"You need to optimize this to $O(N)$."* It was pattern-matching against generic DP optimization templates in its training data, ignoring the fact that for $N=20$, $N^2 = 400$ operations is mathematically optimal.
+**Solution:**
+- Constraint-Aware Prompting. We explicitly instruct the LLM: *"Does the solution's time/space complexity fit within the problem's constraints? A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct."*
+- This forces the LLM to mathematically derive the state space and evaluate it against the parsed constraints (which are guaranteed to be in the OKF Context) before deciding if an approach is optimal.
+
+### EC-PM3 — The "Infinite Redundant DB Write" Problem
+**Situation:** When Gemma correctly verified a solution as solved, Python wrote `is_solved = 1` to the `knowledge_docs` table and `practice_sessions`. If the user stayed on the same LeetCode page for another 5 minutes reading the editorial, the `USER_IDLE` timer would fire again. Gemma would verify it again, and Python would write to the DB again, pointlessly spinning the SSD.
+**Solution:**
+- Implemented an in-memory `_SESSION_CACHE` bypass (Lazy DB Writes).
+- Before triggering the DB update, Python checks `db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1`.
+- If true, it skips the DB write completely and directly routes the UI notification.

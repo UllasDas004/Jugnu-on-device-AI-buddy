@@ -18,12 +18,13 @@ from flush_worker import (
     _parse_cp_url
 )
 from practice_mode import (
-    classify_state, 
-    get_or_create_session, 
-    get_last_hints, 
+    classify_state,
+    get_or_create_session,
+    get_last_hints,
     get_last_hint_id,
     update_session,
-    log_hint
+    log_hint,
+    flush_session_to_db
 )
 from sentence_transformers import SentenceTransformer
 import ollama
@@ -330,141 +331,140 @@ def _idle_handler_background(state, engine, embedder, screen_context, ipc_code="
             if not current_code.strip():
                 print(f"{_YELLOW}[IPC-BG] Practice mode: no code snapshot yet. Skipping hint.{_RESET}")
             else:
-                # --- LLM CORRECTNESS GATE ---
-                # Check if the code is actually correct before we try to give a hint.
-                # This catches the edge case where the user solved it, but hasn't submitted yet,
-                # or submitted but the UIA hasn't captured the 'Accepted' badge yet.
-                correctness = engine.check_code_correctness(current_code, top_doc.get("content", ""))
-                if correctness == "correct":
-                    print(f"{_GREEN}[IPC-BG] Gemma verified code is CORRECT! Marking '{slug}' as solved and generating efficiency review.{_RESET}")
-                    embedder.mark_problem_solved(slug, platform)
-                    # Generate efficiency review instead of practice hint
-                    import practice_mode
-                    review_text = practice_mode.generate_efficiency_review(
-                        problem_content = top_doc.get("content", ""),
-                        current_code = current_code,
-                        problem_slug = slug,
-                        platform = platform,
-                    )
-                    
+                # Step 1: Get or create session (fast SQLite lookup)
+                session = get_or_create_session(slug, platform)
+                if not session:
+                    return
+                session_id = session["id"]
+
+                # Layer 1: Lightweight state gate
+                last_snapshot = session.get("code_snapshot")
+                user_state = classify_state(current_code, last_snapshot)
+                print(f"{_CYAN}[IPC-BG] User state: {user_state}{_RESET}")
+
+                if user_state == "READING":
+                    print(f"{_YELLOW}[IPC-BG] Not enough code yet — skipping hint.{_RESET}")
+                    return
+
+                # Layer 2: Fetch hint history + last feedback
+                hint_type_history = []
+                try:
+                    hint_type_history = json.loads(session.get("hint_type_history") or "[]")
+                except Exception:
+                    hint_type_history = []
+
+                last_feedback = None
+                try:
+                    lhid = get_last_hint_id(session_id)
+                    if lhid:
+                        conn_tmp = sqlite3.connect(DB_PATH, timeout=5.0)
+                        row_tmp = conn_tmp.execute(
+                            "SELECT user_feedback FROM practice_hints WHERE id = ?", (lhid,)
+                        ).fetchone()
+                        conn_tmp.close()
+                        if row_tmp:
+                            last_feedback = row_tmp[0]
+                except Exception:
+                    pass
+
+                # Fetch conversation history (last 3 hints)
+                hint_history = get_last_hints(session_id, n=3)
+
+                # --- SINGLE LLM CALL: CORRECTNESS CHECK + RESPONSE GENERATION ---
+                result = engine.check_code_correctness(
+                    current_code, 
+                    top_doc.get("content", ""),
+                    hint_history=hint_history,
+                    last_feedback=last_feedback
+                )
+
+                if result["type"] == "efficiency_review":
+                    # Code is correct — show efficiency review.
+                    # Only hit the DB if this is a NEW solve (was not solved before this session).
+                    db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1
+
+                    if not db_was_already_solved:
+                        print(f"{_GREEN}[IPC-BG] NEW SOLVE! Marking '{slug}' as solved in DB.{_RESET}")
+                        embedder.mark_problem_solved(slug, platform)        # knowledge_docs.is_solved = 1
+                        update_session(slug=slug, platform=platform, code_snapshot=current_code, is_solved=1)
+                        flush_session_to_db(slug)                           # practice_sessions.is_solved = 1
+                    else:
+                        print(f"{_GREEN}[IPC-BG] Gemma verified code is CORRECT! (Already marked solved in DB — skipping redundant write){_RESET}")
+                        # Still update code snapshot so next cycle delta-compares correctly
+                        update_session(slug=slug, platform=platform, code_snapshot=current_code)
+                        flush_session_to_db(slug)
+
                     practice_sources = [f"{platform.capitalize()}: {slug} (Efficiency Review)"]
                     notification.trigger_flow(
                         state, engine, embedder,
                         search_query   = search_query,
-                        context_chunks = [review_text],
+                        context_chunks = [result["content"]],
                         knowledge_docs = [],
                         sources        = practice_sources,
                         screen_context = screen_context,
-                        situation_type = "GENERAL", # Use general so it doesn't trigger the 1/2/3 practice menu
+                        situation_type = "CP_SOLVED", # Directly show review in UI without re-running LLM
                     )
-                    # We still want to update the session code snapshot
-                    session = get_or_create_session(slug, platform)
-                    if session:
-                        update_session(slug=slug, platform=platform, code_snapshot=current_code, is_solved=1)
-                        practice_mode.flush_session_to_db(slug)
-                    
+
                     return # always return if we handled practice flow
                 else:
-                    # Step 1: Get or create session (fast SQLite lookup)
-                    session = get_or_create_session(slug, platform)
+                    # Code is incorrect or incomplete - generate practice hint
+                    # Update snapshot so NEXT cycle compares against THIS code
+                    update_session(slug=slug, platform=platform, code_snapshot=current_code)
 
-                    if session:
-                        session_id = session["id"]
+                    # Extract hint data from the combined LLM call
+                    hint_type = result["hint_type"]
+                    hint_text = result["content"]
+                    approach = result["approach"]
+                    is_solved = result["is_solved"]  # Should be 0 for incorrect code
 
-                        # Layer 1: Lightweight state gate
-                        last_snapshot = session.get("code_snapshot")
-                        user_state = classify_state(current_code, last_snapshot)
-                        print(f"{_CYAN}[IPC-BG] User state: {user_state}{_RESET}")
+                    # Log the hint and get hint_id for feedback tracking
+                    hint_id = log_hint(
+                        session_id    = session_id,
+                        hint_type     = hint_type,
+                        hint_text     = hint_text,
+                        user_state    = user_state,
+                        code_snapshot = current_code,
+                        approach      = approach,
+                    )
 
-                        if user_state == "READING":
-                            print(f"{_YELLOW}[IPC-BG] Not enough code yet — skipping hint.{_RESET}")
-                        else:
-                            # Update snapshot so NEXT cycle compares against THIS code
-                            update_session(slug=slug, platform=platform, code_snapshot=current_code)
+                    # Update hint_type_history in session
+                    hint_type_history.append(hint_type)
+                    update_session(
+                        slug = slug,
+                        platform = platform,
+                        last_hint_type = hint_type,
+                        hint_type_history = json.dumps(hint_type_history[-10:]),
+                        detected_approach = approach,
+                        is_solved = is_solved
+                    )
+                    flush_session_to_db(slug)
 
-                            # Layer 2: Fetch hint history + last feedback
-                            hint_type_history = []
-                            try:
-                                hint_type_history = json.loads(session.get("hint_type_history") or "[]")
-                            except Exception:
-                                hint_type_history = []
+                    # Display
+                    practice_sources = [
+                        f"{platform.capitalize()}: {slug} "
+                        f"(Practice — {hint_type.replace('_', ' ').title()} | {user_state})"
+                    ]
+                    fb_result = notification.trigger_flow(
+                        state, engine, embedder,
+                        search_query   = search_query,
+                        context_chunks = [hint_text],
+                        knowledge_docs = [],
+                        sources        = practice_sources,
+                        screen_context = screen_context,
+                        situation_type = "CP_STUCK",
+                        session_id     = session_id,
+                        hint_id        = hint_id,
+                    )
+                    # If the user clicked "3" (Go Deeper), instantly fire the next hint cycle
+                    if fb_result == "escalate":
+                        print(f"{_YELLOW}[Practice] Escalate triggered. Firing next hint immediately...{_RESET}")
+                        threading.Thread(
+                            target=_idle_handler_background,
+                            args=(state, engine, embedder, screen_context),
+                            daemon=True
+                        ).start()
 
-                            last_feedback = None
-                            try:
-                                lhid = get_last_hint_id(session_id)
-                                if lhid:
-                                    conn_tmp = sqlite3.connect(DB_PATH, timeout=5.0)
-                                    row_tmp = conn_tmp.execute(
-                                        "SELECT user_feedback FROM practice_hints WHERE id = ?", (lhid,)
-                                    ).fetchone()
-                                    conn_tmp.close()
-                                    if row_tmp:
-                                        last_feedback = row_tmp[0]
-                            except Exception:
-                                pass
-
-                            # Fetch conversation history (last 3 hints)
-                            hint_history = get_last_hints(session_id, n=3)
-
-                            # Single Gemma call: evaluates code direction & generates hint text
-                            import practice_mode
-                            hint_type, hint_text, approach, is_solved = practice_mode.generate_practice_hint(
-                                problem_content = top_doc.get("content", ""),
-                                problem_notes   = top_doc.get("notes", ""),
-                                current_code    = current_code,
-                                hint_history    = hint_history,
-                                last_feedback   = last_feedback,
-                                user_state      = user_state,
-                            )
-                            print(f"{_CYAN}[IPC-BG] Hint generated with type: {hint_type}{_RESET}")
-                            # Log the hint and get hint_id for feedback tracking
-                            hint_id = log_hint(
-                                session_id    = session_id,
-                                hint_type     = hint_type,
-                                hint_text     = hint_text,
-                                user_state    = user_state,
-                                code_snapshot = current_code,
-                                approach      = approach,
-                            )
-
-                            # Update hint_type_history in session
-                            hint_type_history.append(hint_type)
-                            update_session(
-                                slug = slug,
-                                platform = platform,
-                                last_hint_type = hint_type,
-                                hint_type_history = json.dumps(hint_type_history[-10:]),
-                                detected_approach = approach,
-                                is_solved = is_solved
-                            )
-                            practice_mode.flush_session_to_db(slug)
-
-                            # Display
-                            practice_sources = [
-                                f"{platform.capitalize()}: {slug} "
-                                f"(Practice — {hint_type.replace('_', ' ').title()} | {user_state})"
-                            ]
-                            fb_result = notification.trigger_flow(
-                                state, engine, embedder,
-                                search_query   = search_query,
-                                context_chunks = [hint_text],
-                                knowledge_docs = [],
-                                sources        = practice_sources,
-                                screen_context = screen_context,
-                                situation_type = "CP_STUCK",
-                                session_id     = session_id,
-                                hint_id        = hint_id,
-                            )
-                            # If the user clicked "3" (Go Deeper), instantly fire the next hint cycle
-                            if fb_result == "escalate":
-                                print(f"{_YELLOW}[Practice] Escalate triggered. Firing next hint immediately...{_RESET}")
-                                threading.Thread(
-                                    target=_idle_handler_background,
-                                    args=(state, engine, embedder, screen_context),
-                                    daemon=True
-                                ).start()
-
-                        return   # always return if we handled practice flow — don't fall through to generic flow
+                return   # always return if we handled practice flow — don't fall through to generic flow
                     
                     
     # ── NORMAL FLOW (CP_READING, unsolved problems, non-CP sessions) ───────

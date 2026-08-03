@@ -1,13 +1,7 @@
-import sqlite3
-import difflib
 import ollama
 import os
 from datetime import datetime, timezone
-import re
-import sqlite3
 from pathlib import Path
-from typing import Dict
-import difflib
 
 # ----------------------------------------------------------------------
 # Path to the SQLite jugnu.db that the C++ side also uses.
@@ -493,25 +487,134 @@ class AIEngine:
             pass
         return topic
 
-    def check_code_correctness(self, code: str, content: str) -> str:
+    def check_code_correctness(self, code: str, content: str, hint_history: list[str] = None, last_feedback: str = None) -> dict:
         """
-        Fast LLM gate to check if the code correctly solves the problem.
-        Returns 'correct' or 'incomplete'.
+        Combined LLM gate to check if the code correctly solves the problem and generate appropriate response.
+        If correct: returns efficiency review
+        If incorrect: returns practice hint data
+        Returns dict with keys:
+          - type: 'efficiency_review' or 'practice_hint'
+          - content: the generated text (review or hint)
+          - approach: current approach description (only for practice_hint)
+          - hint_type: hint category (only for practice_hint)
+          - is_solved: 0 or 1 (only for practice_hint)
         """
+        history_text = ""
+        if hint_history:
+            history_text = "<past_hints>\n" + "\n".join(f"- {h}" for h in hint_history) + "\n</past_hints>\n\n"
+            
+        feedback_text = ""
+        if last_feedback:
+            feedback_text = f"<feedback>\nUSER FEEDBACK ON LAST HINT: '{last_feedback}' (Adjust your next hint accordingly!)\n</feedback>\n\n"
+
         prompt = (
-            f"Problem:\n{content[:400]}\n\n"
-            f"Code:\n{code[:600]}\n\n"
-            "Does this code correctly solve the problem? Answer ONLY with the word 'correct' or 'incomplete'."
+            f"<problem>\n{content}\n</problem>\n\n"
+            f"<code>\n{code}\n</code>\n\n"
+            f"{history_text}{feedback_text}"
+            "<task>\n"
+            "1. Evaluate whether this code produces correct output for ALL valid inputs given the constraints above. "
+            "You MUST check: (a) Is the algorithm logically correct? "
+            "(b) Does the solution's time/space complexity fit within the problem's constraints? "
+            "A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct.\n"
+            "2. If the code is correct AND efficient enough for the constraints, respond ONLY with these two lines:\n"
+            "   IS_SOLVED: 1\n"
+            "   EFFICIENCY_REVIEW: <brief encouraging review covering time/space complexity and any potential optimizations, max 3-4 sentences>\n"
+            "3. If the code is INCORRECT, has wrong logic, or is too slow/memory-heavy for the stated constraints, respond ONLY with:\n"
+            "   APPROACH: <Describe their current approach in 2-5 words>\n"
+            "   IS_SOLVED: 0\n"
+            "   TYPE: <A 1-2 word hint category>\n"
+            "   HINT: <Your 1-2 sentence Socratic hint ending with a question. DO NOT repeat past hints!>\n"
+            "</task>"
         )
+        print("COMBINED CORRECTNESS CHECK & RESPONSE GENERATION")
+        print(prompt)
         try:
+            # CRITICAL: think=True is intentional here. Correctness evaluation on algorithmic
+            # code requires the model to trace through the logic step-by-step before answering.
+            # With think=False, Gemma pattern-matches on code structure and gives wrong verdicts
+            # (e.g. labelling a correct DP solution as "Logic Flaw" because index variable names
+            # look unusual). The thinking block is discarded — only `content` is parsed.
             response = ollama.chat(
-                model=self.model_name, messages=[{"role": "user", "content": prompt}], think=False,
-                options={"num_ctx": 1536, "num_predict": 10, "temperature": 0.0, "flash_attn": False}
+                model=self.model_name, messages=[{"role": "user", "content": prompt}], think=True,
+                options={"num_ctx": 8192, "num_predict": -1, "temperature": 0.0, "flash_attn": False}
             )
+            # TRAP FIX: newer ollama library returns a Pydantic ChatResponse object,
+            # not a plain dict. We must use attribute access, not .get().
+            # Use `or ''` everywhere — content/thinking can be None, not just missing.
             if hasattr(response, 'message') and response.message:
-                ans = (response.message.content or '').strip().lower()
-                if "correct" in ans and "incomplete" not in ans:
-                    return "correct"
+                content  = (response.message.content  or '').strip()
+                thinking = (getattr(response.message, 'thinking', None) or '').strip()
+            else:
+                # Fallback for old dict-style response format
+                msg      = (response or {}).get('message', {}) or {}
+                content  = (msg.get('content')  or '').strip()
+                thinking = (msg.get('thinking') or '').strip()
+
+            # For debugging
+            print(f"DEBUG: content='{content}', thinking='{thinking}'")
+
+            # Parse the response
+            content_upper = content.upper().strip()
+
+            has_solved_flag = "IS_SOLVED: 1" in content_upper
+            has_efficiency_review = "EFFICIENCY_REVIEW:" in content_upper
+
+            if has_efficiency_review and has_solved_flag:
+                # Extract the efficiency review text
+                # Find the EFFICIENCY_REVIEW line and grab everything after the colon
+                # We truncate at APPROACH: in case Gemma hallucinates both blocks.
+                review_text = content[content_upper.index("EFFICIENCY_REVIEW:") + len("EFFICIENCY_REVIEW:"):].strip()
+                if "APPROACH:" in review_text.upper():
+                    review_text = review_text[:review_text.upper().index("APPROACH:")].strip()
+                elif "\n\n" in review_text:
+                    review_text = review_text.split("\n\n")[0].strip()
+                    
+                return {
+                    "type": "efficiency_review",
+                    "content": review_text,
+                    "approach": None,
+                    "hint_type": None,
+                    "is_solved": None
+                }
+            else:
+                # Parse practice hint format
+                approach = "unknown"
+                hint_type = "CONCEPTUAL"
+                hint_text = "What's your current thinking on the approach?"
+                is_solved = 0
+
+                lines = content.splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if line.upper().startswith("APPROACH:"):
+                        approach = line.split(":", 1)[1].strip()
+                    elif line.upper().startswith("TYPE:"):
+                        extracted = line.split(":", 1)[1].strip()
+                        extracted = "".join(c for c in extracted if c.isalpha() or c == '_')
+                        if extracted:
+                            hint_type = extracted
+                    elif line.upper().startswith("HINT:"):
+                        hint_text = line.split(":", 1)[1].strip()
+                        # Add any continuation lines
+                        for i in range(lines.index(line) + 1, len(lines)):
+                            if lines[i].strip():
+                                hint_text += " " + lines[i].strip()
+                        break
+
+                return {
+                    "type": "practice_hint",
+                    "content": hint_text,
+                    "approach": approach,
+                    "hint_type": hint_type,
+                    "is_solved": is_solved
+                }
         except Exception as e:
             print(f"\033[1;31m[AIEngine] check_code_correctness error: {e}\033[0m")
-        return "incomplete"
+            # Fallback to practice hint on error
+            return {
+                "type": "practice_hint",
+                "content": "What's your current thinking on the approach?",
+                "approach": "unknown",
+                "hint_type": "CONCEPTUAL",
+                "is_solved": 0
+            }

@@ -90,16 +90,29 @@ namespace Jugnu
     // How this works:
     // 1. We create an IUIAutomation COM object — this is Windows' accessibility engine.
     // 2. We get the UIA element for the target window (the Chrome/VS Code process).
-    // 3. We do a breadth-first search (BFS) through all child elements in the UIA tree.
-    // 4. For each element, we query its IUIAutomationTextPattern.
+    // 3. We prepare a Tree walker and do a depth-first search (DFS) through all child elements in the UIA tree.
+    // 4. For each visible element, we query its IUIAutomationTextPattern and IUIAutomationValuePattern.
     //    TextPattern is the UIA interface for reading raw text from any control.
-    // 5. We pick the element with the LONGEST text — this is almost always the code editor.
-    // 6. GetText(-1, ...) returns the complete text with correct newlines + indentation.
-    //    The -1 argument means "no character limit — give me everything".
+    // 5. We apply ARIA landmark pruning: we skip 'complementary' and 'contentinfo' regions (ads, comments, footers)
+    //    but keep 'navigation' and 'banner' to capture URL/page title from RootWebArea.
+    // 6. We filter elements by content type: only Edit, Document, and Text controls are considered.
+    // 7. We also check if an element is within an ARIA 'main' landmark for priority boosting.
+    // 8. We deduplicate overlapping text sections to avoid redundancy.
+    // 9. For Edit controls (code editors), we track the longest one for potential Ghost Clipboard use.
+    // 10. We sort candidates by type priority (Edit > Document > Text) then by text length.
+    // 11. We extract URL and page title from the RootWebArea element via LegacyIAccessiblePattern.
+    // 12. If allowGhostClipboard is true and we have a Monaco editor, we override its content
+    //     with the full buffer obtained via synthetic Ctrl+A/Ctrl+C.
+    // 13. We serialize the results as a JSON array for Python consumption.
     //
-    // Why BFS instead of searching for a specific control type?
+    // Why DFS instead of BFS?
+    //   DFS with a stack is more memory-efficient for deep UI trees and processes visually
+    //   prominent elements first when children are pushed in reverse order.
+    //
+    // Why type-based sorting instead of just longest text?
     //   Monaco (LeetCode, VS Code) can register as Document, Edit, or Group depending
-    //   on the Chrome version. Searching for the longest text is universal and robust.
+    //   on the Chrome version. We prioritize Edit controls (raw code) over Document
+    //   (rich text like markdown previews) to avoid noise, then fall back to length.
     // ─────────────────────────────────────────────────────────────────────────
 
     struct UiaSection
@@ -371,7 +384,7 @@ namespace Jugnu
             return L"";
         }
 
-        // 3. Prepare the Tree walker for manual BFS
+        // 3. Prepare the Tree walker for manual DFS
         IUIAutomationTreeWalker* pWalker = nullptr;
         pAutomation->get_ControlViewWalker(&pWalker);
         if(!pWalker)
@@ -695,7 +708,7 @@ namespace Jugnu
                 }
             }
             else
-                std::cout << "\033[33m[ScreenReader] Ghost Clipboard returned empty — using UIA window text.\033[0m\n";
+                std::cout << "\033[33m[ScreenReader] Ghost Clipboard returned empty - using UIA window text.\033[0m\n";
         }
         // ─────────────────────────────────────────────────────────────────────────
 

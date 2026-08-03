@@ -122,7 +122,6 @@ namespace Jugnu
             return;
         }
         
-        // SAVE TO THE DATABASE
         Jugnu::MemoryManager::ProcessAppSwitch(processName, windowTitle);
 
         
@@ -273,7 +272,7 @@ namespace Jugnu
 
             if(wasHibernating)
             {
-                std::cout << "\033[1;32m[StuckTimer]\033[0m Focus session detected — idle guard is active.\n";
+                std::cout << "\033[1;32m[StuckTimer]\033[0m Focus session detected - idle guard is active.\n";
                 wasHibernating = false;
             }
 

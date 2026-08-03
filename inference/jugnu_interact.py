@@ -56,6 +56,25 @@ def main():
 
     mode      = state.get("mode", "general")
     hint_text = state.get("hint_text", "")
+    
+    if mode == "practice_solved" and hint_text:
+        sources_str = ", ".join(state.get("sources", []))
+        _print_box(
+            f"🏆  Jugnu — Code Accepted!",
+            [
+                f"\033[90m{sources_str}\033[0m" if sources_str else "",
+                "",
+                hint_text,
+                "",
+                "\033[90m[N]\033[0m  Dismiss",
+            ],
+            color="32"
+        )
+        _ask("\n  Press Enter to dismiss [default: N]: ", ["n", ""])
+        result = {"action": "dismiss"}
+        _write_and_exit(result, result_path)
+        return
+
     if mode == "practice_hint" and hint_text:
         sources_str = ", ".join(state.get("sources", []))
         _print_box(

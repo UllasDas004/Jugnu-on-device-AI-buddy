@@ -21,10 +21,10 @@ namespace Jugnu
         // We must force SQLite to be thread-safe before opening it.
         sqlite3_config(SQLITE_CONFIG_SERIALIZED);
 
-        // TRAP FIX: Register sqlite-vec natively before openning!
+        // TRAP FIX: Register sqlite-vec natively before opening!
         sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);
 
-        // Open the database with the FULLMUTEX flag ti serialize concurrent access
+        // Open the database with the FULLMUTEX flag to serialize concurrent access
         int rc = sqlite3_open_v2(
             dbPath.c_str(),
             &db,
@@ -103,7 +103,7 @@ namespace Jugnu
         if(!ExecuteSQL(create_vec_sql)) return false;
 
         // STaging table for raw OCR captures.
-        // C++ writes here directly. Python's FlishWorker reads, cleans with Gemma, then vectorizes.
+        // C++ writes here directly. Python's FlushWorker reads, cleans with Gemma, then vectorizes.
         std::string create_ocr_buffer_sql = R"(
             CREATE TABLE IF NOT EXISTS ocr_buffer (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +116,7 @@ namespace Jugnu
         if(!ExecuteSQL(create_ocr_buffer_sql)) return false;
         
         // OKF-inspired structured knowledge store.
-        // Each row is a synthesized JSON knowledge document from one OCR capture.
+        // Each row is a synthesized JSON knowledge document from one UIA capture.
         // Related captures of the same topic are MERGED here, not duplicated.
 
         std::string create_knowledge_docs_sql = R"(
@@ -202,7 +202,7 @@ namespace Jugnu
             ON practice_hints(session_id, timestamp DESC);
         )";
         if(!ExecuteSQL(create_hints_idx_sql)) return false;
-          
+
         return true;
     }
 
@@ -231,6 +231,10 @@ namespace Jugnu
         return true;
     }
     
+    // loads markov edges at the starting of jugnu in the cache
+    // that gets updated throughout the session
+    // flushed to DB to save the updates every 30 minutes or at shut down
+    // so it is mostly fault tolerant
     std::unordered_map<std::string, std::unordered_map<std::string, int>> DBHandler::LoadMarkovEdges()
     {
         std::unordered_map<std::string, std::unordered_map<std::string, int>> edges;
