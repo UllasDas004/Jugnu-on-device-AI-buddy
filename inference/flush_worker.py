@@ -15,6 +15,8 @@ Why chunking?
     Feeding the whole blob at once confuses the extractor.
 """
 
+from sentence_transformers.util import normalize_embeddings
+from sklearn.metrics.cluster._supervised import normalized_mutual_info_score
 import difflib
 import sqlite3
 import threading
@@ -218,6 +220,8 @@ def _parse_cp_url(url: str | None) -> dict | None:
     if not url:
         return None
 
+    # Strip query parameters
+    url = url.split("?")[0]
     url_lower = url.lower()
 
     for plat in CP_PLATFORMS:
@@ -684,3 +688,89 @@ class FlushWorker:
               f"{len(ids_failed)} failed/retrying).{_RESET}")
         if ids_failed:
             print(f"{_RED}[FlushWorker] {len(ids_failed)} row(s) will be retried next cycle: {ids_failed}{_RESET}")
+
+
+    def process_uia_by_id(self, row_id: int, engine, embedder, is_new: bool = True):
+        """
+        Direct DB pipeline: Fetches the raw UIA JSON saved directly by C++,
+        cleans it, computes its semantic embedding, and updates the DB.
+        """
+        if not is_new:
+            print(f"{_CYAN}[FlushWorker] Row #{row_id} exists. Skipping LTM extraction to maintain idempotency.{_RESET}")
+            return
+
+        try:
+            import sqlite_vec
+            conn = sqlite3.connect("jugnu.db", timeout=5.0)
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT content, window_title, tags, source_url, source_type FROM knowledge_docs WHERE id = ?", (row_id,)).fetchone()
+            if not row:
+                conn.close()
+                return
+            
+            raw_text = row["content"]
+            window_title = row["window_title"] or ""
+            source_url = row["source_url"]
+            source_type = row["source_type"]
+        
+            # Clean null bytes that crash tokenizers
+            raw_text = raw_text.replace('\ufffc', '').replace('\x00', '')
+            section_extractions = []
+            code_snippet = ""
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, list):
+                    for sec in parsed:
+                        ctrl_type = sec.get("type", "Unknown")
+                        sec_text = sec.get("text", "").strip()
+                        if not sec_text or ctrl_type == "PageMeta":
+                            continue
+                        if ctrl_type == "Edit":
+                            code_snippet = sec_text
+                        else:
+                            clean_sec_text = _preprocess_ocr(sec_text)
+                            if clean_sec_text:
+                                section_extractions.append(clean_sec_text)
+            except Exception:
+                if source_type == "ide":
+                    code_snippet = raw_text
+                else:
+                    section_extractions.append(_preprocess_ocr(raw_text[:10000]))
+            combined_text = "\n\n".join(section_extractions)
+
+            # Determine Topic (fall back to title if not CP)
+            topic = "Uncategorized"
+            cp_info = _parse_cp_url(source_url)
+            if cp_info:
+                title_slug = ""
+                if window_title:
+                    import re
+                    title_part = re.split(r'\s*[-|]\s*(LeetCode|Codeforces|CodeChef|AtCoder)', window_title, flags=re.IGNORECASE)[0].strip()
+                    title_slug = re.sub(r'[^a-z0-9]+', '-', title_part.lower()).strip('-')
+                slug = title_slug if title_slug else cp_info["slug"]
+                topic = f"{cp_info['platform'].capitalize()}: {slug}"
+            elif window_title:
+                import re
+                title_part = re.split(r'\s*[-|]', window_title)[0].strip()
+                topic = title_part if title_part else window_title
+            
+            # Initial embedding (Topic + Content) for vector search
+            embed_text = f"{topic}. {combined_text[:500]}"
+            vec = embedder._model.encode(f"passage: {embed_text}", normalize_embeddings = True)
+            blob = embedder._serialize_vector(vec.tolist())
+
+            # Update DB - Notice we do NOT touch `tags`, `summary`, or `notes` here!
+            conn.execute("UPDATE knowledge_docs SET content = ?, code_snippet = ?, topic = ? WHERE id = ?", (combined_text, code_snippet, topic, row_id))
+            conn.execute("DELETE FROM vec_knowledge WHERE rowid = ?", (row_id,))
+            conn.execute("INSERT INTO vec_knowledge (rowid, embedding) VALUES (?, ?)", (row_id, blob))
+            conn.commit()
+            conn.close()
+            
+            print(f"{_GREEN}[FlushWorker] Direct UIA processed & embedded for row #{row_id}: '{topic}'{_RESET}")
+            
+        except Exception as e:
+            print(f"{_RED}[FlushWorker] Error in process_uia_by_id: {e}{_RESET}")
+    

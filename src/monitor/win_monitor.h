@@ -13,6 +13,8 @@ namespace Jugnu
     class WinMonitor
     {
     public:
+        static std::atomic<bool> g_isJugnuUIFocused;
+        
         // Initializes the monitor by registering the Win32 hook
         static void Init();
         

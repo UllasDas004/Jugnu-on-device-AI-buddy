@@ -90,7 +90,50 @@ class AIEngine:
                 return "I noticed you seem stuck — could you tell me what you're working on?"
 
         except Exception as e:
-            return f"Ollama Connection Failed! {e}"
+            print(f"\033[1;31m[AIEngine] generate_insight error: {e}\033[0m")
+            return "I noticed you seem stuck — could you tell me what you're working on?"
+
+    def generate_helpful_nudge(self, context_chunks: list[str], situation_type: str, ipc_code: str) -> str:
+        context_str = "\n".join(context_chunks)[:3000]
+
+        prompt = f"""You are Jugnu, a senior technical AI assistant.
+        The developer has been idle and might be stuck.
+        Situation: {situation_type}
+        
+        Recent Reference Context from their workflow:
+        {context_str}
+        
+        Current Editor Code (if any):
+        {ipc_code[:1000]}
+        
+        Provide a short, proactive suggestion to help them move forward based on the exact context.
+        Keep it under 3 sentences. Be direct, technical, and specific. Do NOT show your reasoning or thinking process."""
+
+        print(f"\n\033[1;35m[AIEngine]\033[0m Generating helpful nudge with {self.model_name}...")
+
+        try:
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                think=False,
+                options={
+                    "num_ctx": 4096,
+                    "flash_attn": False,  
+                    "num_predict": 256,
+                    "temperature": 0.4
+                }
+            )
+
+            if hasattr(response, 'message') and response.message:
+                content  = (response.message.content  or '').strip()
+            else:
+                msg      = (response or {}).get('message', {}) or {}
+                content  = (msg.get('content')  or '').strip()
+
+            return content or "I noticed you seem stuck — could you tell me what you're working on?"
+        except Exception as e:
+            print(f"\033[1;31m[AIEngine] generate_helpful_nudge error: {e}\033[0m")
+            return "I noticed you seem stuck — could you tell me what you're working on?"
     
 
     def extract_ocr_chunk(self, chunk: str, prev_context: str = "") -> str:
@@ -513,17 +556,18 @@ class AIEngine:
             f"{history_text}{feedback_text}"
             "<task>\n"
             "1. Evaluate whether this code produces correct output for ALL valid inputs given the constraints above. "
-            "You MUST check: (a) Is the algorithm logically correct? "
+            "You MUST check: (a) Is the code complete and logically correct? "
             "(b) Does the solution's time/space complexity fit within the problem's constraints? "
-            "A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct.\n"
-            "2. If the code is correct AND efficient enough for the constraints, respond ONLY with these two lines:\n"
-            "   IS_SOLVED: 1\n"
-            "   EFFICIENCY_REVIEW: <brief encouraging review covering time/space complexity and any potential optimizations, max 3-4 sentences>\n"
-            "3. If the code is INCORRECT, has wrong logic, or is too slow/memory-heavy for the stated constraints, respond ONLY with:\n"
+            "CRITICAL: If the code is incomplete, missing core logic, or just boilerplate, you MUST treat it as INCORRECT. DO NOT complete or assume the missing code yourself. "
+            "A solution that is logically correct but would exceed time/memory limits for the given input sizes is also NOT correct.\n"
+            "2. If the code is INCORRECT, has wrong logic, or is too slow/memory-heavy for the stated constraints, respond ONLY with:\n"
             "   APPROACH: <Describe their current approach in 2-5 words>\n"
             "   IS_SOLVED: 0\n"
             "   TYPE: <A 1-2 word hint category>\n"
             "   HINT: <Your 1-2 sentence Socratic hint ending with a question. DO NOT repeat past hints!>\n"
+            "3. If the code is correct AND efficient enough for the constraints, respond ONLY with these two lines:\n"
+            "   IS_SOLVED: 1\n"
+            "   EFFICIENCY_REVIEW: <brief encouraging review covering time/space complexity and any potential optimizations, max 3-4 sentences>\n"
             "</task>"
         )
         print("COMBINED CORRECTNESS CHECK & RESPONSE GENERATION")
@@ -574,7 +618,7 @@ class AIEngine:
                     "content": review_text,
                     "approach": None,
                     "hint_type": None,
-                    "is_solved": None
+                    "is_solved": 1
                 }
             else:
                 # Parse practice hint format

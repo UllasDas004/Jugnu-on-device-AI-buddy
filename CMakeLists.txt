@@ -22,6 +22,8 @@ set(
     src/monitor/file_watcher.cpp
     src/monitor/clipboard_manager.cpp
     src/monitor/screen_reader.cpp
+    src/monitor/cp_state_manager.cpp
+    src/monitor/input_hooks.cpp
     src/server/flush_worker.cpp
 )
 

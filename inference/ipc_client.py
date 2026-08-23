@@ -1,31 +1,19 @@
-import difflib
-import sqlite3
 import threading
 import win32file
 import win32pipe
-import re
 import pywintypes
 import os
+import subprocess
 import sys
 import time
 import json
-import notification
 from state_manager import StateManager
-from ai_engine import AIEngine, DB_PATH
+from ai_engine import AIEngine
 from embedder import Embedder
 from flush_worker import (
-    FlushWorker,
-    _parse_cp_url
+    FlushWorker
 )
-from practice_mode import (
-    classify_state,
-    get_or_create_session,
-    get_last_hints,
-    get_last_hint_id,
-    update_session,
-    log_hint,
-    flush_session_to_db
-)
+from core.cp_event_handler import CPEventHandler
 from sentence_transformers import SentenceTransformer
 import ollama
 
@@ -35,6 +23,124 @@ _GREEN  = "\033[1;32m"
 _RED    = "\033[1;31m"
 _YELLOW = "\033[1;33m"
 _RESET  = "\033[0m"
+
+class MascotController:
+    """
+    Holds the jugnuBug subprocess and lets any part of the system
+    change its animation state with a single call.
+    """
+    def __init__(self):
+        self._proc = None
+        self._dash_proc = None
+        self._watching_timer = None   # auto-revert timer for 'watching' state
+        self.current_state = 'sleeping'
+    
+    def spawn(self, launcher_path: str):
+        """Spawn the always-on jugnuBug mascot process at startup."""
+        self._proc = subprocess.Popen(
+            [sys.executable, launcher_path, 'jugnu_bug'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            creationflags=0x00008000 # ABOVE_NORMAL_PRIORITY_CLASS
+        )
+        print("\033[1;35m[Mascot]\033[0m jugnuBug spawned.")
+
+    def start_output_reader(self, engine, embedder, launcher_path):
+        """Reads mascot stdout for toggle_dashboard / set_bug_state events."""
+        def _reader():
+            for line in iter(self._proc.stdout.readline, ''):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("type") == "toggle_dashboard":
+                        if self._dash_proc and self._dash_proc.poll() is None:
+                            # It's already running, toggle it off by killing it
+                            try:
+                                self._dash_proc.terminate()
+                            except Exception:
+                                pass
+                            self._dash_proc = None
+                        else:
+                            # Not running, spawn it
+                            stats = _query_dashboard_stats(embedder)
+                            state_file = os.path.join(os.path.dirname(launcher_path), 'dashboard_state.json')
+                            with open(state_file, 'w', encoding='utf-8') as f:
+                                json.dump({"dashboard": stats}, f)
+                            
+                            self._dash_proc = subprocess.Popen(
+                                [sys.executable, launcher_path, 'dashboard', state_file],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            self._watch_subprocess(self._dash_proc)
+                    elif data.get("type") == "set_bug_state":
+                        # Mascot debug state override (shouldn't happen from mascot
+                        # stdout, but handle defensively)
+                        self.set_state(data.get("state", "sleeping"))
+                except Exception:
+                    pass
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def _watch_subprocess(self, proc):
+        """Reads stdout of any child process (e.g. dashboard) for set_bug_state events."""
+        def _reader():
+            for line in iter(proc.stdout.readline, ''):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("type") == "set_bug_state":
+                        self.set_state(data.get("state", "sleeping"))
+                except Exception:
+                    pass
+        threading.Thread(target=_reader, daemon=True).start()
+
+    
+    def set_state(self, state_name: str, background_event: bool = False):
+        """
+        Tell the mascot HTML to switch animation state via stdin.
+        The HTML is a pure renderer with no internal timers — all state
+        lifetime logic lives here so individual features can set their own
+        duration without touching the UI layer.
+        """
+        if background_event and self.current_state in ('thinking', 'hint_ready'):
+            return
+
+        self.current_state = state_name
+
+        # Cancel any pending auto-revert before applying the new state
+        if self._watching_timer is not None:
+            self._watching_timer.cancel()
+            self._watching_timer = None
+
+        if not self._proc or self._proc.poll() is not None:
+            return  # Process died, ignore silently
+        try:
+            self._proc.stdin.write(json.dumps({"cmd": "set_state", "state": state_name}) + "\n")
+            self._proc.stdin.flush()
+        except Exception as e:
+            print(f"\033[1;31m[Mascot]\033[0m Failed to set state: {e}")
+            return
+
+        # Only the 'watching' state triggered by app-switch events has an
+        # auto-revert. All other states (hint_ready, thinking, etc.) are
+        # expected to be explicitly cleared by their owning feature.
+        if state_name == 'watching':
+            def _revert():
+                print("\033[90m[Mascot] Watching timer expired — reverting to sleeping.\033[0m", flush=True)
+                self.set_state('sleeping', background_event=True)
+            self._watching_timer = threading.Timer(15.0, _revert)
+            self._watching_timer.daemon = True
+            self._watching_timer.start()
+    
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
 
 # Fix CUDA warmup crash on RTX 4050 / Turing+ with Ollama's Flash Attention PDL kernel
@@ -167,98 +273,20 @@ def _synthesize_and_save_file(engine, embedder, app_name, filepath, code_text):
 # Global stop flag — set by main thread on Ctrl+C, read by reader daemon
 _stop_event = threading.Event()
 
-def _has_meaningful_code(editor_text: str) -> bool:
-    """
-    Language-agnostic heuristic to check if user has started coding.
-    Ignores comments, imports, scaffolding, and function/class declarations by structure,
-    without blacklisting data types (int, vector, string, etc.) that are used in real code.
-    """
-    if not editor_text:
-        return False
-    
-    lines = editor_text.splitlines()
-    meaningful_lines = 0
-
-    # Single-statement scaffolding that LeetCode / IDEs auto-fill
-    _BOILERPLATE_EXACT = {"pass", "return 0;", "{", "}", "};", "class Solution {", "public:", "private:", "protected:"}
-    _CONTROL_FLOW = ("if ", "if(", "else", "for ", "for(", "while ", "while(", "switch ", "switch(", "do ", "try", "catch", "return ")
-
-    for line in lines:
-        s = line.strip()
-        # Skip blank lines, comments, imports, preprocessor directives
-        if not s or s.startswith(("//", "#", "/*", "*", "import ", "using ", "#include", "package ", "from ")):
-            continue
-        # Skip exact boilerplate tokens
-        if s in _BOILERPLATE_EXACT:
-            continue
-        # If line starts with control flow or return, it is ALWAYS meaningful code!
-        if s.startswith(_CONTROL_FLOW):
-            meaningful_lines += 1
-            continue
-        # If line ends with '{' or ':' (and is NOT control flow), it is a class/function declaration (e.g. `vector<int> twoSum(...) {` or `def twoSum(...):`) -> ignore!
-        if s.endswith(("{", ":", "{ /", "{ //")):
-            continue
-        meaningful_lines += 1
-
-    # At least 2 actual statements/expressions needed to be considered "coding"
-    return meaningful_lines >= 2
 
 def _idle_handler_background(state, engine, embedder, screen_context, ipc_code="", target_app=""):
     """
     Runs in a background thread. Keeps the IPC listener free.
     Does: LLM query generation → KNN search → situation detection → notification.
     """
-    # Extract URL and Title preserved by state_manager
-    url_match = re.search(r'\[URL:\s*(https?://[^\]]+)\]', screen_context)
-    active_url = url_match.group(1) if url_match else None
+    print(f"{_YELLOW}[IPC-BG] Generating search query for Generic Idle...{_RESET}")
+    search_query = engine.generate_search_query(screen_context)
+    print(f"{_YELLOW}[IPC-BG] KNN Query: '{search_query}'{_RESET}")
 
-    title_match = re.search(r'\[TITLE:\s*([^\]]+)\]', screen_context)
-    active_title = title_match.group(1) if title_match else ""
-    
-    cp_info = _parse_cp_url(active_url)
-    is_cp_session = cp_info is not None
-
-    if is_cp_session:
-        # Build KNN search query directly from window title and UIA page content!
-        # This mirrors the exact anchor used when saving to vector DB, ensuring high cosine similarity
-        # to the current problem without calling Ollama or risking hallucinations.
-        page_content = ""
-        if "--- Page Content ---" in screen_context:
-            page_content = screen_context.split("--- Page Content ---")[1].strip()[:400]
-        
-        anchor_title = active_title if active_title else (f"{cp_info['platform'].capitalize()}: {cp_info['slug']}")
-        search_query = f"{anchor_title}. {page_content}".strip() if (anchor_title or page_content) else anchor_title
-        print(f"{_CYAN}[IPC-BG] CP Session — using deterministic title+content anchor for KNN: '{search_query[:80]}...'{_RESET}")
-    else:
-        print(f"{_YELLOW}[IPC-BG] Generating search query...{_RESET}")
-        search_query = engine.generate_search_query(screen_context)
-        print(f"{_YELLOW}[IPC-BG] KNN Query: '{search_query}'{_RESET}")
-
-    # We search across ALL CP problems ("cp") so that similar problems or algorithms can be retrieved!
-    # Because search_query is now anchored to actual problem title and text (e.g. "Two Sum - LeetCode. Given an array..."),
-    # KNN will naturally return the current problem as #1 (distance ~0.0), and similar algorithmic problems as #2 and #3.
-    required_tag = "cp" if is_cp_session else None
-
-    knowledge_docs = embedder.search_knowledge_docs(search_query, limit=3, required_tag=required_tag)
-    context_chunks  = []
-    sources         = []
-    situation_type  = "NO_MEMORY"
-    editor_section = ""
-    if is_cp_session:
-        # Check if user has written actual code vs staring at default boilerplate
-        if ipc_code:
-            editor_section = ipc_code
-        elif "--- Editor Content ---" in screen_context:
-            after_editor = screen_context.split("--- Editor Content ---")[1]
-            editor_section = after_editor.split("--- Page Content ---")[0].strip() if "--- Page Content ---" in after_editor else after_editor.strip()
-        
-        # Use language-agnostic attempt detector instead of fragile character counting
-        if not _has_meaningful_code(editor_section):
-            situation_type = "CP_READING"  # Reading / understanding the problem
-            print(f"{_GREEN}[IPC-BG] Situation: CP_READING (Template/Boilerplate only){_RESET}")
-        else:
-            situation_type = "CP_STUCK"    # Stuck on implementation / bugs
-            print(f"{_GREEN}[IPC-BG] Situation: CP_STUCK (Active code attempt){_RESET}")
+    knowledge_docs = embedder.search_knowledge_docs(search_query, engine, limit = 3)
+    context_chunks = []
+    sources = []
+    situation_type = "NO_MEMORY"
 
     if knowledge_docs:
         top           = knowledge_docs[0]
@@ -266,24 +294,18 @@ def _idle_handler_background(state, engine, embedder, screen_context, ipc_code="
         source_type   = top.get('source_type', '')
         code_snippet  = top.get('code_snippet', '')
         
-        # Only compute general situations if we aren't already in a CP session!
-        if not is_cp_session:
-            if capture_count >= 4:
-                situation_type = "REPEATED_STRUGGLE"
-            elif source_type == 'ide':
-                situation_type = "STUCK_ON_OWN_CODE"        # always — user was writing code
-            elif source_type == 'browser' and code_snippet:
-                situation_type = "STUCK_ON_OWN_CODE"        # browser with code = practice problem
-            elif source_type == 'browser':
-                situation_type = "READING_NEW_MATERIAL"     # browser, no code = pure docs
-            else:
-                situation_type = "GENERAL"
-
+        if capture_count >= 4:
+            situation_type = "REPEATED_STRUGGLE"
+        elif source_type == 'ide' or (source_type == 'browser' and code_snippet):
+            situation_type = "STUCK_ON_OWN_CODE"        
+        elif source_type == 'browser':
+            situation_type = "READING_NEW_MATERIAL"     
+        else:
+            situation_type = "GENERAL"
         sources = [doc['topic'] for doc in knowledge_docs]
         print(f"{_GREEN}[IPC-BG] Situation: {situation_type} | Docs: {len(knowledge_docs)}{_RESET}")
-    
+        
     else:
-        # Fallback: episodic memories
         memories = embedder.semantic_search(search_query, limit=3)
         if memories:
             context_chunks = [m["snippet"] for m in memories]
@@ -292,194 +314,38 @@ def _idle_handler_background(state, engine, embedder, screen_context, ipc_code="
             print(f"{_GREEN}[IPC-BG] Falling back to {len(memories)} episodic memories.{_RESET}")
         else:
             print(f"{_YELLOW}[IPC-BG] No memory found. Notification will use general insight.{_RESET}")
+    if not context_chunks and knowledge_docs:
+        context_chunks = [d['summary'] for d in knowledge_docs if d.get('summary')]
+    
+    notification_msg = engine.generate_helpful_nudge(context_chunks, situation_type, ipc_code)
+    
+    if notification_msg:
+        print(f"\n{_YELLOW}================================{_RESET}")
+        print(f"{_YELLOW}💡 {notification_msg}{_RESET}")
+        print(f"{_YELLOW}================================{_RESET}\n")
         
-    # ── PRACTICE MODE CHECK ────────────────────────────────────────────────
-    # Check both CP_STUCK (active coding) and STUCK_ON_OWN_CODE (idle timer fallback)
-    if (situation_type in ("CP_STUCK", "STUCK_ON_OWN_CODE") and knowledge_docs):
-        top_doc = knowledge_docs[0]
-        top_tags = top_doc.get("tags", [])
-        is_practice_mode = "cp" in top_tags
+        # Fire the generic Nudge Bubble with a proper state file
+        import subprocess
+        launcher_path = os.path.join(os.path.dirname(__file__), 'ui', 'launcher.py')
+        nudge_state_file = os.path.join(os.path.dirname(__file__), 'ui', 'nudge_state.json')
+        nudge_state = {
+            "nudge_type":  "idle",
+            "nudge_title": "Ready to dive back in?",
+            "nudge_msg":   notification_msg,
+        }
+        try:
+            with open(nudge_state_file, 'w', encoding='utf-8') as _f:
+                json.dump(nudge_state, _f)
+        except Exception:
+            pass
+        subprocess.Popen(
+            [sys.executable, launcher_path, 'nudge_bubble', nudge_state_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
 
-        if is_practice_mode:
-            print(f"{_GREEN}[IPC-BG] PRACTICE MODE — routing to progressive hint system.{_RESET}")
-
-            # Derive platform & slug from the DB topic (e.g. "Leetcode: two-sum")
-            # This completely removes the dependency on live URL extraction during IDLE!
-            topic = top_doc.get("topic", "")
-            slug, platform = "unknown", "unknown"
-            for pf in ("leetcode", "codeforces", "codechef", "atcoder"):
-                if pf in topic.lower():
-                    platform = pf
-                    parts = topic.split(":", 1)
-                    slug = parts[1].strip().lower() if len(parts) > 1 else topic
-                    break
-            
-            if slug == "unknown" and cp_info:
-                # Fallback to URL info if topic parsing failed but URL exists
-                slug = cp_info.get("slug", "unknown")
-                platform = cp_info.get("platform", "unknown")
-
-            # Prioritize live code currently visible on screen; fallback to DB snippet if obscured
-            current_code = ""
-            if ipc_code:
-                current_code = ipc_code
-            elif 'editor_section' in locals() and editor_section.strip():
-                current_code = editor_section
-            else:
-                current_code = top_doc.get("code_snippet", "") or ""
-            
-            if not current_code.strip():
-                print(f"{_YELLOW}[IPC-BG] Practice mode: no code snapshot yet. Skipping hint.{_RESET}")
-            else:
-                # Step 1: Get or create session (fast SQLite lookup)
-                session = get_or_create_session(slug, platform)
-                if not session:
-                    return
-                session_id = session["id"]
-
-                # Layer 1: Lightweight state gate
-                last_snapshot = session.get("code_snapshot")
-                user_state = classify_state(current_code, last_snapshot)
-                print(f"{_CYAN}[IPC-BG] User state: {user_state}{_RESET}")
-
-                if user_state == "READING":
-                    print(f"{_YELLOW}[IPC-BG] Not enough code yet — skipping hint.{_RESET}")
-                    return
-
-                # Layer 2: Fetch hint history + last feedback
-                hint_type_history = []
-                try:
-                    hint_type_history = json.loads(session.get("hint_type_history") or "[]")
-                except Exception:
-                    hint_type_history = []
-
-                last_feedback = None
-                try:
-                    lhid = get_last_hint_id(session_id)
-                    if lhid:
-                        conn_tmp = sqlite3.connect(DB_PATH, timeout=5.0)
-                        row_tmp = conn_tmp.execute(
-                            "SELECT user_feedback FROM practice_hints WHERE id = ?", (lhid,)
-                        ).fetchone()
-                        conn_tmp.close()
-                        if row_tmp:
-                            last_feedback = row_tmp[0]
-                except Exception:
-                    pass
-
-                # Fetch conversation history (last 3 hints)
-                hint_history = get_last_hints(session_id, n=3)
-
-                # --- SINGLE LLM CALL: CORRECTNESS CHECK + RESPONSE GENERATION ---
-                result = engine.check_code_correctness(
-                    current_code, 
-                    top_doc.get("content", ""),
-                    hint_history=hint_history,
-                    last_feedback=last_feedback
-                )
-
-                if result["type"] == "efficiency_review":
-                    # Code is correct — show efficiency review.
-                    # Only hit the DB if this is a NEW solve (was not solved before this session).
-                    db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1
-
-                    if not db_was_already_solved:
-                        print(f"{_GREEN}[IPC-BG] NEW SOLVE! Marking '{slug}' as solved in DB.{_RESET}")
-                        embedder.mark_problem_solved(slug, platform)        # knowledge_docs.is_solved = 1
-                        update_session(slug=slug, platform=platform, code_snapshot=current_code, is_solved=1)
-                        flush_session_to_db(slug)                           # practice_sessions.is_solved = 1
-                    else:
-                        print(f"{_GREEN}[IPC-BG] Gemma verified code is CORRECT! (Already marked solved in DB — skipping redundant write){_RESET}")
-                        # Still update code snapshot so next cycle delta-compares correctly
-                        update_session(slug=slug, platform=platform, code_snapshot=current_code)
-                        flush_session_to_db(slug)
-
-                    practice_sources = [f"{platform.capitalize()}: {slug} (Efficiency Review)"]
-                    notification.trigger_flow(
-                        state, engine, embedder,
-                        search_query   = search_query,
-                        context_chunks = [result["content"]],
-                        knowledge_docs = [],
-                        sources        = practice_sources,
-                        screen_context = screen_context,
-                        situation_type = "CP_SOLVED", # Directly show review in UI without re-running LLM
-                    )
-
-                    return # always return if we handled practice flow
-                else:
-                    # Code is incorrect or incomplete - generate practice hint
-                    # Update snapshot so NEXT cycle compares against THIS code
-                    update_session(slug=slug, platform=platform, code_snapshot=current_code)
-
-                    # Extract hint data from the combined LLM call
-                    hint_type = result["hint_type"]
-                    hint_text = result["content"]
-                    approach = result["approach"]
-                    is_solved = result["is_solved"]  # Should be 0 for incorrect code
-
-                    # Log the hint and get hint_id for feedback tracking
-                    hint_id = log_hint(
-                        session_id    = session_id,
-                        hint_type     = hint_type,
-                        hint_text     = hint_text,
-                        user_state    = user_state,
-                        code_snapshot = current_code,
-                        approach      = approach,
-                    )
-
-                    # Update hint_type_history in session
-                    hint_type_history.append(hint_type)
-                    update_session(
-                        slug = slug,
-                        platform = platform,
-                        last_hint_type = hint_type,
-                        hint_type_history = json.dumps(hint_type_history[-10:]),
-                        detected_approach = approach,
-                        is_solved = is_solved
-                    )
-                    flush_session_to_db(slug)
-
-                    # Display
-                    practice_sources = [
-                        f"{platform.capitalize()}: {slug} "
-                        f"(Practice — {hint_type.replace('_', ' ').title()} | {user_state})"
-                    ]
-                    fb_result = notification.trigger_flow(
-                        state, engine, embedder,
-                        search_query   = search_query,
-                        context_chunks = [hint_text],
-                        knowledge_docs = [],
-                        sources        = practice_sources,
-                        screen_context = screen_context,
-                        situation_type = "CP_STUCK",
-                        session_id     = session_id,
-                        hint_id        = hint_id,
-                    )
-                    # If the user clicked "3" (Go Deeper), instantly fire the next hint cycle
-                    if fb_result == "escalate":
-                        print(f"{_YELLOW}[Practice] Escalate triggered. Firing next hint immediately...{_RESET}")
-                        threading.Thread(
-                            target=_idle_handler_background,
-                            args=(state, engine, embedder, screen_context),
-                            daemon=True
-                        ).start()
-
-                return   # always return if we handled practice flow — don't fall through to generic flow
-                    
-                    
-    # ── NORMAL FLOW (CP_READING, unsolved problems, non-CP sessions) ───────
-    notification.trigger_flow(
-        state, engine, embedder,
-        search_query   = search_query,
-        context_chunks = context_chunks,
-        knowledge_docs = knowledge_docs,
-        sources        = sources,
-        screen_context = screen_context,
-        situation_type = situation_type,
-    )
-
-
-def _pipe_reader_daemon(handle, state, engine, embedder):
+def _pipe_reader_daemon(handle, state, engine, embedder, mascot):
     """
     Runs in a daemon thread. Uses PeekNamedPipe to avoid blocking
     so the main thread remains free to catch KeyboardInterrupt.
@@ -525,6 +391,8 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                 if event_type == 'SWITCH':
                                     app = payload.get('current_app', '')
                                     state.update_switch(app, payload.get('predicted_next', []))
+
+                                    mascot.set_state('watching', background_event=True)  # 15s watching anim on any switch
                                     
                                     # Since C++ now strictly filters for whitelisted Deep Work apps,
                                     # every SWITCH event is guaranteed to be a coding app.
@@ -591,6 +459,37 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
                                         ).start()
                                     else:
                                         print("\033[90m[System] No recent coding context. Skipping.\033[0m", flush=True)
+                                
+                                elif event_type == "UIA_EXTRACTION_SAVED":
+                                    mascot.set_state('watching', background_event=True)  # 15s watching anim on any switch
+                                    row_id = payload.get('row_id')
+                                    is_new = payload.get('is_new', True)
+                                    if row_id is not None:
+                                        print(f"{_CYAN}[IPC] Received UIA_EXTRACTION_SAVED for row_id: {row_id} (is_new: {is_new}){_RESET}")
+                                        cp_handler.last_uia_row_id = row_id
+                                        # Spawn thread to avoid blocking the IPC pipe
+                                        threading.Thread(
+                                            target = flush_worker.process_uia_by_id,
+                                            args=(row_id, engine, embedder, is_new),
+                                            daemon=True
+                                        ).start()
+                                elif event_type == "CP_SESSION_START":
+                                    slug = payload.get("slug", "")
+                                    platform = payload.get("platform", "leetcode")
+                                    cp_handler.handle_session_start(slug, platform)
+                                    mascot.set_state('watching', background_event=True)
+                                elif event_type == "CP_SESSION_END":
+                                    code = payload.get("code", "")
+                                    cp_handler.handle_session_end(code)
+                                elif event_type == "CP_READING_IDLE":
+                                    code = payload.get("code", "")
+                                    cp_handler.handle_reading_idle(engine, code)
+                                elif event_type == "CP_STUCK":
+                                    code = payload.get("code", "")
+                                    # Run in a background thread so the pipe reader isn't blocked by Gemma!
+                                    threading.Thread(target=cp_handler.handle_stuck, args=(code, engine), daemon=True).start()
+                                elif event_type == "CP_USER_RESUMED":
+                                    cp_handler.handle_typing_resumed()
 
                             except json.JSONDecodeError:
                                 print(f"\033[1;31m[Error] Failed to decode JSON:\033[0m {msg}", flush=True)
@@ -614,91 +513,154 @@ def _pipe_reader_daemon(handle, state, engine, embedder):
             print(f"\n[Python] Unexpected error in reader: {e}", flush=True)
             return
 
-def _practice_session_tracker_daemon(state, engine, embedder):
+
+def _query_dashboard_stats(embedder):
     """
-    Background daemon that checks `practice_sessions` every 60s.
-    If a session hasn't been updated in 3 minutes (last_seen > 180s), the user is stuck.
+    Queries the DB to build the full dashboard state payload.
+    This is called once when the user clicks the mascot to open the dashboard.
+    launcher.py never queries SQLite directly — it only reads this dict.
     """
-    print("[Python] Code-Progression Tracker Daemon started.")
+    from practice_mode import DB_PATH as PM_DB_PATH
+    import sqlite3, os
 
-    while not _stop_event.is_set():
-        time.sleep(60) # Run every 60 seconds
+    stats = {
+        "vitals": {},
+        "cp_stats": []
+    }
+    try:
+        conn = sqlite3.connect(str(PM_DB_PATH), timeout=0.5)
+        conn.row_factory = sqlite3.Row
 
-        try:
-            # 3 minute ago
-            threshold_time = (time.time() - 180)
-            conn = sqlite3.connect(DB_PATH, timeout=5.0)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
+        # ── System Vitals ──────────────────────────────────────────────────────
+        db_size = os.path.getsize(str(PM_DB_PATH)) / (1024 * 1024)
 
-            # Find any unsolved sessions that haven't been updated in 3 minutes
-            cur.execute(
-                """
-                SELECT problem_slug, platform, code_snapshot
-                FROM practice_sessions 
-                WHERE is_solved = 0 
-                  AND strftime('%s', last_seen) < ?
-                """,
-                (int(threshold_time),)
+        doc_count = conn.execute("SELECT COUNT(*) FROM knowledge_docs").fetchone()[0]
+        mem_count = conn.execute("SELECT COUNT(*) FROM episodic_memories").fetchone()[0]
+
+        # Top apps by how recently they were seen (knowledge_docs source)
+        top_apps = conn.execute("""
+            SELECT source_app as app_name, COUNT(*) as doc_count
+            FROM knowledge_docs
+            GROUP BY source_app
+            ORDER BY doc_count DESC
+            LIMIT 8
+        """).fetchall()
+        stats["vitals"] = {
+            "db_size_mb": round(db_size, 2),
+            "doc_count": doc_count,
+            "memory_count": mem_count,
+            "top_apps": [{"app": r["app_name"], "docs": r["doc_count"]} for r in top_apps],
+        }
+
+        # ── CP Stats — Level 1: Problem List ──────────────────────────────────
+        problems = conn.execute("""
+            SELECT problem_slug, platform,
+                   COUNT(*) as session_count,
+                   MAX(is_solved) as ever_solved,
+                   MAX(last_seen) as last_seen
+            FROM practice_sessions
+            GROUP BY problem_slug
+            ORDER BY last_seen DESC
+        """).fetchall()
+        cp_stats = []
+        for prob in problems:
+            slug = prob["problem_slug"]
+            # Level 2: Sessions for this problem
+            sessions = conn.execute("""
+                SELECT id, last_seen, is_solved, detected_approach,
+                       (SELECT COUNT(*) FROM practice_hints WHERE session_id = practice_sessions.id) as hint_count
+                FROM practice_sessions
+                WHERE problem_slug = ?
+                ORDER BY last_seen DESC
+            """, (slug,)).fetchall()
+            sessions_data = []
+            for sess in sessions:
+                # Level 3: Hints for this session
+                hints = conn.execute("""
+                    SELECT hint_type, hint_text, code_snapshot, user_feedback, timestamp
+                    FROM practice_hints
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC
+                """, (sess["id"],)).fetchall()
+                sessions_data.append({
+                    "id": sess["id"],
+                    "last_seen": sess["last_seen"],
+                    "is_solved": sess["is_solved"],
+                    "detected_approach": sess["detected_approach"] or "Unknown",
+                    "hint_count": sess["hint_count"],
+                    "hints": [
+                        {
+                            "hint_type": h["hint_type"],
+                            "hint_text": h["hint_text"],
+                            "code_snapshot": h["code_snapshot"] or "",
+                            "user_feedback": h["user_feedback"],  # 1=helpful, 0=not, None=no feedback
+                            "timestamp": h["timestamp"],
+                        }
+                        for h in hints
+                    ]
+                })
+            cp_stats.append({
+                "slug": slug,
+                "platform": prob["platform"],
+                "session_count": prob["session_count"],
+                "ever_solved": bool(prob["ever_solved"]),
+                "last_seen": prob["last_seen"],
+                "sessions": sessions_data,
+            })
+        stats["cp_stats"] = cp_stats
+
+        # ── Reshape into keys that dashboard.html actually reads ───────────────
+        # ema_scores: list of {app, score} — we use knowledge_docs count as proxy
+        stats["ema_scores"] = [
+            {"app": r["app"], "score": r["docs"]}
+            for r in stats["vitals"]["top_apps"]
+        ]
+
+        # markov_edges: not tracked yet — empty list renders graceful empty state
+        stats["markov_edges"] = []
+
+        # cp_history: flat list that problem list + overview use
+        stats["cp_history"] = [
+            {
+                "slug":              p["slug"],
+                "platform":          p["platform"],
+                "is_solved":         p["ever_solved"],
+                "stuck_count":       sum(s["hint_count"] for s in p["sessions"]),
+                "detected_approach": (
+                    p["sessions"][0]["detected_approach"]
+                    if p["sessions"] else "Unknown"
+                ),
+                "sessions":          p["sessions"],
+            }
+            for p in cp_stats
+        ]
+
+        # strategy_heatmap: count of detected approaches across all problems
+        heatmap = {}
+        for p in cp_stats:
+            approach = (
+                p["sessions"][0]["detected_approach"]
+                if p["sessions"] else None
             )
-            stuck_sessions = cur.fetchall()
-            conn.close()
-            for row in stuck_sessions:
-                slug = row["problem_slug"]
-                platform = row["platform"]
+            if approach and approach not in ("Unknown", "NONE", None):
+                heatmap[approach] = heatmap.get(approach, 0) + 1
+        stats["strategy_heatmap"] = heatmap
 
-                # REVISING VS AFK LOGIC: Check if it's already in knowledge_docs
-                # If they are just staring at the fully solved code, they are AFK.
-                docs = embedder.search_knowledge_docs(f"{platform.capitalize()}: {slug}", limit = 1)
+        conn.close()
+    except Exception as e:
+        print(f"{_RED}[Dashboard] Stats query error: {e}{_RESET}")
+    return stats
 
-                is_revising = True
-                if docs and "solved" in docs[0].get("tags", []):
-                    solved_code = docs[0].get("code_snippet", "")
-                    current_code = row["code_snapshot"] or ""
-
-                    if current_code and solved_code:
-                        ratio = difflib.SequenceMatcher(None, solved_code, current_code).ratio()
-                        if ratio > 0.95:
-                            is_revising = False # Code matches perfectly. They are just AFK
-                
-                if not is_revising:
-                    print(f"\033[90m[Tracker] '{slug}' code matches solved state perfectly. User is AFK/Reading. Ignoring.\033[0m")
-                    continue
-
-                print(f"{_YELLOW}[Tracker] User stuck on '{slug}' for 3 minutes! Triggering AI...{_RESET}")
-                
-                # Generate a pseudo-context to trigger the existing IPC pipeline
-                # Must include a valid URL format so _idle_handler_background detects it as a CP session!
-                dummy_url = f"https://{platform}.com/problems/{slug}/"
-                pseudo_context = f"[URL: {dummy_url}]\n[TITLE: {platform.capitalize()}: {slug}]\n--- Editor Content ---\n{row['code_snapshot']}"
-                
-                threading.Thread(
-                    target=_idle_handler_background,
-                    args=(state, engine, embedder, pseudo_context),
-                    daemon=True
-                ).start()
-                
-        except Exception as e:
-            print(f"{_RED}[Tracker] Error in tracker loop: {e}{_RESET}")
-
-def pipe_listener_main(state, engine, embedder):
+def pipe_listener_main(state, engine, embedder, mascot):
     handle = connect_to_pipe()
     print("[Python] Listening for events from C++...\n")
 
     reader = threading.Thread(
         target=_pipe_reader_daemon,
-        args=(handle, state, engine, embedder),
+        args=(handle, state, engine, embedder, mascot),
         daemon=True  # Dies automatically if main thread exits
     )
     reader.start()
-
-    # Start the idle tracker daemon
-    tracker = threading.Thread(
-        target=_practice_session_tracker_daemon,
-        args=(state, engine, embedder),
-        daemon=True
-    )
-    tracker.start()
 
     # Main thread stays free — its only job is to catch KeyboardInterrupt
     try:
@@ -717,8 +679,18 @@ if __name__ == "__main__":
     embedder = Embedder()
     flush_worker = FlushWorker(embedder, engine, state=state)
     flush_worker.start()
+    cp_handler = CPEventHandler()
+
+    # Spawn the always-on jugnuBug mascot
+    mascot = MascotController()
+    launcher_path = os.path.join(os.path.dirname(__file__), 'ui', 'launcher.py')
+    mascot.spawn(launcher_path)
+    mascot.start_output_reader(engine, embedder, launcher_path)
+
+    # Wire the mascot into the cp_handler so it can update state
+    cp_handler.mascot = mascot
 
     # Python is now a pure headless AI backend.
     # The listener loop runs synchronously on the main thread.
-    pipe_listener_main(state, engine, embedder)
+    pipe_listener_main(state, engine, embedder, mascot)
 

@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jugnu</title>
+
+  <!--  KaTeX – math rendering  -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+        onerror="this.disabled=true">
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"
+          onerror="window._katexFailed=true"></script>
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+          onerror="window._katexFailed=true"></script>
+
+  <!--  marked.js – Markdown rendering  -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"
+          onerror="window.marked={parse:t=>t}"></script>
+
+  <style>
+    /* ─── RESET ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ─── CATPPUCCIN MOCHA TOKENS ────────────────────────────── */
+    :root {
+      --base:      #1e1e2e;
+      --mantle:    #181825;
+      --crust:     #11111b;
+      --surface0:  #313244;
+      --surface1:  #45475a;
+      --overlay0:  #6c7086;
+      --text:      #cdd6f4;
+      --subtext0:  #a6adc8;
+      --subtext1:  #bac2de;
+      --blue:      #89b4fa;
+      --green:     #a6e3a1;
+      --amber:     #f9e2af;
+      --red:       #f38ba8;
+      --orange:    #fab387;
+      --mauve:     #cba6f7;
+      --radius:    12px;
+      --radius-sm: 8px;
+    }
+
+    /* ─── ROOT ───────────────────────────────────────────────── */
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: var(--mantle);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ─── SIDEBAR SHELL ──────────────────────────────────────── */
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      width: 100%; height: 100%;
+      background: var(--mantle);
+      border: 1px solid var(--surface1);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.04);
+      /* Initial hidden state */
+      opacity: 0;
+      transform: translateY(20px);
+    }
+    /* Animation trigger class */
+    .sidebar.animating {
+      animation: slideInUp 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+    }
+    @keyframes slideInUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ─── HEADER ─────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 11px 14px;
+      background: var(--surface0);
+      border-bottom: 1px solid var(--surface1);
+      min-height: 46px;
+      flex-shrink: 0;
+      transition: background 0.3s, border-color 0.3s;
+    }
+    .header.solved {
+      background: rgba(166, 227, 161, 0.10);
+      border-color: rgba(166, 227, 161, 0.25);
+    }
+    .header-icon { font-size: 17px; flex-shrink: 0; }
+    .header-title {
+      font-size: 13px; font-weight: 600; color: var(--text); flex: 1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .close-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--overlay0); font-size: 16px; line-height: 1;
+      padding: 3px 5px; border-radius: 5px;
+      transition: color 0.15s, background 0.15s;
+    }
+    .close-btn:hover { color: var(--red); background: rgba(243,139,168,0.12); }
+
+    /* ─── LEVEL BADGE ────────────────────────────────────────── */
+    .badge {
+      padding: 2px 8px; border-radius: 999px;
+      font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
+      text-transform: uppercase; flex-shrink: 0;
+      display: none;  /* shown via JS */
+    }
+    .badge-blue  { color: var(--blue);  background: rgba(137,180,250,0.12); border: 1px solid rgba(137,180,250,0.3); }
+    .badge-amber { color: var(--amber); background: rgba(249,226,175,0.12); border: 1px solid rgba(249,226,175,0.3); }
+    .badge-red   { color: var(--red);   background: rgba(243,139,168,0.12); border: 1px solid rgba(243,139,168,0.3); }
+    .badge-green { color: var(--green); background: rgba(166,227,161,0.12); border: 1px solid rgba(166,227,161,0.3); }
+
+    .source-strip {
+      display: none;  /* shown via JS */
+      align-items: center;
+      gap: 7px;
+      padding: 6px 14px;
+      background: var(--surface0);
+      font-size: 11px; color: var(--subtext0); font-weight: 500;
+    }
+    .source-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--orange); flex-shrink: 0;
+    }
+    
+    /* ─── NEW UI ELEMENTS ────────────────────────────────────── */
+    .strategy-badge {
+      display: none; margin-left: 6px; padding: 2px 8px; border-radius: 999px;
+      font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
+      text-transform: uppercase; color: var(--mauve); background: rgba(203,166,247,0.12); border: 1px solid rgba(203,166,247,0.3);
+      flex-shrink: 0;
+    }
+    .flow-dot {
+      width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+      margin-left: 10px; margin-right: 4px; flex-shrink: 0;
+    }
+    .flow-STUCK { background: var(--red); box-shadow: 0 0 5px var(--red); }
+    .flow-PROGRESSING { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .flow-READING { background: var(--amber); box-shadow: 0 0 5px var(--amber); }
+    .flow-label { font-size: 10px; font-weight: 700; color: var(--subtext0); text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; }
+    
+    .tags-container {
+      display: none; padding: 0 14px 8px; background: var(--surface0); border-bottom: 1px solid var(--surface1);
+      gap: 6px; flex-wrap: wrap;
+    }
+    .tag-pill {
+      font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+      padding: 2px 6px; border-radius: 4px;
+      background: rgba(137, 180, 250, 0.1); color: var(--blue); border: 1px solid rgba(137, 180, 250, 0.2);
+    }
+
+    /* ─── MAIN CONTENT ───────────────────────────────────────── */
+    .content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      line-height: 1.65;
+      scrollbar-width: thin;
+      scrollbar-color: var(--surface1) transparent;
+    }
+    .content::-webkit-scrollbar { width: 8px; }
+    .content::-webkit-scrollbar-thumb { background: var(--surface0); border-radius: 4px; }
+
+    /* Markdown content typography */
+    .content p { margin-bottom: 10px; }
+    .content p:last-child { margin-bottom: 0; }
+    .content strong { font-weight: 600; color: var(--text); }
+    .content em { font-style: italic; color: var(--subtext1); }
+    .content code {
+      background: var(--surface0); color: var(--mauve);
+      padding: 1px 5px; border-radius: 4px;
+      font-family: Consolas, 'Cascadia Code', monospace; font-size: 11.5px;
+    }
+    .content pre {
+      background: var(--surface0); border: 1px solid var(--surface1);
+      border-radius: var(--radius-sm); padding: 12px;
+      overflow-x: auto; margin: 10px 0;
+    }
+    .content pre code { background: none; padding: 0; color: var(--text); font-size: 12px; }
+    .content ul, .content ol { padding-left: 20px; margin-bottom: 10px; }
+    .content li { margin-bottom: 4px; }
+    .content h1, .content h2, .content h3 {
+      color: var(--text); font-weight: 600; margin: 12px 0 6px;
+    }
+    .content blockquote {
+      border-left: 3px solid var(--blue); margin: 10px 0;
+      padding: 6px 12px; color: var(--subtext1);
+    }
+
+    /* KaTeX overrides so math doesn't overflow */
+    .katex { font-size: 1em !important; }
+    .katex-display { overflow-x: auto; padding: 4px 0; }
+
+    /* Nudge-mode styles */
+    .nudge-lead {
+      font-size: 14px; color: var(--subtext1);
+      margin-bottom: 12px; line-height: 1.5;
+    }
+    .context-box {
+      background: var(--surface0); border: 1px solid var(--surface1);
+      border-left: 3px solid var(--orange);
+      border-radius: var(--radius-sm); padding: 10px 12px;
+      font-size: 11.5px; color: var(--subtext0);
+      font-family: Consolas, monospace; line-height: 1.45;
+      white-space: pre-wrap; word-break: break-word;
+      max-height: 90px; overflow-y: auto;
+    }
+
+    /* Loading spinner */
+    .loading-wrap {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 14px; padding: 28px 0; color: var(--subtext0);
+    }
+    .spinner {
+      width: 30px; height: 30px;
+      border: 2px solid var(--surface1);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-wrap .sub { font-size: 11px; color: var(--overlay0); text-align: center; }
+
+    /* ─── CUSTOM PROBLEM INPUT ───────────────────────────────── */
+    .custom-wrap {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--surface1);
+      flex-shrink: 0;
+    }
+    .custom-wrap textarea {
+      background: var(--surface0); border: 1px solid var(--surface1);
+      border-radius: var(--radius-sm); color: var(--text);
+      font-family: inherit; font-size: 13px;
+      padding: 10px; resize: none; height: 80px; width: 100%;
+      outline: none; transition: border-color 0.15s;
+    }
+    .custom-wrap textarea:focus { border-color: var(--blue); }
+    .custom-wrap textarea::placeholder { color: var(--overlay0); }
+
+    /* ─── ACTIONS BAR ────────────────────────────────────────── */
+    .actions {
+      display: flex; gap: 7px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--surface1);
+      flex-shrink: 0;
+    }
+    .actions.solo { justify-content: center; }
+
+    .btn {
+      flex: 1;
+      padding: 7px 10px;
+      border-radius: var(--radius-sm);
+      font-family: inherit; font-size: 12px; font-weight: 500;
+      cursor: pointer; white-space: nowrap;
+      transition: filter 0.15s, transform 0.1s;
+    }
+    .btn:hover  { filter: brightness(1.2); transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); filter: brightness(0.95); }
+
+    .btn-green { color: var(--green); background: rgba(166,227,161,0.10); border: 1px solid rgba(166,227,161,0.25); }
+    .btn-red   { color: var(--red);   background: rgba(243,139,168,0.10); border: 1px solid rgba(243,139,168,0.25); }
+    .btn-amber { color: var(--amber); background: rgba(249,226,175,0.10); border: 1px solid rgba(249,226,175,0.25); }
+    .btn-blue  { color: var(--blue);  background: rgba(137,180,250,0.10); border: 1px solid rgba(137,180,250,0.25); }
+    .btn-ghost { color: var(--subtext0); background: transparent; border: 1px solid var(--surface1); }
+    .btn-full  { flex: none; width: 100%; padding: 9px; font-size: 13px; }
+
+    /* ─── CHAT BUBBLES ───────────────────────────────────────── */
+    .chat-history { margin-bottom: 16px; }
+    .chat-bubble {
+      background: rgba(49, 50, 68, 0.4); border-radius: var(--radius-sm);
+      padding: 8px 12px; margin-bottom: 8px; font-size: 11.5px; color: var(--subtext1);
+      border-left: 3px solid var(--overlay0);
+    }
+    .chat-bubble-label {
+      font-size: 10px; font-weight: 700; color: var(--overlay0);
+      text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px;
+    }
+
+    /* ─── TIMER BAR ──────────────────────────────────────────── */
+    .timer-track { height: 3px; background: var(--surface0); flex-shrink: 0; }
+    .timer-fill  {
+      height: 100%; width: 100%;
+      background: linear-gradient(90deg, var(--blue), var(--mauve));
+    }
+
+    /* ─── DASHBOARD VIEW ─────────────────────────────────────── */
+    #dashboardView {
+      display: none; flex: 1; overflow-y: auto; padding: 16px;
+      scrollbar-width: thin; scrollbar-color: var(--surface1) transparent;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .dash-grid { display: flex; flex-direction: column; gap: 20px; }
+    .dash-card {
+      background: rgba(49, 50, 68, 0.4); border: 1px solid var(--surface1);
+      border-radius: var(--radius); padding: 14px;
+    }
+    .dash-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
+    .history-list { display: flex; flex-direction: column; gap: 8px; }
+    .history-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px; background: rgba(30, 30, 46, 0.5); border-radius: 6px;
+    }
+    .history-slug { color: var(--text); font-weight: 500; font-size: 12px; }
+    .history-meta { color: var(--subtext0); font-size: 10px; display: flex; gap: 6px; }
+    .dash-card canvas { width: 100% !important; max-height: 200px !important; }
+    /* ─── CP_NUDGE FLOATING BUBBLE ─────────────────────────── */
+    /* Lives outside .sidebar so it overlays even when sidebar is hidden */
+    #nudgeBubble {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      width: 270px;
+      background: rgba(24, 24, 37, 0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(137, 180, 250, 0.28);
+      border-radius: 14px;
+      padding: 14px 16px 12px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04);
+      z-index: 99999;
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      animation: nudgeSlideIn 0.35s cubic-bezier(0.34,1.56,0.64,1) forwards;
+    }
+    #nudgeBubble.visible { display: flex; }
+    @keyframes nudgeSlideIn {
+      from { opacity: 0; transform: translateY(18px) scale(0.96); }
+      to   { opacity: 1; transform: translateY(0)   scale(1);    }
+    }
+    .nudge-bubble-header {
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .nudge-bubble-title {
+      display: flex; align-items: center; gap: 7px;
+      font-size: 12px; font-weight: 700; color: var(--text); letter-spacing: 0.2px;
+    }
+    .nudge-bubble-title .nudge-icon { font-size: 15px; }
+    .nudge-bubble-close {
+      background: none; border: none; cursor: pointer;
+      color: var(--overlay0); font-size: 14px;
+      padding: 2px 4px; border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+      line-height: 1;
+    }
+    .nudge-bubble-close:hover { color: var(--red); background: rgba(243,139,168,0.12); }
+    .nudge-bubble-body {
+      font-size: 12px; color: var(--subtext1); line-height: 1.55;
+    }
+    .nudge-bubble-body strong { color: var(--text); }
+    .nudge-bubble-progress {
+      height: 2px;
+      background: var(--surface1);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .nudge-bubble-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--blue), var(--mauve));
+      border-radius: 999px;
+      transition: width 0.25s linear;
+      width: 100%;
+    }
+    .nudge-bubble-actions {
+      display: flex; gap: 6px;
+    }
+    .nudge-btn {
+      flex: 1; padding: 6px 8px; border-radius: 8px;
+      font-family: inherit; font-size: 11px; font-weight: 600;
+      cursor: pointer; white-space: nowrap;
+      transition: filter 0.15s, transform 0.1s;
+    }
+    .nudge-btn:hover  { filter: brightness(1.2); transform: translateY(-1px); }
+    .nudge-btn:active { transform: translateY(0); }
+    .nudge-btn-yes  { color: var(--green); background: rgba(166,227,161,0.12); border: 1px solid rgba(166,227,161,0.28); }
+    .nudge-btn-skip { color: var(--subtext0); background: transparent; border: 1px solid var(--surface1); }
+
+  </style>
+</head>
+
+<body>
+<div class="sidebar" id="sidebar">
+
+  <!-- HEADER -->
+  <div class="header" id="header">
+    <span class="header-icon" id="hIcon">🔥</span>
+    <div style="flex:1; display:flex; align-items:center; overflow:hidden;">
+      <span class="header-title" id="hTitle" style="flex:none;">Jugnu</span>
+      <span class="flow-dot" id="hFlowDot" style="display:none"></span>
+      <span class="flow-label" id="hFlowLabel" style="display:none"></span>
+    </div>
+    <span class="strategy-badge" id="hStrategy"></span>
+    <span class="badge" id="hBadge"></span>
+    <button class="close-btn" onclick="toggleDashboard()" title="Dashboard">⚙️</button>
+    <button class="close-btn" onclick="onDismiss()" title="Dismiss">✕</button>
+  </div>
+
+  <!-- SOURCE STRIP -->
+  <div class="source-strip" id="sourceStrip">
+    <span class="source-dot"></span>
+    <span id="sourceText"></span>
+  </div>
+  
+  <!-- TAGS CONTAINER -->
+  <div class="tags-container" id="tagsContainer"></div>
+
+  <!-- CONTENT AREA -->
+  <div class="content" id="content"></div>
+
+  <!-- DASHBOARD AREA -->
+  <div id="dashboardView">
+    <div class="dash-grid">
+      <div class="dash-card">
+        <div class="dash-title">Focus & Throttle (EMA)</div>
+        <canvas id="emaChart"></canvas>
+      </div>
+      <div class="dash-card">
+        <div class="dash-title">Strategy Heatmap</div>
+        <canvas id="strategyChart"></canvas>
+      </div>
+      <div class="dash-card">
+        <div class="dash-title">Recent CP History</div>
+        <div class="history-list" id="historyList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CUSTOM PROBLEM INPUT (describe mode) -->
+  <div class="custom-wrap" id="customWrap">
+    <textarea id="customInput" placeholder="What are you stuck on? Describe your problem..."></textarea>
+    <button class="btn btn-blue btn-full" onclick="onSubmitCustom()">Ask Jugnu →</button>
+  </div>
+
+  <!-- ACTIONS BAR -->
+  <div class="actions" id="actions" style="display:none"></div>
+
+
+
+  <!-- TIMER BAR -->
+  <div class="timer-track">
+    <div class="timer-fill" id="timerFill"></div>
+  </div>
+
+</div><!-- /sidebar -->
+
+<!-- ── CP_NUDGE BUBBLE (floats above everything, independent of sidebar) ── -->
+<div id="nudgeBubble">
+  <div class="nudge-bubble-header">
+    <div class="nudge-bubble-title">
+      <span class="nudge-icon">🤔</span>
+      <span id="nudgeBubbleTitle">Looks like you're stuck</span>
+    </div>
+    <button class="nudge-bubble-close" id="nudgeBubbleClose" title="Dismiss">✕</button>
+  </div>
+  <div class="nudge-bubble-body" id="nudgeBubbleBody">
+    You've been on this problem for a while.
+    Want a <strong>hint</strong> from Jugnu?
+  </div>
+  <div class="nudge-bubble-progress">
+    <div class="nudge-bubble-progress-fill" id="nudgeProgressFill"></div>
+  </div>
+  <div class="nudge-bubble-actions">
+    <button class="nudge-btn nudge-btn-yes"  id="nudgeBubbleHint">💡 Hint</button>
+    <button class="nudge-btn nudge-btn-yes"  id="nudgeBubbleReview" style="color:var(--amber); border-color:rgba(249,226,175,0.28); background:rgba(249,226,175,0.12)">👀 Review</button>
+    <button class="nudge-btn nudge-btn-skip" id="nudgeBubbleSkip">Dismiss</button>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   STATE MACHINE
+   Modes: practice_hint | practice_solved | nudge | loading | result
+   ═══════════════════════════════════════════════════════════ */
+
+// ── Global button handler registry ──────────────────────────
+window._H = [];   // reset each setActions() call
+
+// ── Timer state ──────────────────────────────────────────────
+let _timerSecs = 0, _timerLeft = 0, _timerTick = null, _hovered = false;
+document.getElementById('sidebar').addEventListener('mouseenter', () => { _hovered = true; });
+document.getElementById('sidebar').addEventListener('mouseleave', () => { _hovered = false; });
+
+// ── PyWebView initialisation ─────────────────────────────────
+function _init() {
+  if (window.pywebview) {
+    pywebview.api.get_state()
+      .then(raw => { try { render(JSON.parse(raw)); } catch(e) {} });
+  } else {
+    setTimeout(_init, 80);
+  }
+}
+window.addEventListener('pywebviewready', _init);
+setTimeout(_init, 600); // fallback if event is missed
+
+// ── Python → JS: update state ───────────────────────────────
+window.jugnuUpdateState = function(state) { render(state); };
+
+/* ═══════════════════════════════════════════════════════════
+   DASHBOARD LOGIC
+   ═══════════════════════════════════════════════════════════ */
+let _dashboardOpen = false;
+let _emaChartInst = null;
+let _stratChartInst = null;
+
+function toggleDashboard() {
+  _dashboardOpen = !_dashboardOpen;
+  const db = document.getElementById('dashboardView');
+  const content = document.getElementById('content');
+  const source = document.getElementById('sourceStrip');
+  const tags = document.getElementById('tagsContainer');
+  const actions = document.getElementById('actions');
+  const custom = document.getElementById('customWrap');
+
+  if (_dashboardOpen) {
+    db.style.display = 'block';
+    content.style.display = 'none';
+    if(source) source.style.display = 'none';
+    if(tags) tags.style.display = 'none';
+    if(actions) actions.style.display = 'none';
+    if(custom) custom.style.display = 'none';
+    fetchAndRenderDashboard();
+  } else {
+    db.style.display = 'none';
+    content.style.display = 'block';
+    if(window._lastState) {
+      render(window._lastState);
+      if (window._isThinking) {
+        _hide('actions');
+        const c = document.getElementById('content');
+        c.innerHTML += `
+          <div class="loading-wrap" style="padding: 20px 0 10px;">
+            <div class="spinner"></div>
+            <p class="sub" style="margin-top:10px;">Thinking...</p>
+          </div>`;
+        c.scrollTop = c.scrollHeight;
+      }
+    }
+  }
+}
+
+function fetchAndRenderDashboard() {
+  if (!window.pywebview) return;
+  pywebview.api.get_dashboard_stats().then(raw => {
+    try {
+      const stats = JSON.parse(raw);
+      renderDashboardCharts(stats);
+    } catch(e) { console.error("Error rendering dashboard", e); }
+  });
+}
+
+function renderDashboardCharts(stats) {
+  Chart.defaults.color = '#a6adc8';
+  Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+  // 1. EMA Chart
+  const emaCtx = document.getElementById('emaChart').getContext('2d');
+  if (_emaChartInst) _emaChartInst.destroy();
+  const topEma = stats.ema_scores.slice(0, 5);
+  _emaChartInst = new Chart(emaCtx, {
+    type: 'bar',
+    data: {
+      labels: topEma.map(e => e.app),
+      datasets: [{
+        label: 'EMA Score',
+        data: topEma.map(e => e.score),
+        backgroundColor: '#89b4fa',
+        borderRadius: 4
+      }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' } }, y: { grid: { display: false } } }
+    }
+  });
+
+  // 2. Strategy Heatmap
+  const stratCtx = document.getElementById('strategyChart').getContext('2d');
+  if (_stratChartInst) _stratChartInst.destroy();
+  const labels = Object.keys(stats.strategy_heatmap);
+  const data = Object.values(stats.strategy_heatmap);
+  const colors = ['#cba6f7', '#89b4fa', '#a6e3a1', '#f9e2af', '#f38ba8'];
+  
+  _stratChartInst = new Chart(stratCtx, {
+    type: 'doughnut',
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, borderWidth: 0, hoverOffset: 4 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: {size: 10} } } }, cutout: '70%' }
+  });
+
+  // 3. History List
+  const list = document.getElementById('historyList');
+  list.innerHTML = '';
+  stats.cp_history.slice(0, 10).forEach(h => {
+    const isSolved = h.is_solved ? '<span style="color:var(--green)">✓</span>' : '<span style="color:var(--red)">✗</span>';
+    list.innerHTML += `
+      <div class="history-item">
+        <div>
+          <div class="history-slug">${h.slug}</div>
+          <div class="history-meta">${h.platform} • Stuck: ${h.stuck_count}x • ${h.detected_approach || 'Unknown'}</div>
+        </div>
+        <div style="font-size:16px;">${isSolved}</div>
+      </div>
+    `;
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RENDER DISPATCHER
+   ═══════════════════════════════════════════════════════════ */
+function render(s) {
+  window._lastState = s;
+  window._isThinking = false;
+
+  if (_dashboardOpen) {
+    if (s.mode === 'practice_hint' || s.mode === 'practice_solved' || s.mode === 'result' || s.mode === 'loading') {
+      _dashboardOpen = false;
+      document.getElementById('dashboardView').style.display = 'none';
+      document.getElementById('content').style.display = 'block';
+      const actions = document.getElementById('actions');
+      if(actions) actions.style.display = 'flex';
+      const source = document.getElementById('sourceStrip');
+      if(source) source.style.display = 'flex';
+    } else {
+      fetchAndRenderDashboard();
+      return;
+    }
+  }
+  
+  stopTimer();
+  _hideCustomInput();
+
+  // Re-trigger slide animation
+  const sb = document.getElementById('sidebar');
+  sb.style.animation = 'none'; sb.offsetHeight;
+  sb.style.animation = '';
+
+  // Clear solved styling
+  document.getElementById('header').classList.remove('solved');
+
+  switch (s.mode) {
+    case 'practice_hint':   return _renderHint(s);
+    case 'practice_solved': return _renderSolved(s);
+    case 'nudge':           return _renderNudge(s);
+    case 'loading':         return _renderLoading();
+    case 'result':          return _renderResult(s);
+    default:                return _renderNudge(s);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MODE RENDERERS
+   ═══════════════════════════════════════════════════════════ */
+
+// ── Practice Hint ────────────────────────────────────────────
+function _renderHint(s) {
+  const typeStr = s.hint_type ? String(s.hint_type).toUpperCase() : 'CONCEPTUAL';
+  let badgeCls = 'badge-blue';
+  if (typeStr.includes('LOGIC')) badgeCls = 'badge-amber';
+  else if (typeStr.includes('IMPLEMENTATION') || typeStr.includes('SYNTAX')) badgeCls = 'badge-red';
+  
+  const info = { label: '💡 ' + typeStr, cls: badgeCls };
+  const title = s.slug || 'Practice Hint';
+
+  _setHeader('🧠', title, info, s.approach, s.user_state);
+  _setSource(s.sources);
+  if (s.platform) _setTags([s.platform]);
+  else _setTags([]);
+
+  let html = '';
+  if (s.history && s.history.length > 0) {
+    html += '<div class="chat-history">';
+    s.history.forEach((h, i) => {
+      html += `<div class="chat-bubble">
+                 <div class="chat-bubble-label">Past Hint #${i+1}</div>
+                 ${_md(h)}
+               </div>`;
+    });
+    html += '</div>';
+  }
+  html += _md(s.hint_text || '');
+  _setContent(html);
+
+  // Auto-scroll to bottom of chat
+  const c = document.getElementById('content');
+  c.scrollTop = c.scrollHeight;
+
+  _setActions([
+    { label: '✓ Got it',          cls: 'btn-green', fn: () => pywebview.api.feedback('helpful')     },
+    { label: '✗ Not helpful',     cls: 'btn-red',   fn: () => pywebview.api.feedback('not_helpful') },
+    { label: '↓ Go deeper',       cls: 'btn-amber', fn: onGoDeeper },
+  ]);
+
+  startTimer(30);
+}
+
+// ── Solved / Efficiency Review ───────────────────────────────
+function _renderSolved(s) {
+  document.getElementById('header').classList.add('solved');
+  const title = s.slug || 'Problem Solved!';
+  _setHeader('🏆', title, { label: 'Accepted', cls: 'badge-green' }, null, null);
+  _setSource(s.sources);
+  if (s.platform) _setTags([s.platform]);
+  else _setTags([]);
+  _setContent(_md(s.hint_text || ''));
+
+  const el = document.getElementById('actions');
+  el.className = 'actions solo';
+  _setActions([
+    { label: '✓ Awesome, close!', cls: 'btn-green btn-full', fn: () => pywebview.api.dismiss() }
+  ], /* keepClass */ true);
+}
+
+// ── Nudge (general mode stage 1) ────────────────────────────
+function _renderNudge(s) {
+  _setHeader('🔥', 'Need a Hand?', null);
+  _hide('sourceStrip');
+
+  const ctx = (s.summary || '').slice(0, 280);
+  const ctxHtml = ctx
+    ? `<div class="context-box">${_esc(ctx)}</div>`
+    : '';
+  _setContent(`<p class="nudge-lead">You've been coding for a while!<br>I noticed some context in your session.</p>${ctxHtml}`);
+
+  _setActions([
+    { label: '📋 Use this context', cls: 'btn-blue',  fn: () => pywebview.api.confirm_context('yes') },
+    { label: '✏️ Describe it',     cls: 'btn-amber', fn: _showDescribeInput                          },
+    { label: 'No thanks',          cls: 'btn-ghost', fn: () => pywebview.api.decline()               },
+  ]);
+
+  startTimer(30);
+}
+
+// ── Loading ──────────────────────────────────────────────────
+function _renderLoading() {
+  _setHeader('🔥', 'Thinking...', null);
+  _hide('sourceStrip');
+  _setContent(`
+    <div class="loading-wrap">
+      <div class="spinner"></div>
+      <p>Querying Gemma…</p>
+      <p class="sub">Feel free to keep coding —<br>the insight will appear here.</p>
+    </div>`);
+  _setActions([]);
+}
+
+// ── Result (general mode insight) ───────────────────────────
+function _renderResult(s) {
+  _setHeader('💡', "Jugnu's Insight", null);
+  _setSource(s.sources);
+  _setContent(_md(s.insight || ''));
+
+  const el = document.getElementById('actions');
+  el.className = 'actions solo';
+  _setActions([
+    { label: '✓ Got it!', cls: 'btn-green', fn: () => pywebview.api.dismiss() }
+  ], true);
+
+  startTimer(60);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SUB-ACTIONS
+   ═══════════════════════════════════════════════════════════ */
+function _showDescribeInput() {
+  stopTimer();
+  _hide('actions');
+  const w = document.getElementById('customWrap');
+  w.style.display = 'flex';
+  document.getElementById('customInput').focus();
+}
+
+function _hideCustomInput() {
+  document.getElementById('customWrap').style.display = 'none';
+  document.getElementById('customInput').value = '';
+}
+
+function onSubmitCustom() {
+  const text = document.getElementById('customInput').value.trim();
+  if (!text) return;
+  _hideCustomInput();
+  _setContent(`<div class="loading-wrap"><div class="spinner"></div><p>Querying Gemma…</p></div>`);
+  _setActions([]);
+  pywebview.api.submit_custom(text);
+}
+
+function onDismiss() { stopTimer(); pywebview.api.dismiss(); }
+
+function onGoDeeper() {
+  stopTimer();
+  _hide('actions');
+  window._isThinking = true;
+  const c = document.getElementById('content');
+  c.innerHTML += `
+    <div class="loading-wrap" style="padding: 20px 0 10px;">
+      <div class="spinner"></div>
+      <p class="sub" style="margin-top:10px;">Thinking...</p>
+    </div>`;
+  c.scrollTop = c.scrollHeight;
+  pywebview.api.feedback('escalate');
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TIMER BAR (30s / 60s auto-dismiss)
+   ═══════════════════════════════════════════════════════════ */
+function startTimer(secs) {
+  stopTimer();
+  _timerSecs = secs; _timerLeft = secs;
+  const fill = document.getElementById('timerFill');
+  fill.style.width = '100%';
+
+  _timerTick = setInterval(() => {
+    if (_hovered) return;  // pause on hover
+    _timerLeft -= 0.25;
+    const pct = Math.max(0, _timerLeft / _timerSecs * 100);
+    fill.style.width = pct + '%';
+    if (_timerLeft <= 0) { stopTimer(); pywebview.api.dismiss(); }
+  }, 250);
+}
+
+function stopTimer() {
+  if (_timerTick) { clearInterval(_timerTick); _timerTick = null; }
+  document.getElementById('timerFill').style.width = '100%';
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DOM HELPERS
+   ═══════════════════════════════════════════════════════════ */
+function _setHeader(icon, title, badge, strategy, userState) {
+  document.getElementById('hIcon').textContent  = icon;
+  document.getElementById('hTitle').textContent = title;
+  const b = document.getElementById('hBadge');
+  if (badge) {
+    b.textContent = badge.label;
+    b.className   = 'badge ' + badge.cls;
+    b.style.display = '';
+  } else {
+    b.style.display = 'none';
+  }
+
+  const strat = document.getElementById('hStrategy');
+  if (strategy) {
+    strat.textContent = `🎯 ` + strategy;
+    strat.style.display = '';
+  } else {
+    strat.style.display = 'none';
+  }
+
+  const fd = document.getElementById('hFlowDot');
+  const fl = document.getElementById('hFlowLabel');
+  if (userState) {
+    fd.className = 'flow-dot flow-' + userState.toUpperCase();
+    fd.style.display = '';
+    fl.textContent = userState;
+    fl.style.display = '';
+  } else {
+    fd.style.display = 'none';
+    fl.style.display = 'none';
+  }
+}
+
+function _setSource(src) {
+  const strip = document.getElementById('sourceStrip');
+  if (src) {
+    document.getElementById('sourceText').textContent = src;
+    strip.style.display = 'flex';
+    if (!document.getElementById('tagsContainer').style.display || document.getElementById('tagsContainer').style.display === 'none') {
+        strip.style.borderBottom = '1px solid var(--surface1)';
+    } else {
+        strip.style.borderBottom = 'none';
+    }
+  } else {
+    strip.style.display = 'none';
+  }
+}
+
+function _setTags(tags) {
+  const container = document.getElementById('tagsContainer');
+  const strip = document.getElementById('sourceStrip');
+  if (tags && tags.length > 0) {
+    container.innerHTML = tags.map(t => `<span class="tag-pill">${_esc(t)}</span>`).join('');
+    container.style.display = 'flex';
+    strip.style.borderBottom = 'none';
+  } else {
+    container.style.display = 'none';
+    strip.style.borderBottom = '1px solid var(--surface1)';
+  }
+}
+
+function _setContent(html) {
+  const el = document.getElementById('content');
+  el.innerHTML = html;
+  // KaTeX auto-render (math inside markdown)
+  if (window.renderMathInElement && !window._katexFailed) {
+    try {
+      renderMathInElement(el, {
+        delimiters: [
+          { left: '$$', right: '$$', display: true  },
+          { left: '$',  right: '$',  display: false },
+          { left: '\\[', right: '\\]', display: true  },
+          { left: '\\(', right: '\\)', display: false },
+        ],
+        throwOnError: false,
+      });
+    } catch(e) {}
+  }
+}
+
+function _setActions(buttons, keepClass) {
+  const el = document.getElementById('actions');
+  if (!keepClass) el.className = 'actions';
+  window._H = [];
+  if (!buttons.length) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = buttons.map((b, i) => {
+    window._H.push(b.fn);
+    return `<button class="btn ${b.cls}" onclick="window._H[${i}]()">${b.label}</button>`;
+  }).join('');
+}
+
+function _md(text) {
+  if (!text) return '';
+  try { return window.marked ? marked.parse(text) : _esc(text); }
+  catch(e) { return _esc(text); }
+}
+
+function _esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function _show(id) { document.getElementById(id).style.display = ''; }
+function _hide(id) { document.getElementById(id).style.display = 'none'; }
+
+/* ═══════════════════════════════════════════════════════════
+   CP_NUDGE BUBBLE CONTROLLER
+   showNudgeBubble(title?, body?) — called from Python via evaluate_js
+   ═══════════════════════════════════════════════════════════ */
+(function() {
+  const NUDGE_DURATION_MS = 120_000; // 2 minutes
+  let _nudgeTimer  = null;
+  let _nudgeTick   = null;
+  let _nudgeStart  = 0;
+
+  const bubble   = document.getElementById('nudgeBubble');
+  const fill     = document.getElementById('nudgeProgressFill');
+  const titleEl  = document.getElementById('nudgeBubbleTitle');
+  const bodyEl   = document.getElementById('nudgeBubbleBody');
+  const btnHint    = document.getElementById('nudgeBubbleHint');
+  const btnReview  = document.getElementById('nudgeBubbleReview');
+  const btnSkip    = document.getElementById('nudgeBubbleSkip');
+  const btnClose = document.getElementById('nudgeBubbleClose');
+
+  function _dismissNudge() {
+    bubble.classList.remove('visible');
+    clearTimeout(_nudgeTimer);
+    clearInterval(_nudgeTick);
+    _nudgeTimer = null;
+    _nudgeTick  = null;
+  }
+
+  function _startProgressTick() {
+    _nudgeStart = Date.now();
+    fill.style.width = '100%';
+    clearInterval(_nudgeTick);
+    _nudgeTick = setInterval(() => {
+      const elapsed = Date.now() - _nudgeStart;
+      const pct = Math.max(0, 100 - (elapsed / NUDGE_DURATION_MS * 100));
+      fill.style.width = pct + '%';
+      if (pct <= 0) { clearInterval(_nudgeTick); _nudgeTick = null; }
+    }, 250);
+  }
+
+  window.showNudgeBubble = function(title, body) {
+    if (title) titleEl.textContent = title;
+    if (body)  bodyEl.innerHTML = body;
+
+    // Force re-animation on repeated shows
+    bubble.classList.remove('visible');
+    bubble.offsetHeight; // reflow
+    bubble.classList.add('visible');
+
+    clearTimeout(_nudgeTimer);
+    _nudgeTimer = setTimeout(_dismissNudge, NUDGE_DURATION_MS);
+    _startProgressTick();
+  };
+
+  window.hideNudgeBubble = function() { _dismissNudge(); };
+
+  btnClose.addEventListener('click', _dismissNudge);
+  btnSkip.addEventListener( 'click', _dismissNudge);
+
+  btnHint.addEventListener('click', () => {
+    _dismissNudge();
+    if (window.pywebview) {
+      pywebview.api.nudge_action('reading', 'hint');
+    }
+  });
+
+  btnReview.addEventListener('click', () => {
+    _dismissNudge();
+    if (window.pywebview) {
+      pywebview.api.nudge_action('reading', 'review');
+    }
+  });
+
+  btnSkip.addEventListener('click', () => {
+    _dismissNudge();
+    if (window.pywebview) {
+      pywebview.api.nudge_action('reading', 'dismiss');
+    }
+  });
+})();
+</script>
+</body>
+</html>

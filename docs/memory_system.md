@@ -5,26 +5,36 @@
 The memory system is a three-tier architecture:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  TIER 3: core_persona (Permanent — Never evicted)               │
-│  "User is preparing for FAANG placements"                       │
-├─────────────────────────────────────────────────────────────────┤
-│  TIER 2: knowledge_docs & vec_knowledge (The OKF Vault)         │
-│  Synthesized JSON knowledge (e.g., Code logic, SQL schemas)     │
-│  "Topic: sqlite_vec integration in db_handler.cpp"              │
-├─────────────────────────────────────────────────────────────────┤
-│  TIER 1: episodic_memories (Rolling — 5,000-row EMA cap)        │
-│  "User read: Virtual Memory — Galvin Ch9 [Mon 3PM]"             │
-│  + vec_episodic (VIRTUAL TABLE — 384-dim float vectors)         │
-├─────────────────────────────────────────────────────────────────┤
-│  TIER 0.5: ocr_buffer (Staging — Cleared by Python flush_worker)│
-│  "Raw dirty screen pixels with UI noise..."                     │
-├─────────────────────────────────────────────────────────────────┤
-│  TIER 0: In-RAM (Hot — Instant access, 30-min flush)            │
-│  EMA priority_map: {"code.exe": 0.89, "chrome.exe": 0.73}      │
-│  Dynamic Governor: Throttles apps where 0 < EMA < 0.25          │
-│  Markov transitions: {"code|chrome|Morning" -> "chrome": 14}    │
-└─────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|  TIER 2: knowledge_docs + vec_knowledge  (Structured Long-Term Memory)|
+|  "Topic: Two Sum — Sliding Window | Tags: cp, leetcode, two-pointers" |
+|  Written to directly by C++ ScreenReader (Gear 1 tab-switch fast path)|
+|  Enriched by Python FlushWorker (TOPIC, TAGS, NOTES + vec embedding)  |
+|  Also holds: practice_sessions + practice_hints (CP Practice Mode)    |
++-----------------------------------------------------------------------+
+|  TIER 1: episodic_memories + vec_episodic  (Rolling Short-Term Memory)|
+|  "User saved: main.cpp with BFS implementation [Mon 3PM]"             |
+|  384-dim e5-small-v2 float vectors. 5,000-row EMA cap.               |
++-----------------------------------------------------------------------+
+|  TIER 0.5: ocr_buffer  (Staging — C++ OCR fallback only)             |
+|  Raw dirty UIA/OCR blobs. Purged after successful FlushWorker sync.   |
+|  NOTE: Gear 1 tab-switch now writes DIRECTLY to knowledge_docs,       |
+|  bypassing ocr_buffer. This table is only for background OCR fallback.|
++-----------------------------------------------------------------------+
+|  TIER 0: In-RAM  (Hot — flushed to SQLite every 30 min)              |
+|  EMA priority_map:   {"code.exe": 0.89, "chrome.exe": 0.73}         |
+|  Dynamic Governor:   throttles apps where 0 < EMA < 0.25             |
+|  Markov transitions: {"code|chrome|Morning" -> "chrome": 14}         |
+|  g_lastCodeBuffer:   live Monaco code from Ghost Clipboard (volatile) |
++-----------------------------------------------------------------------+
+
+Write paths:
+  C++ Gear 1 (tab-switch) ---> knowledge_docs (direct, skips ocr_buffer)
+                           ---> IPC: UIA_EXTRACTION_SAVED -> Python enriches
+  C++ OCR fallback        ---> ocr_buffer -> [FlushWorker 60s] -> knowledge_docs
+  C++ Gear 2 (typing)     ---> g_lastCodeBuffer (RAM only, never touches DB)
+  Python FlushWorker      ---> process_uia_by_id(row_id) -> vec_knowledge embed
+  File Save / Clipboard   ---> episodic_memories + knowledge_docs (via Python)
 ```
 
 ---
@@ -241,3 +251,58 @@ When Jugnu detects a transition into a "Deep Work" state (high EMA app is foregr
 
 **Why `> 0.0`?** 
 Unknown system services (like `svchost.exe` or `csrss.exe`) have a score of `0.0` because Jugnu has never seen the user explicitly switch to them. By only throttling apps with a score `> 0.0`, Jugnu ensures it never accidentally chokes critical Windows OS services, creating a perfectly safe, self-training governor.
+
+---
+
+## 7. Practice Mode Database Schema (Phase 8)
+
+Two tables are created by `db_handler.cpp` specifically for the CP Practice Mode. They exist in the same `jugnu.db` file alongside the core memory tables.
+
+### `practice_sessions`
+One row = one active problem attempt. A session "expires" if `last_seen > 2h ago` OR `is_solved = 1`.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-increment |
+| `problem_slug` | TEXT | e.g., `"two-sum"` |
+| `platform` | TEXT | `"leetcode"` or `"codeforces"` |
+| `session_start` | DATETIME | When the session began |
+| `last_seen` | DATETIME | Updated on every CP event |
+| `code_snapshot` | TEXT | Latest code capture |
+| `detected_approach` | TEXT | Gemma's approach label (e.g., `"Dynamic Programming"`) |
+| `approach_confidence` | REAL | 0.0–1.0 confidence score |
+| `is_solved` | INTEGER | 0 or 1 |
+| `user_state` | TEXT | `'READING'` or `'CODING'` |
+| `last_hint_type` | TEXT | Most recent hint category |
+| `hint_type_history` | TEXT | JSON array of all hint types given |
+
+**Constraint:** `UNIQUE(problem_slug, platform)` is required for Python's `ON CONFLICT DO UPDATE` UPSERT to work correctly. Without it, every hint trigger inserts a new row, resetting `hint_level` to 0.
+
+**Index:** `idx_practice_sessions_lookup ON (problem_slug, platform, is_solved, last_seen)` for O(log N) expiry queries.
+
+### `practice_hints`
+One row = one hint issued during a session.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-increment |
+| `session_id` | INTEGER FK | References `practice_sessions.id` |
+| `timestamp` | DATETIME | When hint was generated |
+| `hint_type` | TEXT NOT NULL | `'CONCEPTUAL'`, `'LOGIC'`, `'IMPLEMENTATION'` (from Gemma `TYPE:`) |
+| `hint_text` | TEXT NOT NULL | The Socratic hint or efficiency review text |
+| `user_state` | TEXT | `'READING'` or `'CODING'` at hint time |
+| `code_snapshot` | TEXT | Code at the moment of the hint |
+| `approach_at_hint` | TEXT | Detected approach when hint was given |
+| `user_feedback` | INTEGER | 1 = helpful, 0 = not helpful, NULL = no feedback |
+| `implicit_code_changed` | INTEGER | 1 if code changed significantly after hint |
+| `test_outcome_after` | TEXT | Future: test result after hint |
+
+**Index:** `idx_practice_hints_session ON (session_id, timestamp DESC)` for O(log N) recent hint retrieval.
+
+### Dashboard Stats Query
+When the user clicks the mascot, `_query_dashboard_stats()` in `ipc_client.py` builds a nested JSON structure:
+- **Level 1:** All problems ever seen (grouped by slug)
+- **Level 2:** All sessions per problem (with hint counts)
+- **Level 3:** All hints per session (type, text, feedback, code snapshot)
+
+This is serialized to `dashboard_state.json` and read by `dashboard.html` at spawn time. The dashboard never queries SQLite directly.

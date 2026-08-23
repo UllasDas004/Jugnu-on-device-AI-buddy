@@ -37,6 +37,9 @@ namespace Jugnu
             return false;
         }
 
+        // Add busy timeout so C++ waits if Python has a lock instead of crashing
+        sqlite3_busy_timeout(db, 30000); // 30 seconds
+
         // P0-FIX: Enable WAL mode for concurrent C++/Python access.
         // Without this, every C++ write locks the entire file, causing Python
         // SQLITE_BUSY even with timeout=5.0 during long flushes.
@@ -419,5 +422,67 @@ namespace Jugnu
         sqlite3_finalize(stmt);
 
         return (rc == SQLITE_DONE);
+    }
+
+    long long DBHandler::SaveToKnowledgeDocs(const std::string& appName, const std::string& windowTitle, const std::string& source, const std::string& tags, const std::string& content, bool& isNew)
+    {
+        if(!db) return -1;
+        ExecuteSQL("BEGIN TRANSACTION;");
+
+        long long rowId = -1;
+        sqlite3_stmt* stmt;
+
+        // 1. Check if row exists for this windowTitle (deduplication)
+        std::string selectSql = "SELECT id FROM knowledge_docs WHERE window_title = ? LIMIT 1;";
+        if(sqlite3_prepare_v2(db, selectSql.c_str(), -1, &stmt, NULL) == SQLITE_OK)
+        {
+            sqlite3_bind_text(stmt, 1, windowTitle.c_str(), -1, SQLITE_TRANSIENT);
+            if(sqlite3_step(stmt) == SQLITE_ROW) rowId = sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+
+        if(rowId != -1)
+        {
+            isNew = false;
+            // 2. Update existing row (Prevents row spam)
+            // DO NOT update content or code_snippet to maintain Idempotent LTM!
+            std::string updateSql = "UPDATE knowledge_docs SET last_updated = CURRENT_TIMESTAMP, capture_count = capture_count + 1 WHERE id = ?;";
+            if(sqlite3_prepare_v2(db, updateSql.c_str(), -1, &stmt, NULL) == SQLITE_OK)
+            {
+                sqlite3_bind_int64(stmt, 1, rowId);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+        }
+        else
+        {
+            // 3. Insert new row
+            std::string sourceType = (appName == "chrome.exe" || appName == "msedge.exe") ? "browser" : "ide";
+            
+            std::string insertSql;
+            if (sourceType == "browser")
+                insertSql = "INSERT INTO knowledge_docs (topic, source_app, source_type, window_title, source_url, tags, content) VALUES ('Uncategorized', ?, ?, ?, ?, ?, ?);";
+            else
+                insertSql = "INSERT INTO knowledge_docs (topic, source_app, source_type, window_title, file_path, tags, content) VALUES ('Uncategorized', ?, ?, ?, ?, ?, ?);";
+
+            if(sqlite3_prepare_v2(db, insertSql.c_str(), -1, &stmt, NULL) == SQLITE_OK)
+            {
+                sqlite3_bind_text(stmt, 1, appName.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 2, sourceType.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 3, windowTitle.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 4, source.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 5, tags.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 6, content.c_str(), -1, SQLITE_TRANSIENT);
+                
+                if(sqlite3_step(stmt) == SQLITE_DONE)
+                {
+                    rowId = sqlite3_last_insert_rowid(db);
+                    isNew = true;
+                }
+                sqlite3_finalize(stmt);
+            }
+        }
+        ExecuteSQL("COMMIT;");
+        return rowId;
     }
 }

@@ -1,299 +1,335 @@
 # 🏗️ Jugnu — System Architecture
 
-This document describes the architectural decisions behind Jugnu — what we built, why we built it this way, and how each design choice is more efficient than what came before.
+## Overview
+
+Jugnu is a native Windows desktop AI coding assistant. Its architecture is a **Three-Layer system**: a C++ kernel for real-time OS event capture, a Python inference backend for AI processing, and a multi-window HTML/JS UI rendered by pywebview (WebView2).
 
 ---
 
-## Core Philosophy
-
-> **Pure algorithms for systems intelligence. ML strictly for language understanding.**
-
-Every routing, caching, prioritization, and deduplication decision is handled by deterministic algorithms — not neural networks. The LLM (Gemma) only fires when the user needs natural language: when they ask a question or when text must be semantically understood.
-
-The architectural boundary is simple and absolute:
-- **C++** owns everything that must be always-on, zero-latency, and system-level.
-- **Python** owns everything that involves a neural network, a prompt, or an embedding.
-- They share state through a single SQLite database (WAL mode) and communicate lightweight telemetry over Windows Named Pipes.
-
----
-
-## Why C++ + Python, Not Pure Python?
-
-Early prototypes ran the entire monitor loop in Python. The problem was immediate: Python's GIL (Global Interpreter Lock) meant that a long Gemma inference call would momentarily freeze the clipboard monitor and miss events. Clipboard captures were dropped, app-switch timestamps were skewed.
-
-The split fixes this permanently. The C++ engine is a native Windows process — it hooks into the OS event loop directly and is physically incapable of being blocked by Python inference. Python becomes a completely independent process that can take as long as it needs without affecting data collection.
-
----
-
-## The Three-Layer Architecture
+## The Three Layers
 
 ```
-┌──────────────────────────────────────────────────┐
-│         C++ ENGINE  (jugnu.exe)                  │
-│  Always-on. Event-driven. Zero-overhead.         │
-│  • App switch tracking (WinEventHook)            │
-│  • Screen capture (IUIAutomation + WinRT OCR)    │
-│  • Stuck timer (3-min idle detection)            │
-│  • SQLite database (shared memory vault)         │
-│  • DSA memory systems (Markov + EMA)             │
-│  • Named Pipe IPC server                         │
-└──────────────────┬───────────────────────────────┘
-                   │ Windows Named Pipes
-                   │ (lightweight telemetry only)
-┌──────────────────▼───────────────────────────────┐
-│     PYTHON INFERENCE SERVICE (ipc_client.py)     │
-│  Heavy lifting. RTX 4050 GPU. Runs independently.│
-│  • Gemma 3 via Ollama (LLM inference)            │
-│  • e5-small ONNX (384-dim text embeddings)       │
-│  • FlushWorker (background OKF pipeline)         │
-│  • Notification bridge (PowerShell UI)           │
-└──────────────────┬───────────────────────────────┘
-                   │
-┌──────────────────▼───────────────────────────────┐
-│         NATIVE UI (Microsoft WebView2)           │
-│  Floating, borderless. Summoned via Ctrl+Space.  │
-└──────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  LAYER 3: UI Layer (pywebview / WebView2)                           │
+│  jugnu_bug.html | sidebar.html | nudge_bubble.html | dashboard.html │
+│  stdin/stdout JSON pipes — no HTTP, no sockets                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 2: Python Inference Backend (ipc_client.py)                  │
+│  AI Engine (Gemma 4 E2B via Ollama) | Embedder (e5-small-v2)       │
+│  FlushWorker | CPEventHandler | StateManager | MascotController     │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 1: C++ Event Engine (Jugnu.exe)                              │
+│  WinMonitor | ScreenReader | CPStateManager | DBHandler | IPCServer │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## The Zero-Overhead Hibernation System
+## Layer 1: The C++ Engine
 
-### The Old Approach and Why It Failed
+### `WinMonitor` (`win_monitor.cpp`)
 
-The original stuck timer and screen reader both ran on a simple `while(true) { Sleep(10s); check(); }` loop. This had two fatal problems:
+The event backbone. Registers `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` with `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS` so Windows OS calls `WinEventProc` the exact millisecond the foreground window changes.
 
-1. **Power drain**: The threads woke up every 10 seconds unconditionally — even while the user was watching a movie or playing a game. This burned battery and CPU doing absolutely nothing useful.
-2. **False positives**: The stuck timer would fire during video playback because `GetLastInputInfo` was idle for 3 minutes — the user wasn't stuck, they were watching a tutorial.
+**Key Behaviors:**
 
-### The New Approach: `hDeepWorkEvent`
+| Behavior | Implementation |
+|---|---|
+| Deep Work Whitelist | `std::unordered_set` with `code.exe`, `chrome.exe`, `Antigravity IDE.exe`, etc. |
+| Hibernation signal | `hDeepWorkEvent` — a manual-reset Win32 event. `ResetEvent()` on non-work app, `SetEvent()` on whitelisted app |
+| Jugnu UI focus guard | Detects `python.exe` windows with title starting with `"jugnu"` → sets `g_isJugnuUIFocused` flag, pauses stuck timer |
+| Terminal bypass (FIX ST-1) | `WindowsTerminal.exe`, `pwsh.exe`, `cmd.exe` never update `lastMeaningfulApp` |
+| Anti-idle ghost popup | `IsUserIdle()` check on every `WinEventProc` call — ignores focus steals while AFK |
+| App path harvesting | `GetModuleFileNameExA` extracts each process's absolute `.exe` path and calls `DBHandler::UpsertAppPath` for the RAM Prefetcher |
+| Profiling | `QueryPerformanceCounter` measures event processing time — logs warning if > 1ms |
 
-We replaced the polling loop with a native Windows Kernel Event object (`hDeepWorkEvent`). This is a zero-cost synchronization primitive built into the Windows kernel.
-
-The `WinEventHook` in `win_monitor.cpp` — which fires on every foreground app switch — now acts as the master switch:
-
-- When the user switches to a **Focus App** (VS Code, Cursor, Chrome, IntelliJ, etc.), the hook signals the event.
-- When they switch to anything else (Spotify, YouTube, a game), the hook resets the event.
-
-Both the Screen Reader and the Stuck Timer thread simply wait on this event before doing any work. When it is not signaled, the Windows scheduler puts these threads into a true **kernel sleep** — consuming exactly 0% CPU, 0 battery drain. The system is completely inert until the user sits down to code.
-
-This means Jugnu is not just "low CPU" — it is **physically incapable of doing any computation** while the user is not in a focused session.
-
----
-
-## App Switch Detection (`win_monitor.cpp`)
-
-The monitor registers a `WinEventHook` with the OS for the `EVENT_SYSTEM_FOREGROUND` event. This is a pure callback — the OS itself calls our function the instant the foreground window changes. No polling. No timers. Zero overhead between app switches.
-
-On each switch, the monitor:
-1. Resolves the new process name from the window handle
-2. Decides if it is a Focus App and signals/resets `hDeepWorkEvent` accordingly
-3. Updates the **Markov Chain** (records the transition for app prediction)
-4. Updates the **EMA priority score** for the app (learns which apps the user values most)
+**`StuckTimerThread`:**
+- Waits on `hDeepWorkEvent` to hibernate when user is outside the focus zone
+- Uses **dynamic math** (no fixed polling): `DWORD timeRemaining = 180000 - idleTime` then `Sleep(timeRemaining)` — precise, no spin-lock
+- On 3-minute idle: grabs `ScreenReader::GetLastCodeBuffer()`, JSON-escapes it char-by-char, injects into `USER_IDLE` IPC payload
+- `g_isJugnuUIFocused` gate prevents firing while the user is actively clicking the Jugnu UI
 
 ---
 
-## Screen Capture (`screen_reader.cpp`)
+### `ScreenReader` (`screen_reader.cpp`)
 
-### The Hybrid Capture Timer (Gear 1 & Gear 2)
-Instead of a fixed polling timer, Jugnu uses a context-aware hybrid capture engine to drastically reduce CPU and DB overhead:
-- **Gear 1: Tab/Window Switch (10s Debounce):** When the user switches to a new file or tab in the IDE, Jugnu waits exactly 10 seconds. If they don't switch away (preventing Alt-Tab spam), it fires exactly ONE full UIA scan (combining the UI accessibility tree + Ghost Clipboard) and writes it to the SQLite `ocr_buffer`. This captures the full problem description and initial code state.
-- **Gear 2: Active Typing Threshold (60s + 5s Pause):** While the user is coding, Jugnu accumulates active keystroke time. If the user hits 60 seconds of active typing and then pauses to think for 5 seconds, Jugnu triggers a Ghost Clipboard extraction. Crucially, this bypasses the UIA COM thread and the SQLite database entirely, storing the fresh code directly into the volatile `g_lastCodeBuffer` in RAM.
+Dual-gear capture engine. Runs on its own thread, hibernates on `hDeepWorkEvent` with 0% CPU.
 
-### The Three-Tier Capture Strategy
+#### Gear 1 — Tab/Window Switch (10s Debounce)
+When the foreground window changes to a whitelisted capture app (VS Code, Chrome, etc.):
+1. Wait 10 seconds (debounce to avoid heavy UIA on rapid Alt-Tabs)
+2. Check if the user paused typing for > 5 seconds (`extractionPending` flag)
+3. Fire `ExtractTextViaUIA(hwnd, allowGhostClipboard=false)` — **NO Ghost Clipboard** during normal UIA to prevent disrupting user
+4. Call `DBHandler::SaveToKnowledgeDocs()` — direct to `knowledge_docs` table, bypassing `ocr_buffer`
+5. Send `UIA_EXTRACTION_SAVED` JSON event to Python with `row_id` and `is_new` flag
 
-**Tier 1: IUIAutomation (UIA)**
+**CP Session Auto-Detection (inside Gear 1):**
+- After 10s dwell, window title is checked for `"LeetCode"` or `"Codeforces"`
+- If matched: `CPStateManager::StartSession(slug, platform)` is called
+- Slug is derived by lowercasing the title and replacing spaces with hyphens
 
-UIA is Windows' native accessibility framework — the same one used by screen readers for visually impaired users. Instead of taking a screenshot and running it through OCR, UIA reads the actual text directly from the application's UI tree.
+**Abandon Detection (Rage-Quit Catcher):**
+- Tracks `lastProblemTitle` (the CP problem window title)
+- On any tab change where `lastProblemTitle` is set and the new title doesn't match, sends `PRACTICE_ABANDONED` IPC event to Python
 
-This is architecturally superior in every way:
-- The text is **perfect** — no OCR noise, no misread characters, no hallucinated symbols.
-- It preserves **code indentation** exactly.
-- It captures **multiple independent sections** — the code editor block and the problem description block are extracted as separate items with their control type (`Edit`, `Document`, `Text`) attached.
-- It works **without GPU** — pure COM call, zero image processing.
+#### Gear 2 — Active Typing Hot-Path (Code RAM Cache)
+While the user is actively coding, after 5s typing pause (detected by polling `GetLastInputInfo`):
+1. Fire `GhostClipboard(pMonacoEl)` — synthetic click + Ctrl+A + Ctrl+C on the Monaco editor
+2. Store the full code string in `g_lastCodeBuffer` (volatile RAM — **not written to DB**)
+3. When `StuckTimerThread` fires, it calls `ScreenReader::GetLastCodeBuffer()` and injects the live code directly into the `USER_IDLE` IPC payload
 
-The UIA engine uses a **Depth-First Search (DFS)** with aggressive **ARIA Pruning**, checking `get_CurrentIsOffscreen()` to skip hidden noise and pruning structural nodes (`Pane`, `Group`), compressing the payload by 90%. It then serializes the result as a structured JSON array. Python receives typed sections — it knows instantly if something is code or documentation.
+**Why:** FlushWorker only runs every 60s, so DB-sourced code is always stale. The hot-path guarantees 0ms staleness.
 
-**Tier 2: WinRT OCR (Fallback)**
+#### Ghost Clipboard Protocol (`GhostClipboard()`)
+Full implementation detail:
+1. Synthetic mouse click at center of Monaco bounding rect (bypasses `SetFocus` which fails on Chrome's shadow DOM)
+2. Backup current clipboard contents via `OpenClipboard/GetClipboardData`
+3. Set `g_ghostClipboardIgnoreUntilTick` far into the future to suppress our own `WM_CLIPBOARDUPDATE`
+4. Send `Ctrl+A` → `EmptyClipboard()` → `Ctrl+C` → wait 150ms for Monaco's async write
+5. Read code from clipboard
+6. Restore original clipboard atomically
+7. Lower ignore tick to `+1000ms` for residual async events
+8. Send `VK_RIGHT` to deselect the "Select All" highlight
 
-For apps that don't expose a UIA accessibility tree, the screen reader falls back to a GPU-accelerated screenshot pipeline. It captures the window pixels using GDI, converts them to a WinRT SoftwareBitmap, and passes them to the native Windows 10/11 OCR engine. This runs on dedicated hardware (the GPU's media engine) and is significantly faster than Python-based Tesseract or EasyOCR.
+**Sanity check:** If Ghost Clipboard result is shorter than the UIA partial view (< 90% length), it used the wrong focus target — fall back to UIA text.
 
-**Tier 3: Skip**
-
-If a process is not in the Focus App list, capture is skipped entirely. This is enforced by an O(1) hash set lookup — no linear string comparisons.
-
-### Why Write to SQLite Instead of Sending Over Named Pipes?
-
-The old design sent OCR text blobs directly over the Named Pipe to Python. This had a fatal scaling problem: a 4K monitor can produce 6,000–8,000 characters of text. Sending this over a byte stream meant Python's IPC reader had to buffer, receive, and parse a massive JSON string — blocking the entire event loop for hundreds of milliseconds and causing dropped telemetry.
-
-The new design completely eliminates this bottleneck. C++ writes the captured text directly to the `ocr_buffer` SQLite table using native C APIs. This is an asynchronous disk write that takes under 1 millisecond. The Named Pipe is now only used for lightweight signals (clipboard events, file saves, stuck alerts). Python's background `FlushWorker` reads the `ocr_buffer` at its own pace, on its own schedule, without ever touching the IPC loop.
-
----
-
-## The Stuck Timer
-
-The Stuck Timer is a dedicated thread that detects when the user has been idle for 3 minutes inside a Focus App. It signals a `USER_IDLE` event to Python via Named Pipe, which then triggers Gemma to generate a proactive suggestion.
-
-**Key design decisions:**
-
-- **Completely gated on `hDeepWorkEvent`**: The timer does not run at all outside Focus Apps. There is no risk of it triggering while the user is watching a video.
-- **3-minute window with reset**: Every time the user switches into a Focus App, the timer resets. The clock only runs while they are actively in a session.
-- **Single-shot per idle period**: The alert fires once per idle period. Once the user moves their mouse or types, `hasOcredWhileIdle` resets, and the next idle period starts fresh.
-
----
-
-## The OKF Knowledge Pipeline (Python)
-
-### The Problem with Raw Context
-
-Early designs tried to store raw screen text as memories and retrieve them via vector search. This produced terrible RAG results because:
-
-1. **e5-small-v2 is a sentence embedding model** — it performs well on natural prose, poorly on raw code symbols, indentation, and mixed UI noise.
-2. **Raw OCR text is dirty** — scrollbar ratios, menu labels, button text, and status bars all contaminate the semantic space.
-3. **Duplicate captures** — the same problem or code file might be captured 20 times across sessions, flooding the vector store with near-identical entries.
-
-### The Objective Knowledge Format (OKF)
-
-The OKF pipeline transforms dirty, raw screen captures into clean, structured knowledge documents with distinct fields: a topic, a prose summary, explanatory content, a verbatim code snippet, semantic tags, and a capture count.
-
-The pipeline has four distinct stages:
-
-**Stage 0.5 — JSON Sanitization & Area-Wise Sequence Matching**
-
-Before any processing, the raw UIA JSON is scrubbed of `\ufffc` (Object Replacement Character) and `\x00` null bytes. This prevents fatal buffer overflows deep inside the LLM context.
-Then, an Area-Wise Deduplication check runs: it completely decouples the user's Code (`Edit` control) from the webpage prose (`Document` control). It only skips processing if BOTH the code and the page are **>95% identical** to the last capture. This ensures that a single character edit in the user's code triggers an OKF capture, even if the surrounding 5,000 words of LeetCode documentation remained completely static.
-
-**Stage 1 — Routing by Control Type**
-
-Because C++ now attaches the UIA control type to each captured section, Python can route immediately:
-- `Edit` controls (code editors): flagged as verbatim and bypass Gemma entirely. A zero-GPU heuristic function (`_detect_code_tags`) scans the text for language-specific keywords and attaches the correct language tag instantly.
-- `Document` / `Text` controls (problem statements, docs): sent to Gemma for structured extraction.
-
-This is the most important optimization in the pipeline. Previously, every captured section went through Gemma regardless. Now, the majority of content (code) completely bypasses the LLM — cutting GPU time by roughly 60-80% for typical coding sessions.
-
-**Stage 2 — Gemma Extraction (Zero-Overhead Token Budget)**
-
-Gemma reads the raw document text and outputs structured key-value headers (`TOPIC:`, `TAGS:`, `NOTES:`). **Gemma no longer generates `CONTENT`.** The raw C++ UIA payload is piped directly through Python to the database, freeing up massive LLM output tokens and preventing generation cutoffs on large files. Plain header lines are parsed with simple string splitting — robust against any hallucination.
-
-**Stage 3 — Pure Python Section Fusion**
-
-All extracted sections are merged using pure Python logic: tags are deduplicated as a set, paragraphs are deduplicated using `difflib` string similarity, and code snippets are kept as the longest unique version. No LLM is involved at this stage.
-
-**Stage 4 — Semantic Anchor Embedding**
-
-A critical insight: the `e5-small-v2` model works best on natural prose. Instead of embedding the full content (which may include hundreds of lines of code), we ask Gemma to generate a 1-2 sentence prose summary describing what the knowledge document is about. Only this summary and the topic are embedded and stored in `vec_knowledge`. The retrieval quality compared to embedding raw text is dramatically better.
+#### UIA Extraction Architecture (`ExtractTextViaUIA`)
+- **DFS traversal** with an explicit stack (memory-efficient for deep Chrome DOM trees)
+- **ARIA landmark pruning**: `complementary` and `contentinfo` regions are pruned entirely (ads, comments, sidebars). `navigation` and `banner` are kept (for Chrome URL bar).
+- **RootWebArea URL extraction**: `LegacyIAccessiblePattern::get_CurrentValue()` on the first Document element with a non-empty Name gives the active page URL without requiring omnibox focus
+- **PageMeta section**: URL + page title are stored as a combined `{"type":"PageMeta","title":"...","url":"..."}` JSON object. Python splits this for `source_url` storage
+- **Content type whitelist**: Only `UIA_EditControlTypeId` (code editors), `UIA_DocumentControlTypeId` (rich text), `UIA_TextControlTypeId` (plain text)
+- **Deduplication**: Edit controls are never absorbed by Document controls and vice versa. Substring deduplication collapses redundant nested elements
+- **Bounded Levenshtein**: C++ `BoundedSimilarityRatio()` with early-abort at 2% diff threshold — O(N) instead of O(N²) for near-identical captures
+- **Sorting**: Edit (code) > Document (page text) by type priority, then by text length descending. Always cap at 5 sections
+- **JSON serialization**: Output is a JSON array with `type`, `name`, `full_buffer`, and `text` fields per section
 
 ---
 
-## The Intelligent Merge Strategy (Phase 5)
+### `InputHooks` (`input_hooks.cpp`)
 
-When a new knowledge document is about to be saved, `embedder.py` executes a strict deterministic-first merge pipeline:
+A dedicated Win32 low-level hook thread **exclusively for the CP Practice Mode**. Installed/removed dynamically by `CPStateManager` only when a CP session is active. Runs a `GetMessage` loop on its own thread (0% CPU when idle).
 
-1. **Deterministic Anchors:** Checks for an exact match on `window_title` or `file_path`. If found, it instantly merges the document. This prevents "Vector Identity" duplication where identical code files got slightly different LLM topics and failed the semantic threshold.
-2. **Semantic Search (Fallback):** Checks `vec_knowledge` using KNN cosine similarity. If distance < 0.03 (>97% similar), it initiates a merge.
-3. **Pure Mathematical Merging:**
-   - **"Never Delete, Only Add" (Union Merge):** When scrolling in VSCode, code falls off-screen. `difflib` naturally emits a `delete` opcode for the missing lines. Jugnu explicitly ignores deletes, preventing scroll-loss from erasing the user's codebase. Overwrites are only permitted when the `full_buffer` flag is true (via the Ghost Clipboard).
-   - **OCR-to-UIA Upgrade:** Automatically overwrites old, dirty OCR text with pixel-perfect strings if a pristine UIA capture arrives for the same topic.
-   - **Tags:** Python set union.
-   - **Capture Count:** Incremented to build importance signals.
+| Atomic | Description |
+|---|---|
+| `g_lastKeyboardInputMs` | `GetTickCount()` on every real `WM_KEYDOWN` |
+| `g_lastMouseInputMs` | `GetTickCount()` on every real mouse event |
+| `g_isMouseOnly` | Set if mouse moves but no keyboard for > 2s |
+| `g_cpKeyStrokeCount` | Total keystrokes since session start |
 
-Zero GPU. Zero LLM. Pure Python running in milliseconds.
+**Synthetic input guard:** Both `KbProc` and `MouseProc` check `LLKHF_INJECTED` / `LLMHF_INJECTED` flags and skip events generated by `SendInput` (i.e., from Ghost Clipboard Ctrl+A/Ctrl+C). This prevents the CP state machine from counting our own synthetic inputs as user activity.
 
----
-
-## The SQLite Memory Vault
-
-All persistent state lives in a single SQLite database with WAL (Write-Ahead Logging) mode enabled. WAL allows C++ and Python to hold simultaneous read connections without blocking each other, and Python writes do not block C++ reads.
-
-The database is organized into tiers by permanence:
-
-| Tier | Table | Permanence | Who writes |
-|------|-------|-----------|------------|
-| 0 (hot) | C++ RAM maps | Volatile — 30-min flush | C++ (always) |
-| 0.5 (staging) | `ocr_buffer` | Cleared every cycle | C++ writes, Python clears |
-| 1 (episodic) | `episodic_memories` + `vec_episodic` | Rolling 5,000-row cap | Python on events |
-| 2 (knowledge) | `knowledge_docs` + `vec_knowledge` | Never evicted, only merged | Python FlushWorker |
-| 2.5 (practice)| `practice_sessions` | Rolling 2-hour window | Python (FlushWorker & IPC) |
-| 3 (persona) | `core_persona` | Permanent | Written at onboarding |
-
-**The Column-Split OKF Schema**: 
-Previously, `knowledge_docs` stored a massive stringified JSON blob which caused severe CPU bottlenecks during Python parsing on every search. In Phase 3, this was refactored into dedicated SQLite columns (`topic`, `content`, `code_snippet`, `notes`, `tags`). Now, the C-powered SQLite engine handles the parsing and filtering, and Python simply fetches the raw strings for the RAG payload, drastically reducing CPU overhead.
-
-**Practice Mode Session State (`practice_sessions`)**: 
-In Phase 6, we introduced a dedicated SQLite table to track the user's active CP sessions. This table acts as a pedagogical state machine, locking the `is_solved` state and the current `hint_level` (0-3). Sessions are automatically pruned if unsolved for over 2 hours, preventing the AI from dragging stale context across days of work.
-
-Knowledge documents are never deleted or evicted — they only grow richer through merging. The episodic log rolls over (oldest rows pruned) to keep the database size bounded. The OKF vault is the long-term brain.
+On every real `WM_KEYDOWN`: immediately calls `CPStateManager::OnKeyDown()` with zero latency.
 
 ---
 
-## RAG Context Assembly
+### `DBHandler` (`db_handler.cpp`)
 
-When the user asks a question, context is assembled through a rigorous four-stage pipeline designed to prevent VRAM crashes and provide hyper-specific answers:
+All SQLite access for C++. Single global connection with thread-safe serialized mode.
 
-1. **Search Query Generation**: Gemma reads the current screen context (what the user is looking at right now) and generates a dense 15-word semantic query that captures the core technical problem. This is significantly more accurate than using the user's raw question as a search query.
+**Initialization:**
+```cpp
+sqlite3_config(SQLITE_CONFIG_SERIALIZED);    // Thread-safe before open
+sqlite3_auto_extension(sqlite3_vec_init);     // Register sqlite-vec before open
+sqlite3_open_v2(..., SQLITE_OPEN_FULLMUTEX); // Serialize concurrent C++/Python access
+sqlite3_busy_timeout(db, 30000);             // 30s retry if Python holds the lock
+ExecuteSQL("PRAGMA journal_mode=WAL;");       // P0-FIX: Allow concurrent C++/Python reads
+ExecuteSQL("PRAGMA synchronous=NORMAL;");    // ~3x faster than FULL, safe with WAL
+```
 
-2. **Vector Search + Blended Re-Ranking**: The 15-word query is embedded and searched against `vec_knowledge` using KNN cosine similarity. Before returning results, the system applies **Layer 3 Topic Deduplication** (discarding search results if they are >85% identical to an already accepted document, preventing the LLM from being flooded with 3 copies of the exact same LeetCode problem). The surviving documents undergo **Blended Re-Ranking**, mathematically mutating the raw cosine distance with an exponential time decay (rewarding recent memories) and logarithmic frequency scale (rewarding problems the user has struggled on repeatedly).
+**Key Tables Created by C++:**
 
-3. **Tiered Token Budgeting**: The context is physically sliced before ingestion to guarantee it mathematically fits inside the `num_ctx` window, preventing CUDA Out-Of-Memory (OOM) crashes. The current screen context is capped at 3,000 chars, the primary retrieved OKF document code at 2,500 chars, and secondary supporting documents heavily truncated to 800 chars.
+| Table | Purpose |
+|---|---|
+| `app_priorities` | EMA scores flushed every 30 min from RAM |
+| `markov_edges` | App transition counts for Markov chain prediction |
+| `app_paths` | Absolute `.exe` paths for RAM prefetching |
+| `episodic_memories` + `vec_episodic` | Rolling short-term memory (VIRTUAL table for KNN) |
+| `ocr_buffer` | Staging zone for OCR blobs (C++ writes, Python cleans) |
+| `knowledge_docs` + `vec_knowledge` | OKF structured long-term memory |
+| `practice_sessions` | Per-problem CP session state |
+| `practice_hints` | Full hint log per session (type, text, code snapshot, feedback) |
 
-4. **Situation-Aware Prompt Engineering**: Based on the `capture_count` telemetry of the retrieved topic, Jugnu dynamically swaps its core persona. If `capture_count >= 4`, Jugnu shifts into a `REPEATED_STRUGGLE` mode, altering its system prompt to stop giving generic tutorials and instead strictly cross-check the user's code against their own historically documented edge cases and constraints, providing the one precise insight that will unblock them.
-
-The answer is then grounded in the user's own past learning history and precisely tuned to their current level of frustration, not just general knowledge.
-
----
-
-## The Socratic Practice Engine (Phase 6)
-
-In addition to acting as a passive knowledge base, Jugnu includes an active **Practice Mode** specifically designed for Competitive Programming (CP) and algorithm training (LeetCode, Codeforces, etc.).
-
-### Architecture of Practice Mode
-
-Instead of generic RAG retrieval, Practice Mode relies on deterministic state tracking and pedagogical hint escalation to simulate a real human interviewer.
-
-1. **Deterministic Topic Anchoring:** To prevent URL mismatches when the user switches between their browser and their IDE, Jugnu parses the exact CP platform and problem slug directly from the Vector DB's retrieved OKF `topic` (e.g. `Leetcode: two-sum`).
-2. **The Zero-DB IPC Code Pipeline:** Previously, Python queried the SQLite DB to find the user's latest code snippet when the idle timer fired. This caused race conditions where the C++ `flush_worker` hadn't synced the active buffer to disk yet, resulting in stale hints. We built a **Zero-DB IPC Pipeline**: C++ caches the active screen text in a volatile RAM buffer (`g_lastCodeBuffer`) and injects the meticulously escaped code directly into the `USER_IDLE` JSON payload sent over the Named Pipe. Python skips the DB entirely and feeds this hot context directly to the LLM.
-3. **The "Meaningful Code" Heuristic:** The IPC listener uses a lightning-fast substring parser to check if the user is actively writing code (detecting control flow like `if`, `for`, `while`) or if they are just staring at the platform's default boilerplate. This forks the telemetry into `CP_STUCK` vs `CP_READING`.
-4. **Unified Constraint-Aware Evaluation:** When the idle timer fires, Jugnu uses a single Gemma LLM call to evaluate the code. Crucially, the prompt is explicitly instructed to evaluate Big-O time and space complexity against the problem's mathematically stated constraints (e.g. $O(N^2)$ for $N \le 20$). This forces Gemma to accept optimal solutions rather than pattern-matching against generic DP templates.
-5. **UI Routing & Lazy DB Writes:** 
-   - **If Solved:** The LLM must output an explicit `IS_SOLVED: 1` flag. If it does, Jugnu instantly bypasses the hint UI, routes a `CP_SOLVED` payload to spawn a green "Efficiency Review" popup, and caches the solved state in a Python RAM dict. It skips writing to the SQLite `knowledge_docs` entirely if the problem was already solved previously, ensuring zero DB overhead.
-   - **If Unsolved:** Jugnu uses XML-delimited prompt injection to feed the user's past feedback and previous hints into the prompt. This creates **Socratic Memory** — the AI explicitly avoids repeating past hints and escalates its guidance exactly where the user is stuck, outputting a 1-2 sentence question without writing syntax.
-
----
-
-## Responsibility Split (Exact Boundary)
-
-| Component | Language | Reason |
-|---|---|---|
-| App switch detection | C++ | OS callback — must be always-on |
-| IUIAutomation capture | C++ | COM API — native, zero-overhead |
-| WinRT OCR fallback | C++ | WinRT — native GPU hardware path |
-| `ocr_buffer` writer | C++ | Direct SQLite C API — sub-millisecond |
-| Markov Chain | C++ | O(1) hash map — trivial math |
-| EMA priority scoring | C++ | Float arithmetic — trivial math |
-| LRU Cache | C++ | DSA — hot path |
-| Named Pipe IPC server | C++ | Zero-latency secure bridge |
-| 30-min RAM→SQLite flush | C++ | Always running background thread |
-| Ghost Clipboard Bypass | C++ | Win32 `AddClipboardFormatListener` (Direct CTRL+C DB injection) |
-| File system watcher | C++ | Win32 `ReadDirectoryChangesW` |
-| `hDeepWorkEvent` gate | C++ | Kernel event — gates all background threads |
-| Stuck timer | C++ | Thread gated on `hDeepWorkEvent` |
-| Gemma inference | Python | Ollama SDK — trivial, easy to update prompts |
-| e5-small embedding | Python | ONNX Runtime — trivial |
-| OKF extraction pipeline | Python | FlushWorker — reads `ocr_buffer`, writes `knowledge_docs` |
-| Semantic anchor embedding | Python | Only embeds 1-2 sentence prose summary |
-| Mathematical OKF merging | Python | `difflib` — zero GPU, milliseconds |
-| RAG context assembly | Python | Queries `vec_knowledge`, builds prompt |
-| Stuck alert UI | Python | PowerShell prompt via subprocess |
+**`SaveToKnowledgeDocs()`:**
+- Checks `window_title` for existing row (deterministic deduplication)
+- If found: increments `capture_count` and updates `last_updated` only — **never overwrites content or code** (idempotent LTM)
+- If not found: inserts new row with `topic='Uncategorized'`
+- Returns `row_id` and `isNew` flag for Python IPC notification
 
 ---
 
-## Background Task Schedule
+## Layer 2: The Python Inference Backend
 
-| Task | Interval | Language | Purpose |
-|---|---|---|---|
-| EMA + Markov flush | 30 min | C++ | Persist in-RAM state to SQLite |
-| OKF Batch Cleaner | 60 sec (AC only) | Python | Process `ocr_buffer` → `knowledge_docs` |
-| Async file synthesis | On file save | Python daemon | Extract OKF doc from saved code file |
-| Gemma idle unload | 5 min no queries | Python | Free ~2.7GB VRAM when not in use |
-| EMA decay | Nightly | C++ | Decay unused apps — enforces 0.1 floor |
-| Markov pruning | Weekly | C++ | Remove transition edges with count = 1 |
+### `MascotController` (`ipc_client.py`)
+
+Holds the `jugnuBug` subprocess. Provides a `set_state(state_name, background_event=False)` API used by every feature.
+
+**State Priority Guard:**
+```python
+if background_event and self.current_state in ('thinking', 'hint_ready'):
+    return   # Don't let background events kill high-priority animations
+```
+
+Background events (`SWITCH`, `UIA_EXTRACTION_SAVED`) pass `background_event=True`. Only explicit feature actions (Gemma finished, hint generated) omit the flag.
+
+**Auto-revert:** `watching` state sets a 15-second `threading.Timer` that calls `set_state('sleeping', background_event=True)`. All other states require explicit clearing.
+
+**Subprocess communication:**
+- Python → Mascot: `stdin` JSON line: `{"cmd": "set_state", "state": "thinking"}`
+- Mascot → Python: `stdout` JSON line: `{"type": "toggle_dashboard"}`
+
+---
+
+### IPC Event Router (`_pipe_reader_daemon`)
+
+Named pipe reader using `PeekNamedPipe` (non-blocking). Runs as a daemon thread, freeing the main thread for `KeyboardInterrupt`.
+
+| IPC Event | Handler |
+|---|---|
+| `SWITCH` | `state.update_switch()`, mascot `watching` (background) |
+| `CLIPBOARD` | `embedder.save_memory()` + OKF synthesis if > 100 chars |
+| `FILE_SAVED` | Read file → `save_memory()` + `_synthesize_and_save_file()` |
+| `USER_IDLE` | `_idle_handler_background()` in thread — KNN search + Gemma nudge |
+| `UIA_EXTRACTION_SAVED` | `flush_worker.process_uia_by_id(row_id)` in thread |
+| `CP_SESSION_START` | `cp_handler.handle_session_start()` |
+| `CP_SESSION_END` | `cp_handler.handle_session_end()` |
+| `CP_READING_IDLE` | `cp_handler.handle_reading_idle()` — nudge bubble + hint |
+| `CP_STUCK` | `cp_handler.handle_stuck()` in thread — Gemma code check |
+| `CP_USER_RESUMED` | `cp_handler.handle_typing_resumed()` |
+| `PRACTICE_ABANDONED` | `cp_handler.handle_session_end()` |
+
+**Code bypass:** `USER_IDLE` and `CP_*` events carry a `"code"` field (the `g_lastCodeBuffer` from C++). If present, Python **skips the SQLite DB read entirely** — guaranteeing 0ms staleness.
+
+---
+
+### `AIEngine` (`ai_engine.py`)
+
+Wraps `ollama.chat()` calls against **Gemma 4 E2B** (`gemma4:e2b`).
+
+**Universal settings:**
+- `flash_attn: False` — fixes CUDA PDL crash on RTX 4050 / Turing+ architectures
+- `think=False` for all metadata/extraction tasks (speed), `think=True` for `check_code_correctness` (accuracy)
+- `num_ctx: 8192` for correctness check, lower for others
+
+**`check_code_correctness(code, content, hint_history, last_feedback)`:**
+The critical Practice Mode gate. Uses `think=True` intentionally — Gemma traces code logic step-by-step before rendering a verdict, preventing pattern-match false positives on unusual variable names.
+
+Prompt enforces:
+- Code must be **complete + logically correct** — boilerplate or incomplete code is `IS_SOLVED: 0`
+- `TYPE:` field extracted for hint categorization (`CONCEPTUAL`, `LOGIC`, `IMPLEMENTATION`)
+- `hint_history` injected as `<past_hints>` block to prevent hint repetition
+
+Response parsing:
+```
+IS_SOLVED: 1 + EFFICIENCY_REVIEW: → efficiency_review dict
+IS_SOLVED: 0 + APPROACH + TYPE + HINT → practice_hint dict
+```
+
+**`extract_section(text, control_type, cleaned_content)`:**
+Gemma extracts only `TOPIC`, `TAGS`, `NOTES` from UIA text — `cleaned_content` (raw C++ UIA payload) is stored directly as `content`, saving output tokens and preventing generation cutoffs.
+
+**`build_rag_context()` Token Budget:**
+
+| Layer | Cap |
+|---|---|
+| Current screen | 5000 chars |
+| Primary doc: code | 4000 chars |
+| Primary doc: content | 2500 chars |
+| Primary doc: notes | 1500 chars |
+| Supporting docs | 1000 chars each |
+
+**Situation-Aware Prompts (`answer_with_context`):**
+
+| Situation | Prompt Persona |
+|---|---|
+| `STUCK_ON_OWN_CODE` | Bug reviewer: find specific bug in THEIR code vs. documented constraints |
+| `REPEATED_STRUGGLE` | Escalated coach: 4+ revisits → direct unblocking insight |
+| `READING_NEW_MATERIAL` | Connector: link new docs to active code |
+| `CP_READING` | Problem categorizer: 2-sentence approach hint, no code |
+| `CP_STUCK` | Socratic interviewer: validate correct parts, ask probing question on bug |
+| `GENERAL` / `NO_MEMORY` | Default assistant with memory context |
+
+---
+
+## The IPC Protocol
+
+### C++ → Python (Named Pipe `\.\pipe\jugnu_ipc`)
+
+All payloads are UTF-8 JSON terminated with `"END_OF_MSG\n"`.
+
+```json
+{ "type": "SWITCH",   "current_app": "code.exe", "predicted_next": ["chrome.exe"] }
+{ "type": "USER_IDLE", "current_app": "code.exe", "code": "<escaped code buffer>" }
+{ "type": "UIA_EXTRACTION_SAVED", "row_id": 42, "is_new": true }
+{ "type": "CP_SESSION_START", "slug": "two-sum", "platform": "leetcode" }
+{ "type": "CP_STUCK", "code": "<escaped code buffer>" }
+{ "type": "CP_READING_IDLE", "code": "" }
+{ "type": "PRACTICE_ABANDONED", "title": "Two Sum - LeetCode", "code": "..." }
+```
+
+### Python → Mascot (stdin pipe)
+```json
+{"cmd": "set_state", "state": "thinking"}
+```
+
+### Python → Sidebar/Nudge (JSON state file)
+Written to `ui_state.json` or `nudge_state.json` before subprocess spawn.
+
+---
+
+## The Practice Mode Pipeline
+
+```
+[C++ ScreenReader] Tab settled on LeetCode for 10s
+    ↓ CPStateManager::StartSession(slug, platform)
+    ↓ IPC: CP_SESSION_START
+
+[Python CPEventHandler] handle_session_start()
+    ↓ get_or_create_session() → practice_sessions row
+    ↓ InputHooks installed (WH_KEYBOARD_LL + WH_MOUSE_LL)
+
+[C++ InputHooks] User reads problem, no keystrokes for 3 min
+    ↓ CPStateManager fires CP_READING_IDLE
+    ↓ IPC: CP_READING_IDLE + code (from g_lastCodeBuffer)
+
+[Python] handle_reading_idle()
+    ↓ Mascot → nudge state
+    ↓ Spawn nudge_bubble.html
+
+[User clicks Help] nudge_bubble stdout: {"event":"nudge_action","action":"hint"}
+    ↓ Mascot → thinking state
+    ↓ engine.check_code_correctness(code, problem_context, hint_history)
+    ↓ log_hint() → practice_hints DB row (with real hint_type from Gemma TYPE: field)
+    ↓ Write ui_state.json
+    ↓ Spawn sidebar.html
+    ↓ Mascot → hint_ready state
+
+[User starts coding] InputHooks detect keystrokes
+    ↓ CPStateManager fires CP_USER_RESUMED
+    ↓ Python: handle_typing_resumed() — dismisses sidebar
+
+[C++ ScreenReader Gear 2] 5s pause after 60s+ of typing
+    ↓ GhostClipboard() → g_lastCodeBuffer updated
+
+[3 min idle while coding] StuckTimerThread fires
+    ↓ IPC: CP_STUCK + live code from g_lastCodeBuffer
+    ↓ Python: handle_stuck() in background thread
+    ↓ engine.check_code_correctness() with think=True
+    ↓ Sidebar updated with hint or efficiency review
+```
+
+---
+
+## SQLite Concurrency Architecture
+
+WAL mode enables concurrent C++ writes and Python reads without `SQLITE_BUSY` errors:
+
+```
+C++ Thread (WinMonitor / ScreenReader)     Python FlushWorker Thread
+    ↓ DBHandler::SaveToKnowledgeDocs()          ↓ sqlite3.connect() 
+    ↓ PRAGMA journal_mode=WAL                   ↓ read knowledge_docs
+    ↓ busy_timeout=30000ms                      ↓ process_uia_by_id()
+    → Non-blocking concurrent access ←→→→→→→→→→
+```
+
+The `sqlite-vec` extension is registered via `sqlite3_auto_extension` **before** `sqlite3_open_v2`. The `.h` file is never included to avoid the macro redefinition trap — only the `extern "C"` forward declaration is used.

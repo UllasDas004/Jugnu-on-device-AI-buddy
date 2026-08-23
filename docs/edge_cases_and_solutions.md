@@ -664,6 +664,22 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 **Situation:** User submitted an $O(N^2)$ dynamic programming solution for LeetCode's *Stone Game*. The problem constraints explicitly state $N \le 20$. The LLM rejected the code, saying *"You need to optimize this to $O(N)$."* It was pattern-matching against generic DP optimization templates in its training data, ignoring the fact that for $N=20$, $N^2 = 400$ operations is mathematically optimal.
 **Solution:**
 - Constraint-Aware Prompting. We explicitly instruct the LLM: *"Does the solution's time/space complexity fit within the problem's constraints? A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct."*
+
+---
+
+## Category 11: LLM Prompting & Practice Mode Traps
+
+### EC-PM1 — The "Hallucinated Success" Problem
+**Situation:** Small 4B parameter models like Gemma are heavily instruction-tuned for conversational politeness. If a user provided an obviously wrong $O(N^3)$ solution to a problem, Gemma would correctly identify the logic flaw, but end its message with: *"Great attempt! Here is your EFFICIENCY_REVIEW: This solution uses $O(N^3)$ time..."* The Python regex parser saw `EFFICIENCY_REVIEW` and instantly flagged the problem as solved.
+**Solution:**
+- We introduced strict structural gates via XML delimiters `<task>`.
+- The prompt explicitly forces the model to output a binary commit: `IS_SOLVED: 1` or `IS_SOLVED: 0` on the very first line of its reasoning block.
+- The Python parser now strictly requires `IS_SOLVED: 1` to be present before it even attempts to parse for the `EFFICIENCY_REVIEW` block, completely neutralizing conversational hallucinations.
+
+### EC-PM2 — The "Template Pattern Matching" Problem
+**Situation:** User submitted an $O(N^2)$ dynamic programming solution for LeetCode's *Stone Game*. The problem constraints explicitly state $N \le 20$. The LLM rejected the code, saying *"You need to optimize this to $O(N)$."* It was pattern-matching against generic DP optimization templates in its training data, ignoring the fact that for $N=20$, $N^2 = 400$ operations is mathematically optimal.
+**Solution:**
+- Constraint-Aware Prompting. We explicitly instruct the LLM: *"Does the solution's time/space complexity fit within the problem's constraints? A solution that is logically correct but would exceed time/memory limits for the given input sizes is NOT correct."*
 - This forces the LLM to mathematically derive the state space and evaluate it against the parsed constraints (which are guaranteed to be in the OKF Context) before deciding if an approach is optimal.
 
 ### EC-PM3 — The "Infinite Redundant DB Write" Problem
@@ -672,3 +688,58 @@ These optimizations focus purely on how we eliminated CPU polling overhead in th
 - Implemented an in-memory `_SESSION_CACHE` bypass (Lazy DB Writes).
 - Before triggering the DB update, Python checks `db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1`.
 - If true, it skips the DB write completely and directly routes the UI notification.
+
+---
+
+## Category 12: Mascot & UI Overlay Edge Cases
+
+### EC-MU1 — The "Thinking State Overwritten by Background SWITCH" Problem
+**Situation:** User clicks the nudge bubble to request a hint. `cp_handler` sets mascot to `thinking`. Gemma starts generating (takes 3-5s). During this time, a `SWITCH` IPC event arrives from C++ (e.g., the user Alt-Tabbed back to Chrome). The IPC event handler calls `mascot.set_state('watching')`, overwriting `thinking` and the mascot reverts to watching animation while Gemma is still running.
+**Solution:**
+- `MascotController.set_state()` now accepts a `background_event: bool` parameter.
+- Background events (`SWITCH`, `UIA_EXTRACTION_SAVED`, watching timer revert) pass `background_event=True`.
+- If `current_state` is already `'thinking'` or `'hint_ready'`, all `background_event=True` calls are silently discarded.
+- Only explicit feature calls (hint generated, hint ready) omit the flag and can overwrite the high-priority state.
+
+### EC-MU2 — The "Mascot Watching Timer Never Cancels" Problem
+**Situation:** Mascot is in `watching` state with a 15-second auto-revert timer running. User clicks Help on the nudge bubble and mascot transitions to `thinking`. 15 seconds later, the old `watching` timer fires and reverts to `sleeping`, killing the `thinking` animation mid-Gemma-generation.
+**Solution:**
+- `MascotController._watching_timer` is cancelled at the top of every `set_state()` call before applying the new state. This ensures no stale timer can revert any subsequent state.
+
+### EC-MU3 — The "Nudge Bubble Spawned Before Problem Context Loaded" Problem
+**Situation:** `CP_READING_IDLE` fires with an empty `code` field because `g_lastCodeBuffer` was not yet populated. Gemma receives no code context, assumes the problem is unsolved (no code = boilerplate), and gives an irrelevant hint.
+**Solution:**
+- C++ now passes `g_lastCodeBuffer` in the `CP_READING_IDLE` IPC payload even if empty.
+- `cp_event_handler.handle_reading_idle()` passes `code` to `engine.check_code_correctness()`.
+- The prompt's `CRITICAL` clause: *"If the code is incomplete, missing core logic, or just boilerplate, you MUST treat it as INCORRECT. DO NOT complete or assume the missing code yourself."*
+- For reading-phase hints (no code yet), problem context from `knowledge_docs` provides sufficient Socratic framing.
+
+### EC-MU4 — The "hint_type Always Logged as CONCEPTUAL" Problem
+**Situation:** Gemma correctly outputs `TYPE: LOGIC` in its response. The Python parser logs `hint_type='CONCEPTUAL'` in the DB because the parser was extracting `result.get("type")` (which returns `'practice_hint'`) instead of `result.get("hint_type")`.
+**Solution:**
+- `log_hint()` in `cp_event_handler` now reads `hint_type=result.get("hint_type") or "CONCEPTUAL"` — explicitly pulling the `hint_type` key from Gemma's parsed response dict.
+- Gemma's `TYPE:` field is sanitized with `"".join(c for c in extracted if c.isalpha() or c == '_')` to strip formatting noise before logging.
+
+---
+
+## Category 13: SQLite Concurrency Edge Cases (Phase 8)
+
+### EC-DB1 — The "database is locked" FlushWorker Crash
+**Situation:** C++ ScreenReader continuously writes to `knowledge_docs` via `DBHandler::SaveToKnowledgeDocs()` while Python's `FlushWorker` attempts to read `ocr_buffer` and write `knowledge_docs` simultaneously. Python receives `sqlite3.OperationalError: database is locked`.
+**Solution:**
+- C++ uses `sqlite3_busy_timeout(db, 30000)` — waits up to 30 seconds before giving up.
+- C++ enables `PRAGMA journal_mode=WAL` — Write-Ahead Logging allows concurrent readers and one writer without full-file locking.
+- Python also sets `timeout=30.0` in `sqlite3.connect()`.
+- `PRAGMA synchronous=NORMAL` with WAL is safe and ~3x faster than `FULL` mode.
+
+### EC-DB2 — The "practice_hints NOT NULL constraint failed" Error
+**Situation:** `log_hint()` call omits `hint_type` field. SQLite raises `NOT NULL constraint failed: practice_hints.hint_type`. Session breaks and hint is not logged.
+**Solution:**
+- `log_hint()` signature defaults to `hint_type="CONCEPTUAL"` as a Python-level fallback.
+- Caller passes `hint_type=result.get("hint_type") or "CONCEPTUAL"` ensuring the field is always populated regardless of Gemma parsing failures.
+
+### EC-DB3 — The "UPSERT silently creates duplicate sessions" Problem
+**Situation:** `practice_sessions` table lacked a `UNIQUE(problem_slug, platform)` constraint. Python's `INSERT ... ON CONFLICT` UPSERT clause silently failed — SQLite ignored the `ON CONFLICT` and inserted a new row instead, causing `hint_level` to reset to 0 on every hint trigger.
+**Solution:**
+- `CREATE UNIQUE INDEX` on `(problem_slug, platform)` is enforced at DB initialization in `db_handler.cpp`.
+- Additionally: `CREATE INDEX idx_practice_sessions_lookup ON practice_sessions(problem_slug, platform, is_solved, last_seen)` for O(log N) session expiry queries.

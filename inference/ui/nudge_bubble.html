@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JugnuNudge</title>
+  <style>
+    /* ── Reset ─────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Transparent window shell ───────────────────────────────────── */
+    html, body {
+      width: 100%; height: 100%;
+      background: transparent;
+      overflow: hidden;
+      -webkit-app-region: no-drag;
+    }
+
+    /* ── Catppuccin Mocha tokens ────────────────────────────────────── */
+    :root {
+      --base:     #1e1e2e;
+      --mantle:   #181825;
+      --crust:    #11111b;
+      --surface0: #313244;
+      --surface1: #45475a;
+      --overlay0: #6c7086;
+      --text:     #cdd6f4;
+      --subtext0: #a6adc8;
+      --subtext1: #bac2de;
+      --blue:     #89b4fa;
+      --green:    #a6e3a1;
+      --amber:    #f9e2af;
+      --red:      #f38ba8;
+      --mauve:    #cba6f7;
+    }
+
+    /* ── Card ───────────────────────────────────────────────────────── */
+    .bubble {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+
+      background: rgba(24, 24, 37, 0.94);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(137, 180, 250, 0.24);
+      border-radius: 14px;
+      padding: 11px 13px 10px;
+      box-shadow:
+        0 8px 32px rgba(0, 0, 0, 0.65),
+        0 0 0 1px rgba(255, 255, 255, 0.04),
+        inset 0 1px 0 rgba(255,255,255,0.06);
+
+      /* Entrance animation */
+      animation: slideIn 0.32s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(10px) scale(0.96); }
+      to   { opacity: 1; transform: translateY(0)    scale(1);    }
+    }
+
+    /* ── Header row ─────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .jugnu-icon {
+      font-size: 15px;
+      flex-shrink: 0;
+      /* subtle glow pulse */
+      animation: icon-pulse 3s ease-in-out infinite;
+    }
+    @keyframes icon-pulse {
+      0%, 100% { filter: drop-shadow(0 0 3px rgba(203,166,247,0.4)); }
+      50%       { filter: drop-shadow(0 0 7px rgba(203,166,247,0.8)); }
+    }
+
+    .title {
+      flex: 1;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: 0.1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .close-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--overlay0);
+      font-size: 13px;
+      line-height: 1;
+      padding: 2px 4px;
+      border-radius: 4px;
+      transition: color 0.12s, background 0.12s;
+      flex-shrink: 0;
+    }
+    .close-btn:hover {
+      color: var(--red);
+      background: rgba(243, 139, 168, 0.12);
+    }
+
+    /* ── Body text ──────────────────────────────────────────────────── */
+    .body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 11.5px;
+      color: var(--subtext1);
+      line-height: 1.5;
+      /* shrink to avoid overflow — bubble is only 110px tall */
+      flex-shrink: 1;
+      overflow: hidden;
+    }
+    .body strong { color: var(--text); }
+
+    /* ── Progress bar (15s countdown) ──────────────────────────────── */
+    .progress-track {
+      height: 2px;
+      background: var(--surface1);
+      border-radius: 999px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--blue), var(--mauve));
+      /* JS drives width transitions */
+      transition: width 0.25s linear;
+      width: 100%;
+    }
+
+    /* ── Action buttons ─────────────────────────────────────────────── */
+    .actions {
+      display: flex;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    .btn {
+      flex: 1;
+      padding: 5px 7px;
+      border-radius: 7px;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: filter 0.12s, transform 0.08s;
+    }
+    .btn:hover  { filter: brightness(1.25); transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); filter: brightness(0.95); }
+
+    .btn-hint   {
+      color: var(--green);
+      background: rgba(166, 227, 161, 0.12);
+      border: 1px solid rgba(166, 227, 161, 0.28);
+    }
+    .btn-review {
+      color: var(--amber);
+      background: rgba(249, 226, 175, 0.12);
+      border: 1px solid rgba(249, 226, 175, 0.28);
+    }
+    .btn-skip {
+      color: var(--subtext0);
+      background: transparent;
+      border: 1px solid var(--surface1);
+    }
+  </style>
+</head>
+<body>
+  <div class="bubble" id="bubble">
+
+    <!-- Header -->
+    <div class="header">
+      <span class="jugnu-icon" id="jugnuIcon">🤔</span>
+      <span class="title" id="titleEl">Looks like you're stuck</span>
+      <button class="close-btn" id="closeBtn" title="Dismiss">✕</button>
+    </div>
+
+    <!-- Body -->
+    <div class="body" id="bodyEl">
+      You've been on this a while — want a
+      <strong>hint</strong> from Jugnu?
+    </div>
+
+    <!-- Progress bar -->
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+      <button class="btn btn-hint"   id="btnHint">💡 Help / Review</button>
+      <button class="btn btn-skip"   id="btnSkip">Not now</button>
+    </div>
+
+  </div>
+
+  <script>
+  /* ═══════════════════════════════════════════════════════════════════
+     nudge_bubble.html — standalone 300×110 companion window
+     Contract:
+       Python calls:  (none — window is shown/hidden by Python directly)
+       JS  calls:     pywebview.api.nudge_action(nudge_type, action)
+                      where nudge_type = 'reading' | ...
+                        and action     = 'hint' | 'review' | 'dismiss'
+     The 15-second auto-dismiss is handled by Python (threading.Timer),
+     which calls window.hide(). The progress bar here is purely visual
+     and driven by a JS ticker that matches the 15s duration.
+  ═══════════════════════════════════════════════════════════════════ */
+
+  var TIMER_MS   = 15000;  // must match Python's delay_seconds=15 in jugnu_sidebar.py
+  var _tick      = null;
+  var _start     = 0;
+  var _nudgeType = 'reading';  // set by Python if needed via update()
+
+  var fill    = document.getElementById('progressFill');
+  var titleEl = document.getElementById('titleEl');
+  var bodyEl  = document.getElementById('bodyEl');
+  var iconEl  = document.getElementById('jugnuIcon');
+
+  /* ── Progress bar countdown ────────────────────────────────────── */
+  function startProgressBar() {
+    _start = Date.now();
+    fill.style.width = '100%';
+    clearInterval(_tick);
+    _tick = setInterval(function() {
+      var elapsed = Date.now() - _start;
+      var pct = Math.max(0, 100 - (elapsed / TIMER_MS * 100));
+      fill.style.width = pct + '%';
+      if (pct <= 0) { clearInterval(_tick); _tick = null; dismiss('dismiss'); }
+    }, 100);
+  }
+
+  /* ── Public: called from Python via evaluate_js to update content ── */
+  window.updateNudge = function(nudgeType, title, body) {
+    _nudgeType = nudgeType || 'reading';
+    if (title) titleEl.textContent = title;
+    if (body)  bodyEl.innerHTML    = body;
+    // Pick icon by nudge type
+    var icons = { reading: '🤔', idle: '😴', abandon: '⚠️' };
+    iconEl.textContent = icons[_nudgeType] || '🤔';
+    startProgressBar();
+  };
+
+  /* ── Dismiss helper ─────────────────────────────────────────────── */
+  function dismiss(action) {
+    clearInterval(_tick);
+    _tick = null;
+    if (window.pywebview && window.pywebview.api) {
+      // Two-arg signature: nudge_action(nudge_type, action)
+      // matches JugnuAPI.nudge_action(self, nudge_type, action)
+      window.pywebview.api.nudge_action(_nudgeType, action);
+    }
+  }
+
+  /* ── Button wiring ──────────────────────────────────────────────── */
+  document.getElementById('closeBtn').addEventListener('click', function() {
+    dismiss('dismiss');
+  });
+  document.getElementById('btnSkip').addEventListener('click', function() {
+    dismiss('dismiss');
+  });
+  document.getElementById('btnHint').addEventListener('click', function() {
+    dismiss('hint');
+  });
+
+  /* ── Boot: start the progress bar immediately on page load ──────── */
+  /* Python shows the window after the page is loaded, so the bar     */
+  /* starts ticking as soon as the user can see it.                   */
+  window.addEventListener('pywebviewready', function() {
+    startProgressBar();
+  });
+  // Fallback for cases where pywebviewready already fired
+  if (typeof window.pywebview !== 'undefined') {
+    startProgressBar();
+  } else {
+    setTimeout(startProgressBar, 100);
+  }
+  </script>
+</body>
+</html>

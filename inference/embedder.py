@@ -507,7 +507,7 @@ class Embedder:
         
         return sorted(docs, key=lambda x: x['final_score'])
 
-    def search_knowledge_docs(self, query_text: str, limit: int = 3, required_tag: str | None = None) -> list[dict]:
+    def search_knowledge_docs(self, query_text: str, engine = None, limit: int = 3, required_tag: str | None = None) -> list[dict]:
         """
         Semantic search over the OKF knowledge_docs table.
         Returns full structured dicts — no flattening.
@@ -529,8 +529,8 @@ class Embedder:
             fetch_limit = limit + 2
 
             sql = """
-                SELECT kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes,
-                   kd.capture_count, kd.last_updated, kd.source_type, distance, kd.is_solved
+                SELECT kd.id, kd.topic, kd.tags, kd.content, kd.code_snippet, kd.notes,
+                   kd.capture_count, kd.last_updated, kd.source_type, distance, kd.is_solved, kd.summary
                 FROM vec_knowledge vk
                 INNER JOIN knowledge_docs kd ON vk.rowid = kd.id
                 WHERE vk.embedding MATCH ? AND k = ?
@@ -551,11 +551,39 @@ class Embedder:
             # Build raw result dicts — all fields separate, no flattening
             raw_results = []
             
-            for topic,tags_str,content,code_snippet,notes,capture_count,last_updated, source_type, distance, is_solved in rows:
+            for doc_id, topic, tags_str, content, code_snippet, notes, capture_count, last_updated, source_type, distance, is_solved, summary in rows:
                 try:
                     tags = json.loads(tags_str) if tags_str else []
                 except Exception:
                     tags = []
+
+                # --- NEW LAZY SYNTHESIS LOGIC ---
+                if not summary and engine is not None:
+                    print(f"{_CYAN}[Embedder] Lazy synthesis triggered for doc #{doc_id}: '{topic}'{_RESET}")
+                    
+                    # Generate metadata on the fly
+                    synth_result = engine.extract_section(content[:3000], "Document", cleaned_content=content)
+                    
+                    if synth_result:
+                        new_summary = synth_result.get("summary", "")
+                        new_notes = synth_result.get("notes", "")
+                        new_tags = synth_result.get("tags", [])
+                        
+                        # Merge the new AI tags with the heuristic tags provided by C++
+                        merged_tags = list(dict.fromkeys(tags + new_tags))
+                        
+                        # Update DB so we never have to synthesize this row again
+                        cursor.execute(
+                            "UPDATE knowledge_docs SET summary = ?, notes = ?, tags = ? WHERE id = ?",
+                            (new_summary, new_notes, json.dumps(merged_tags), doc_id)
+                        )
+                        self._conn.commit()
+                        
+                        # Apply to current run
+                        summary = new_summary
+                        notes = new_notes
+                        tags = merged_tags
+                # --------------------------------
 
                 # Convert last_updated ISO string to epoch for re-ranking
                 last_updated_ts = time.time()
@@ -569,6 +597,7 @@ class Embedder:
                 raw_results.append({
                     "topic":          topic,
                     "tags":           tags,
+                    "summary":        summary or "",
                     "content":        content or "",
                     "code_snippet":   code_snippet or "",
                     "notes":          notes or "",

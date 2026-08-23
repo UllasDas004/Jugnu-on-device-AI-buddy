@@ -24,16 +24,16 @@ We replaced this with a highly optimized, context-aware dual-gear system:
 
 ### Gear 1: Tab/Window Switch (10s Debounce)
 When the user switches to a new tab or window in a Focus App (like opening a new LeetCode problem), Jugnu waits for exactly 10 seconds.
-- **The Action:** If the user stays on the tab, Jugnu fires exactly ONE full UIA scan (combining the UI accessibility tree + Ghost Clipboard) and writes it to the SQLite `ocr_buffer`. 
-- **Why it's better:** By firing only once per tab switch, we capture the full problem description and initial code state without repeatedly spamming the heavy COM interface. This completely eliminates UI thread hanging during active work.
+- **The Action:** If the user stays on the tab AND has been idle for 5+ seconds (not actively typing), Jugnu fires exactly ONE full UIA scan (walking the accessibility tree + optional Ghost Clipboard for code editors). This is now written **directly to `knowledge_docs`**, bypassing `ocr_buffer` entirely.
+- **Why it's better:** Direct write avoids the 60-second FlushWorker delay. C++ immediately sends an `UIA_EXTRACTION_SAVED` IPC event with the `row_id` so Python enriches it (TOPIC, TAGS, NOTES, KNN embedding) in a background thread without blocking the pipe reader.
 
-### Gear 2: Active Typing Hot-Path (60s + 5s Pause)
-While the user is actively coding, Jugnu accumulates keystroke time. If the user hits 60 seconds of active typing and then pauses to think for 5 seconds, Jugnu shifts into Gear 2.
-- **The Action:** Jugnu fires a targeted Ghost Clipboard extraction. Crucially, this bypasses the UIA COM tree entirely, and instead of writing to the SQLite database, it saves the perfectly escaped code directly into a volatile `g_lastCodeBuffer` in RAM.
-- **Why it's better:** 
+### Gear 2: Active Typing Hot-Path (5s Pause)
+While the user is actively coding, a background check fires when the user pauses typing for more than 5 seconds (`GetLastInputInfo` polling).
+- **The Action:** Jugnu fires a targeted Ghost Clipboard extraction (synthetic Ctrl+A + Ctrl+C on the Monaco editor). Crucially, this bypasses the UIA COM tree entirely, and **instead of writing to SQLite**, saves the perfectly escaped code directly into a volatile `g_lastCodeBuffer` in RAM.
+- **Why it's better:**
   1. **Zero Disk I/O:** No SQLite DB spam, no Python wakeups, no disk writes while the user is in a flow state.
   2. **Perfect Code Accuracy:** Ghost Clipboard explicitly copies the Monaco/VSCode editor buffer, avoiding UIA truncation or off-screen scroll issues.
-  3. **0ms Staleness:** When the 3-minute Stuck Timer eventually fires, it injects this hot RAM cache directly into the IPC payload. Gemma gets the exact code on screen instantly, completely bypassing the Python DB read pipeline.
+  3. **0ms Staleness:** When the 3-minute Stuck Timer fires, it injects this hot RAM cache directly into the IPC payload (`"code": "..."` field). Gemma sees the exact code on screen instantly, completely bypassing the Python DB read pipeline.
 
 ### Tier 2: WGC + OCR (Hardware Accelerated via Native C++)
 **Technology:** Windows Graphics Capture (WGC) + `Windows.Media.Ocr` (MSVC C++/WinRT).
@@ -50,8 +50,11 @@ If Jugnu detects massive screen updates with no readable text (e.g., full-screen
 
 Once text is successfully extracted, it goes through a robust cleaning and synthesis pipeline.
 
-**Stage 1: The Zero-IPC Buffer**
-1. C++ bypasses the Named Pipe IPC entirely to avoid serialization bloat. It writes the raw UTF-8 text directly into the SQLite `ocr_buffer` table. This happens instantly.
+**Stage 1: Direct-to-`knowledge_docs` (Gear 1 Fast Path)**
+Since Phase 8, Gear 1 tab-switch UIA captures are written **directly to `knowledge_docs`** by the C++ `DBHandler::SaveToKnowledgeDocs()` call. `ocr_buffer` is **not used** for this path. The C++ engine then immediately sends a `UIA_EXTRACTION_SAVED` IPC event to Python, which triggers `flush_worker.process_uia_by_id(row_id)` in a background thread to add Gemma-generated metadata and KNN embeddings.
+
+**Stage 1b: ocr_buffer Fallback (Background OCR Only)**
+The `ocr_buffer` staging table is now used exclusively for the WinRT OCR fallback path (when UIA finds no text). C++ writes raw OCR blobs here; Python's FlushWorker processes them on the 60-second cycle.
 
 **Stage 2: The Python FlushWorker**
 A background Python daemon (`flush_worker.py`) wakes up every 60 seconds to process the `ocr_buffer`.
@@ -70,3 +73,45 @@ A background Python daemon (`flush_worker.py`) wakes up every 60 seconds to proc
    - **OCR-to-UIA Upgrades:** If a new pristine UIA capture matches an old dirty OCR document, the system automatically overwrites the OCR text with the pixel-perfect UIA string.
 6. **Safe Row Deletion:** 
    - Rows are marked for deletion from `ocr_buffer` *only after* synthesis succeeds. If Gemma crashes (OOM/Timeout), the row is retained in `ids_failed` and retried on the next cycle, guaranteeing zero data loss.
+
+---
+
+## 4. Phase 8 — ScreenReader Enhancements
+
+### 4.1 UIA Direct-to-`knowledge_docs` Fast Path
+Previously, all C++ captures went into `ocr_buffer` for Python's FlushWorker to process. In Phase 8, Gear 1 tab-switch UIA captures are written **directly** to `knowledge_docs` via `DBHandler::SaveToKnowledgeDocs()`, bypassing `ocr_buffer` entirely.
+
+**Why:** `knowledge_docs` is the authoritative structured store. Writing directly avoids one full FlushWorker cycle (60s delay) for the problem context the CP mode needs immediately.
+
+After the direct write, C++ sends `UIA_EXTRACTION_SAVED` IPC event with the `row_id`. Python's `flush_worker.process_uia_by_id(row_id)` then immediately enriches the row with Gemma-generated metadata (TOPIC, TAGS, NOTES) and embeds it into `vec_knowledge`. This happens in a background thread — the IPC pipe is never blocked.
+
+### 4.2 RootWebArea URL Extraction
+Previous versions could only extract page text. Phase 8 adds reliable URL extraction directly from the UIA accessibility tree, without requiring the Chrome address bar to be focused.
+
+**Method:** After DFS, the first `UIA_DocumentControlTypeId` element with a non-empty `Name` property is the `RootWebArea`. Its URL is retrieved via `LegacyIAccessiblePattern::get_CurrentValue()`. Chrome always populates this regardless of focus state.
+
+**Stored as:** A `{"type":"PageMeta","title":"...","url":"..."}` JSON object at the front of the UIA result array. Python's `flush_worker` splits this out and saves `source_url` to `knowledge_docs`, enabling accurate deduplication by URL instead of just window title.
+
+### 4.3 InputHooks — Synthetic Input Filtering
+The CP-mode `InputHooks` (`WH_KEYBOARD_LL` + `WH_MOUSE_LL`) now explicitly filter synthetic inputs from Ghost Clipboard operations using the `LLKHF_INJECTED` and `LLMHF_INJECTED` flags. This prevents `g_cpKeyStrokeCount` from incrementing during Ctrl+A/Ctrl+C extraction, keeping the CP state machine's idle timers accurate.
+
+### 4.4 BoundedSimilarityRatio — O(N) Levenshtein Guard
+A custom C++ bounded Levenshtein implementation with early abort at 2% diff threshold. Used to detect near-identical UIA captures (e.g., user scrolled slightly) without running a full O(N²) comparison:
+
+```cpp
+static double BoundedSimilarityRatio(const std::string& s1, const std::string& s2)
+// Aborts early if abs(len1 - len2) > 2% * max(len1, len2)
+// Returns 0.0 (definitely different) or similarity ratio 0.0-1.0
+```
+
+### 4.5 CP Abandon Detection (Rage-Quit Catcher)
+`ScreenReader::ReaderThread` now tracks `lastProblemTitle`. On any tab change where the previous title was a CP problem, it sends a `PRACTICE_ABANDONED` IPC event to Python with the title and last known code snapshot. This allows the Practice Mode to mark the session as abandoned and update stats.
+
+### 4.6 Platform Auto-Detection in Session Start
+When a new tab settles after 10 seconds:
+1. Window title is lowercased and checked for `"leetcode"` or `"codeforces"`
+2. Platform string is derived automatically (`"leetcode"` / `"codeforces"`)
+3. Slug is derived: `title.substr(0, title.find(" - "))` → spaces replaced with `-`
+4. `CPStateManager::StartSession(slug, platform)` is called immediately
+
+No Python-side parsing needed — C++ sends the clean slug and platform in the `CP_SESSION_START` IPC payload.

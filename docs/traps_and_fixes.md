@@ -1049,3 +1049,45 @@ These traps were discovered during the implementation of the Zero-IPC architectu
 **Problem:** When Gemma correctly verified a solution as solved, Python wrote `is_solved = 1` to the SQLite `knowledge_docs` and `practice_sessions` tables. If the user stayed on the same LeetCode page for another 5 minutes reading the editorial, the `USER_IDLE` timer would fire again. Gemma would verify it again, and Python would write to the DB again, pointlessly spinning the SSD and doing repetitive SQLite merges.
 **Fix:** 
 Implemented an in-memory `_SESSION_CACHE` bypass (Lazy DB Writes). Before triggering the DB update, Python checks `db_was_already_solved = top_doc.get("is_solved", 0) == 1 or session.get("is_solved", 0) == 1`. If true, it skips the DB write completely and directly routes the UI notification.
+
+---
+
+## Group M: Phase 8/9 — Mascot Animation & UI Overlay Traps
+
+### Trap M-1: The Mascot "Thinking" State Killed by Background SWITCH Events
+**Problem:** When the user clicked "Help" in the nudge bubble, `CPEventHandler` set the mascot to `thinking`. While Gemma was generating (3-5s), a `SWITCH` IPC event from C++ (triggered by an Alt-Tab) called `mascot.set_state('watching')`. This overwrote `thinking` silently, so the mascot displayed `watching` animation the entire time Gemma was working.
+**Non-obvious:** The IPC pipe reader processes ALL events in sequence. There is no priority queue — a `SWITCH` event that arrives 200ms after the user clicks "Help" is processed on the same thread, with no awareness that `thinking` is "more important."
+**Fix:** Added `background_event: bool = False` parameter to `MascotController.set_state()`. Background-triggered calls (`SWITCH`, `UIA_EXTRACTION_SAVED`, timer revert to sleeping) pass `background_event=True`. If `current_state` is already in `('thinking', 'hint_ready')`, the call is silently discarded with an early return. Only direct feature calls (hint generation complete) can overwrite high-priority states.
+
+### Trap M-2: The "Watching Timer Fires After Thinking Started" Problem
+**Problem:** `SWITCH` events set mascot to `watching` AND start a 15-second `threading.Timer` to revert to `sleeping`. If "Help" was clicked and `thinking` started after the timer was launched, the old `watching` timer would fire 15 seconds later and call `set_state('sleeping', background_event=True)`, interrupting `thinking` or `hint_ready`.
+**Non-obvious:** `threading.Timer` objects are fire-and-forget — they don't check current state when they fire.
+**Fix:** `MascotController._watching_timer` is stored as an instance variable. At the top of every `set_state()` call (before any other logic), the existing timer is cancelled via `self._watching_timer.cancel()` and reset to `None`. Since the revert timer uses `background_event=True`, the M-1 fix provides a second layer of protection.
+
+### Trap M-3: `hint_type` Always Logged as "CONCEPTUAL"
+**Problem:** Gemma's `check_code_correctness()` returns a dict with key `"hint_type"` (e.g., `"LOGIC"`). The caller in `cp_event_handler.py` was reading `result.get("type")` which returns the string `'practice_hint'` (the response type discriminator). SQLite received `hint_type='practice_hint'`, which violates the type whitelist, or fell through to the `or "CONCEPTUAL"` default.
+**Non-obvious:** The response dict has two similar-looking keys: `"type"` (the response category: `'practice_hint'` vs `'efficiency_review'`) and `"hint_type"` (the Gemma-generated hint category: `'CONCEPTUAL'`, `'LOGIC'`, etc.). Easy to confuse.
+**Fix:** `log_hint(hint_type=result.get("hint_type") or "CONCEPTUAL")` — explicitly reads the correct key. `hint_type` from Gemma is also sanitized: `"".join(c for c in extracted if c.isalpha() or c == '_')` strips any stray colons, backticks, or whitespace Gemma sometimes emits.
+
+---
+
+## Group N: Phase 8 — SQLite WAL and Concurrency Traps
+
+### Trap N-1: `database is locked` Crashing FlushWorker
+**Problem:** C++ ScreenReader's `SaveToKnowledgeDocs()` executes a `BEGIN TRANSACTION` / `COMMIT` cycle (taking ~5ms) while Python's `FlushWorker` simultaneously tries to `sqlite3.connect()` and read/write the same DB. Python gets `sqlite3.OperationalError: database is locked`. The FlushWorker cycle crashes, logs `[FlushWorker] Unhandled cycle error: database is locked`, and all queued `ocr_buffer` rows are skipped.
+**Non-obvious:** SQLite in default journal mode (`DELETE`) acquires an exclusive file lock during any write. A concurrent Python process that opens the same file during a C++ write is instantly rejected — there is no wait/retry built in.
+**Fix:**
+1. `PRAGMA journal_mode=WAL` — WAL mode allows concurrent readers during a write and concurrent writers in a controlled sequence, eliminating the full-file lock.
+2. `sqlite3_busy_timeout(db, 30000)` in C++ — C++ retries for up to 30 seconds instead of immediately returning `SQLITE_BUSY`.
+3. `PRAGMA synchronous=NORMAL` — safe with WAL (no data loss risk), ~3x faster than `FULL`.
+4. Python: `sqlite3.connect(..., timeout=30.0)` — Python also waits up to 30 seconds before raising.
+
+### Trap N-2: `sqlite3_auto_extension` Must Be Called Before `sqlite3_open_v2`
+**Problem:** Registering `sqlite3_vec_init` via `sqlite3_auto_extension` after `sqlite3_open_v2` has no effect — the extension is not loaded into the already-open connection. Any `vec0 USING vec0(...)` virtual table creation fails silently with "no such module: vec0".
+**Non-obvious:** `sqlite3_auto_extension` is a process-global registration hook. It must run before ANY connection is opened, not just before the specific connection that needs the extension.
+**Fix:** In `DBHandler::Init()`, `sqlite3_auto_extension((void(*)(void))sqlite3_vec_init)` is called before `sqlite3_open_v2()`. The `sqlite3_vec_init` function is forward-declared via `extern "C"` — the `sqlite-vec.h` header is never included to avoid the macro redefinition trap (see Group I in the original docs).
+
+### Trap N-3: `SQLITE_CONFIG_SERIALIZED` Must Be Called Before Any `sqlite3_open`
+**Problem:** `sqlite3_config()` calls must happen before the SQLite library is initialized (i.e., before any `sqlite3_open*` call). Calling it after the first open is a no-op and the thread safety mode is not changed. On a machine with multiple C++ threads, this causes silent DB corruption under load.
+**Non-obvious:** `sqlite3_config(SQLITE_CONFIG_SERIALIZED)` has no error output — it silently fails if called too late.
+**Fix:** In `main()`, `DBHandler::Init()` is the first call, and inside `Init()`, `sqlite3_config(SQLITE_CONFIG_SERIALIZED)` is the first line before any other SQLite API call.

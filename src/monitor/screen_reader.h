@@ -16,6 +16,9 @@ namespace Jugnu
 
             static std::string GetLastCodeBuffer();
 
+            static std::string GetLastCodeBufferJsonEscaped();
+            static void TriggerGhostClipboard();
+
         private:
             static DWORD WINAPI ReaderThread(LPVOID lpParam);
 

@@ -20,51 +20,35 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    C++ Telemetry Engine (Native Daemon)             │
+│  LAYER 3: UI Layer (pywebview / WebView2)                           │
+│  jugnu_bug.html  │  sidebar.html  │  nudge_bubble.html  │  dashboard│
+│  launcher.py spawns each as a separate subprocess window            │
+│  Communication: stdin/stdout JSON pipes (no HTTP server)            │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 2: Python Inference Backend (ipc_client.py)                  │
+│  MascotController │ AIEngine (Gemma 4 E2B) │ Embedder (e5-small-v2) │
+│  FlushWorker │ CPEventHandler │ StateManager                        │
 │                                                                     │
-│  WinMonitor (SetWinEventHook)                                       │
-│     └─ Fires on foreground window change (hDeepWorkEvent)           │
+│  IPC Pipe Daemon (PeekNamedPipe, non-blocking)                      │
+│     └─ SWITCH / CLIPBOARD / FILE_SAVED / USER_IDLE routing          │
+│     └─ CP_SESSION_START / CP_STUCK / CP_READING_IDLE routing        │
 │                                                                     │
-│  Hybrid Capture Engine (ScreenReader)                               │
-│     └─ Gear 1 (Passive): Fires UIA on tab-switch (10s debounce)     │
-│        └─ Writes baseline context & code to SQLite ocr_buffer       │
-│     └─ Gear 2 (Active): 60s typing threshold + 5s pause triggers    │
-│        a silent Ghost Clipboard (CTRL+C) for pristine code fetch    │
-│        └─ Saves pristine code to RAM cache (g_lastCodeBuffer)       │
+│  Zero-DB Code Hot-Path: code from g_lastCodeBuffer in IPC payload   │
+│     └─ Bypasses SQLite entirely — 0ms staleness for Gemma           │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 1: C++ Event Engine (Jugnu.exe)                              │
+│  WinMonitor │ ScreenReader │ CPStateManager │ DBHandler │ IPCServer │
 │                                                                     │
-│  StuckTimer Thread                                                  │
-│     └─ Monitors AFK/Idle time (3 minutes)                           │
-│     └─ Fires USER_IDLE event via Named Pipe IPC                     │
-│        └─ Embeds RAM-cached code directly in the JSON payload       │
-└─────────────────────────────────────────────────────────────────────┘
-                 │                             │
- SQLite ocr_buffer writes              Named Pipe IPC 
- (Baseline Context Path)               (Zero-DB Code Hot-Path)
-                 ▼                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Python Inference Engine (uv venv)                │
+│  WinMonitor: SetWinEventHook → hDeepWorkEvent (manual-reset Win32)  │
+│     └─ Hibernates ScreenReader when outside Deep Work whitelist     │
 │                                                                     │
-│  FlushWorker (every 60s, AC power only)                             │
-│     └─ Consumes ocr_buffer & Area-Wise Dedup (>95% match)           │
-│     └─ UIA JSON Path:                                               │
-│         Edit controls  → verbatim code, heuristic tag detection     │
-│         Document/Text  → Gemma extraction (TOPIC, TAGS, NOTES only) │
-│     └─ OKF Synthesis → Writes episodic memories to vector DB        │
+│  ScreenReader: DFS UIA Tree Walker + GhostClipboard                 │
+│     Gear 1 (Tab Switch): 10s debounce → UIA → knowledge_docs direct │
+│     Gear 2 (Active Typing): 5s pause → Ghost Clipboard → RAM cache  │
 │                                                                     │
-│  IPC Client Daemon & Practice Engine (practice_mode.py)             │
-│     └─ Receives USER_IDLE event + fresh code from C++               │
-│     └─ Evaluates active code from IPC against DB context            │
-│     └─ Single-Call Gemma Hint Generation (Approach, Type, Hint)     │
-│                                                                     │
-│  AIEngine (Ollama / Gemma4:e2b)                                     │
-│     └─ Situation-Aware Prompting (REPEATED_STRUGGLE)                │
-│     └─ Tiered Token Budgeting (prevents VRAM OOM)                   │
-│                                                                     │
-│  Embedder (multilingual-e5-small)                                   │
-│     └─ Deterministic Anchors (exact window_title / file_path match) │
-│     └─ Union Merge ("Never Delete, Only Add" scroll-loss fix)       │
-│                                                                     │
-│  StateManager ─→ Terminal / WebView2 UI                            │
+│  StuckTimerThread: 3min idle → CP_STUCK + g_lastCodeBuffer in IPC   │
+│  InputHooks: WH_KEYBOARD_LL + WH_MOUSE_LL (CP sessions only)        │
+│  DBHandler: SQLite WAL mode + busy_timeout=30s + FULLMUTEX          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,13 +56,13 @@ A **personalized AI agent** that runs natively on Windows. Think of it as a stud
 
 ## 🚀 What Is Built & Working
 
-### ✅ Socratic Practice Mode (Phase 8)
-Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot. The entire practice mode operates through a strict multi-layer pipeline:
-- **Layer 1: Deterministic Context Retrieval:** Uses the exact window title and UIA page content to instantly anchor and retrieve the correct problem description from the vector database, preventing CP problem hallucination.
-- **Layer 2: Zero-LLM Active Coding Detection:** A fast, language-agnostic parser distinguishes when you are just reading boilerplates (`CP_READING`) versus actively writing control flow logic (`CP_STUCK`). This prevents premature AI interruptions while you're still reading.
-- **Layer 3: Constraint-Aware Correctness Gate:** Before offering a hint, a unified LLM call explicitly verifies if your code solves the problem. Crucially, it mathematically evaluates the Big-O time and space complexity against the problem's stated constraints (e.g. $O(N^2)$ for $N \le 20$), rather than pattern-matching. If correct, Jugnu skips the hint menu entirely (via `CP_SOLVED` routing) and instantly displays an **Efficiency Review**.
-- **Layer 4: Unified Socratic Hint Engine & Memory:** If you are truly stuck, the same single LLM call generates the hint. The engine explicitly injects your **Hint History** and **Past Feedback** directly into the prompt using XML delimiters, ensuring Jugnu never repeats itself and remembers what you found helpful. It evaluates your algorithmic approach, spots the flaw, and outputs a 1-2 sentence Socratic question without writing syntax. To prevent false positives, it must explicitly output `IS_SOLVED: 1` to mark a problem as complete.
-- **Layer 5: Session State Machine & Lazy DB Writes:** Maintains `practice_sessions` and `practice_hints` in SQLite. Jugnu caches the `is_solved` state in a Python RAM dictionary and completely skips redundant SQLite writes if the problem was already solved in a past session, ensuring zero DB overhead while still providing live feedback.
+### ✅ Socratic Practice Mode + Glassmorphic Sidebar (Phase 8)
+Jugnu tracks when you are attempting coding problems (e.g., LeetCode) and acts as an empathetic technical interviewer rather than an answer bot:
+- **Constraint-Aware Correctness Gate (`think=True`):** Before offering a hint, Gemma traces through your code logic step-by-step and evaluates it against the problem's stated constraints. Incomplete code = `IS_SOLVED: 0`. An $O(N^2)$ solution for $N \le 20$ = solved. Pattern-matching false verdicts are eliminated.
+- **Socratic Hint Generation:** If stuck, the same single LLM call generates a `APPROACH: / TYPE: / HINT:` response. `TYPE:` (`CONCEPTUAL`, `LOGIC`, `IMPLEMENTATION`) is now correctly parsed and stored in `practice_hints.hint_type`.
+- **Chat-Style Sidebar** (`sidebar.html`): All hints from the current session are displayed as chat bubbles. Each hint shows its `hint_type` badge (color-coded), the problem slug, platform tag, and Gemma's approach label. The latest hint is always scrolled into view.
+- **Mascot State Machine:** The `jugnuBug` mascot animates through: `sleeping` → `watching` → `thinking` (while Gemma runs) → `hint_ready`. Background `SWITCH` events cannot kill the `thinking` or `hint_ready` states.
+- **Session Memory:** `practice_sessions` + `practice_hints` in SQLite (WAL mode). Hint history is injected back into Gemma's prompt on every subsequent request to prevent repetition.
 
 ### ✅ Hybrid Capture Engine & Zero-DB Hot-Paths (Phase 7)
 We overhauled the OS telemetry engine to capture pristine data without spamming COM APIs or SQLite:
@@ -194,30 +178,38 @@ This decoupled storage allows:
 ## 📅 Development Roadmap
 
 ### ✅ Phase 1–8 (Completed)
-- Full C++/Python dual-process architecture
-- Zero-Overhead Hibernation with Win32 Events
-- UIA Structured JSON extraction pipeline (DFS + ARIA Pruning)
-- OKF Two-Pass synthesis pipeline (Column-Split Schema)
-- Resilient `ocr_buffer` safe-delete with retry
-- Dual-table memory system (episodic + knowledge)
-- WAL-mode SQLite for concurrent access
+- Full C++/Python dual-process architecture (Jugnu.exe + ipc_client.py)
+- Zero-Overhead Hibernation with Win32 Events (`hDeepWorkEvent`)
+- UIA Structured JSON extraction pipeline (DFS + ARIA Pruning + BoundedSimilarityRatio)
+- OKF Two-Pass synthesis pipeline (Column-Split Schema, Gemma metadata-only extraction)
+- UIA direct-to-`knowledge_docs` fast path (bypasses `ocr_buffer` for tab-switch captures)
+- Resilient `ocr_buffer` safe-delete with retry (ids_failed rollback)
+- Dual-table memory system (episodic + knowledge + vec KNN)
+- WAL-mode SQLite for concurrent C++/Python access (busy_timeout=30s)
 - Battery-aware FlushWorker (AC power gate + settle time)
-- Anti-idle ghost popup trap
-- CUDA warmup to prevent KV-cache crash on RTX 4050
-- Tiered Token Budgeting & `\ufffc` Null Byte Sanitization
-- Situation-Aware Prompt Engineering & Blended Re-Ranking
-- Deterministic Vector Anchors & Union Merging
-- Ghost Clipboard Native Bypass
-- Socratic Practice Engine (State Machine, Hint Escalation, Active Code Heuristics)
+- Anti-idle ghost popup trap + Jugnu UI focus guard
+- CUDA warmup to prevent KV-cache crash on RTX 4050 (flash_attn=False)
+- Tiered Token Budgeting + `\ufffc` Null Byte Sanitization
+- Situation-Aware Prompt Engineering + Blended Re-Ranking
+- Deterministic Vector Anchors + Union Merging
+- Ghost Clipboard with synthetic input guard (`LLKHF_INJECTED` filter)
+- CP Practice Engine: InputHooks, CPStateManager, hint escalation, active code heuristics
+- 4-Window Overlay UI: jugnu_bug (mascot), sidebar (hints), nudge_bubble, dashboard
+- MascotController priority guard (thinking/hint_ready protected from background events)
+- hint_type parsed correctly from Gemma's `TYPE:` field
+- CP Abandon Detection (rage-quit catcher)
+- Dashboard with CP stats drill-down (per-problem → per-session → per-hint)
 
-### 🔧 Phase 9 — Gemma Response Polishing (In Progress)
-- [ ] Refine few-shot prompting to force Gemma to respect brevity instructions
-- [ ] Implement strict output parsing to prevent code hallucination mutations
-- [ ] Fix PowerShell markdown rendering for code blocks
-- [ ] Add Gemini API fallback when the local 4B model lacks confidence
+### 🔧 Phase 9 — Hint Escalation & Gemma Response Polishing (Next)
+- [ ] Socratic hint tier escalation (conceptual → guided code → full walkthrough)
+- [ ] `user_feedback` loop — adjust future hint style based on helpful/not-helpful signal
+- [ ] Approach confidence improvements
+- [ ] Gemini API cloud fallback when local model confidence is low
 
-### 🔮 Phase 10 — Native UI & Expansion
-- [ ] Port the PowerShell terminal UI to a native C++ WebView2 borderless window
+### 🔮 Phase 10 — Onboarding & Settings
+- [ ] First-run onboarding window (focus apps, model selection)
+- [ ] Settings panel (pause monitoring, clear DB)
+- [ ] Port to native C++ WebView2 host (ICoreWebView2)
 
 ---
 

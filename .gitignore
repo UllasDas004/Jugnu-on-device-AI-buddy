@@ -61,3 +61,12 @@ docs/resume_plan.md
 docs/api_study_guide.md
 docs/interview_cheatsheet.md
 docs/interview_prep_guide.md
+
+# App State & Configs
+inference/jugnu_prefs.json
+inference/ui/*_state.json
+inference/ui/jugnu_config.json
+*.json
+
+
+test_webview.py

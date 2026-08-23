@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jugnu Dashboard</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"
+          onerror="window.marked={parse:function(t){return t}}"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --base:     #1e1e2e;
+      --mantle:   #181825;
+      --crust:    #11111b;
+      --surface0: #313244;
+      --surface1: #45475a;
+      --surface2: #585b70;
+      --overlay0: #6c7086;
+      --text:     #cdd6f4;
+      --sub0:     #a6adc8;
+      --sub1:     #bac2de;
+      --blue:     #89b4fa;
+      --green:    #a6e3a1;
+      --amber:    #f9e2af;
+      --red:      #f38ba8;
+      --orange:   #fab387;
+      --mauve:    #cba6f7;
+      --teal:     #94e2d5;
+      --pink:     #f5c2e7;
+      --r:        10px;
+      --r-sm:     6px;
+    }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: var(--crust);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       APP SHELL
+    ═══════════════════════════════════════════════════ */
+    .app { display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }
+
+    /* ── Top navigation bar ────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      background: var(--mantle);
+      border-bottom: 1px solid var(--surface0);
+      padding: 0 20px;
+      flex-shrink: 0;
+      height: 48px;
+    }
+    .topbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 800;
+      color: var(--text);
+      margin-right: 28px;
+      letter-spacing: -0.3px;
+    }
+    .topbar-brand .bug { font-size: 20px; }
+
+    .tab-nav { display: flex; gap: 2px; flex: 1; }
+    .tab-btn {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 16px;
+      height: 48px;
+      border: none;
+      background: none;
+      color: var(--sub0);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active {
+      color: var(--blue);
+      border-bottom-color: var(--blue);
+    }
+    .tab-btn .icon { font-size: 15px; }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-left: auto;
+    }
+    .window-controls {
+      display: flex;
+      gap: 8px;
+    }
+    .win-btn {
+      background: none; border: none; cursor: pointer; color: var(--sub0);
+      font-size: 14px; display: flex; align-items: center; justify-content: center;
+      width: 24px; height: 24px; border-radius: 4px; transition: 0.2s;
+    }
+    .win-btn:hover { background: var(--surface1); color: var(--text); }
+    .win-btn.close:hover { background: var(--red); color: var(--crust); }
+    
+    .jugnu-state-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--surface0);
+      border: 1px solid var(--surface1);
+      color: var(--sub1);
+    }
+    .state-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green);
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    /* ── Tab pages ─────────────────────────────────────── */
+    .tab-page {
+      display: none;
+      flex: 1;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .tab-page.active { display: flex; }
+
+    /* ═══════════════════════════════════════════════════
+       SHARED COMPONENTS
+    ═══════════════════════════════════════════════════ */
+    .scroll-area {
+      overflow-y: auto;
+      flex: 1;
+    }
+    .scroll-area::-webkit-scrollbar { width: 5px; }
+    .scroll-area::-webkit-scrollbar-thumb {
+      background: var(--surface1); border-radius: 5px;
+    }
+
+    .section-title {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--overlay0);
+      margin-bottom: 10px;
+    }
+
+    .card {
+      background: var(--mantle);
+      border: 1px solid var(--surface0);
+      border-radius: var(--r);
+      padding: 16px 18px;
+      transition: border-color 0.15s;
+    }
+    .card:hover { border-color: var(--surface1); }
+    .card-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--sub1);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .stat-card {
+      background: var(--mantle);
+      border: 1px solid var(--surface0);
+      border-radius: var(--r);
+      padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .stat-label {
+      font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.7px;
+      color: var(--overlay0);
+    }
+    .stat-value {
+      font-size: 26px; font-weight: 800; line-height: 1.1;
+    }
+    .stat-value.green { color: var(--green); }
+    .stat-value.amber { color: var(--amber); }
+    .stat-value.blue  { color: var(--blue);  }
+    .stat-value.red   { color: var(--red);   }
+    .stat-sub { font-size: 11px; color: var(--sub0); }
+
+    .empty-state {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 10px; padding: 40px 20px;
+      color: var(--overlay0); text-align: center;
+    }
+    .empty-icon  { font-size: 34px; }
+    .empty-title { font-size: 14px; font-weight: 600; color: var(--sub0); }
+    .empty-sub   { font-size: 12px; }
+
+    .loading-spinner {
+      display: flex; align-items: center; justify-content: center;
+      gap: 10px; padding: 30px;
+      color: var(--overlay0); font-size: 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner-ring {
+      width: 18px; height: 18px;
+      border: 2px solid var(--surface1);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       TAB 1 — SYSTEM VITALS
+    ═══════════════════════════════════════════════════ */
+    #tab-system {
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .system-content {
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* EMA focus bars */
+    .ema-list { display: flex; flex-direction: column; gap: 9px; }
+    .ema-row  { display: flex; align-items: center; gap: 10px; }
+    .ema-app  {
+      width: 130px; font-size: 11.5px; color: var(--sub1);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0;
+    }
+    .ema-bar-bg {
+      flex: 1; height: 8px; background: var(--surface0);
+      border-radius: 4px; overflow: hidden;
+    }
+    .ema-bar-fill {
+      height: 100%; border-radius: 4px;
+      background: linear-gradient(90deg, var(--blue), var(--mauve));
+      transition: width 0.7s cubic-bezier(0.34,1.56,0.64,1);
+    }
+    .ema-score {
+      width: 38px; text-align: right;
+      font-size: 11px; font-weight: 600; color: var(--blue);
+    }
+
+    /* Markov table */
+    .markov-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .markov-table th {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.6px; color: var(--overlay0);
+      padding: 6px 10px; text-align: left;
+      border-bottom: 1px solid var(--surface0);
+    }
+    .markov-table td {
+      padding: 7px 10px; font-size: 12px; color: var(--sub1);
+      border-bottom: 1px solid var(--surface0);
+    }
+    .markov-table tr:last-child td { border-bottom: none; }
+    .markov-table tr:hover td { background: rgba(255,255,255,0.02); }
+    .markov-arrow { color: var(--overlay0); margin: 0 4px; }
+    .markov-weight {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 28px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--surface0);
+      font-size: 11px; font-weight: 700; color: var(--amber);
+    }
+
+    /* Jugnu control panel */
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    .ctrl-btn {
+      display: flex; flex-direction: column; align-items: center;
+      gap: 6px; padding: 14px 10px;
+      background: var(--surface0);
+      border: 1px solid var(--surface1);
+      border-radius: var(--r);
+      cursor: pointer;
+      font-size: 11px; font-weight: 600; color: var(--sub1);
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .ctrl-btn:hover { background: var(--surface1); border-color: var(--surface2); color: var(--text); }
+    .ctrl-btn.active { border-color: var(--blue); color: var(--blue); background: rgba(137,180,250,0.08); }
+    .ctrl-btn .ctrl-icon { font-size: 20px; }
+
+    /* ═══════════════════════════════════════════════════
+       TAB 2 — CP SESSIONS
+    ═══════════════════════════════════════════════════ */
+    #tab-cp {
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Stats bar at top */
+    .cp-stats-bar {
+      background: var(--mantle);
+      border-bottom: 1px solid var(--surface0);
+      padding: 14px 24px;
+      flex-shrink: 0;
+    }
+
+    /* Two-column main area */
+    .cp-main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    /* Left — problem list */
+    .cp-left {
+      width: 260px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--surface0);
+      background: var(--mantle);
+      overflow: hidden;
+    }
+    .cp-search-wrap {
+      padding: 10px 10px 8px;
+      flex-shrink: 0;
+      border-bottom: 1px solid var(--surface0);
+    }
+    .search-box {
+      width: 100%;
+      background: var(--surface0);
+      border: 1px solid var(--surface1);
+      border-radius: var(--r-sm);
+      color: var(--text); font-size: 12px;
+      padding: 7px 10px; outline: none;
+      transition: border-color 0.2s;
+    }
+    .search-box::placeholder { color: var(--overlay0); }
+    .search-box:focus { border-color: var(--blue); }
+
+    .problem-list { padding: 6px; overflow-y: auto; flex: 1; }
+    .problem-list::-webkit-scrollbar { width: 4px; }
+    .problem-list::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 4px; }
+
+    .problem-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; border-radius: var(--r-sm);
+      cursor: pointer; transition: background 0.15s;
+      margin-bottom: 2px;
+    }
+    .problem-item:hover { background: var(--surface0); }
+    .problem-item.active { background: rgba(137,180,250,0.1); }
+
+    .pf-badge {
+      font-size: 9px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.5px; padding: 2px 5px; border-radius: 4px; flex-shrink: 0;
+    }
+    .pf-leetcode   { background: rgba(249,226,175,0.15); color: var(--amber); }
+    .pf-codeforces { background: rgba(137,180,250,0.15); color: var(--blue);  }
+    .pf-codechef   { background: rgba(203,166,247,0.15); color: var(--mauve); }
+    .pf-atcoder    { background: rgba(148,226,213,0.15); color: var(--teal);  }
+    .pf-unknown    { background: rgba(108,112,134,0.15); color: var(--overlay0); }
+
+    .problem-slug {
+      flex: 1; font-size: 12px; color: var(--sub1);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .problem-item.active .problem-slug { color: var(--text); }
+
+    .solved-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .solved-dot.solved   { background: var(--green); }
+    .solved-dot.unsolved { background: var(--surface1); }
+
+    /* Right — detail panel */
+    .cp-right {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+      min-width: 0;
+      background: var(--base);
+    }
+    .detail-header {
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--surface0);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .detail-title {
+      font-size: 15px; font-weight: 700; color: var(--text); flex: 1;
+    }
+    .detail-badges { display: flex; gap: 7px; flex-wrap: wrap; }
+    .meta-pill {
+      font-size: 10px; font-weight: 700;
+      padding: 3px 9px; border-radius: 999px; border: 1px solid;
+    }
+    .meta-pill.solved   { color: var(--green); border-color: rgba(166,227,161,0.3); background: rgba(166,227,161,0.08); }
+    .meta-pill.unsolved { color: var(--overlay0); border-color: var(--surface1); background: var(--surface0); }
+    .meta-pill.info     { color: var(--blue); border-color: rgba(137,180,250,0.3); background: rgba(137,180,250,0.08); }
+    .meta-pill.warn     { color: var(--amber); border-color: rgba(249,226,175,0.3); background: rgba(249,226,175,0.08); }
+
+    .detail-content {
+      flex: 1; overflow-y: auto; padding: 18px 22px;
+      display: flex; flex-direction: column; gap: 16px;
+      min-height: 0;
+    }
+    .detail-content::-webkit-scrollbar { width: 5px; }
+    .detail-content::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 5px; }
+
+    /* Donut + overview when no problem selected */
+    .cp-overview {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    .chart-wrap { position: relative; height: 200px; }
+
+    /* Hint cards */
+    .hints-label {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--overlay0);
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--surface0);
+    }
+    .hint-card {
+      background: var(--mantle);
+      border: 1px solid var(--surface0);
+      border-radius: var(--r);
+      overflow: hidden;
+      animation: fadeIn 0.2s ease;
+      flex-shrink: 0;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+    .hint-card-hdr {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 14px;
+      background: var(--surface0);
+      border-bottom: 1px solid var(--surface1);
+    }
+    .hint-level {
+      font-size: 9px; font-weight: 800; text-transform: uppercase;
+      letter-spacing: 0.6px; padding: 2px 7px; border-radius: 4px;
+    }
+    .lvl-direction { background: rgba(137,180,250,0.15); color: var(--blue);  }
+    .lvl-approach  { background: rgba(249,226,175,0.15); color: var(--amber); }
+    .lvl-concrete  { background: rgba(243,139,168,0.15); color: var(--red);   }
+    .lvl-default   { background: rgba(108,112,134,0.15); color: var(--overlay0); }
+
+    .hint-num       { font-size: 11px; color: var(--overlay0); }
+    .hint-ts        { font-size: 10px; color: var(--overlay0); margin-left: auto; }
+    .hint-fb        { font-size: 13px; }
+
+    .hint-card-body {
+      padding: 12px 14px; line-height: 1.65;
+      color: var(--sub1); font-size: 12.5px;
+    }
+    .hint-card-body p  { margin-bottom: 6px; }
+    .hint-card-body p:last-child { margin-bottom: 0; }
+    .hint-card-body code {
+      background: var(--surface0); border-radius: 4px;
+      padding: 1px 5px; font-size: 11.5px;
+      font-family: 'Cascadia Code','Consolas',monospace; color: var(--blue);
+    }
+    .hint-card-body pre {
+      background: var(--crust); border-radius: var(--r-sm);
+      padding: 10px 12px; overflow-x: auto; margin: 8px 0;
+    }
+    .hint-card-body pre code { background: none; padding: 0; color: var(--text); }
+    .hint-card-body strong { color: var(--text); }
+
+    .hint-code-toggle {
+      background: var(--surface0); border-top: 1px solid var(--surface1);
+      padding: 8px 14px; font-size: 11px; font-weight: 600; color: var(--blue);
+      cursor: pointer; text-align: center; transition: background 0.15s;
+    }
+    .hint-code-toggle:hover { background: var(--surface1); }
+    .hint-code-block {
+      background: var(--crust); border-top: 1px solid var(--surface1);
+      padding: 12px 14px; overflow-x: auto; overflow-y: auto;
+      max-height: 450px;
+    }
+    .hint-code-block::-webkit-scrollbar { width: 8px; }
+    .hint-code-block::-webkit-scrollbar-thumb { background: var(--surface0); border-radius: 4px; }
+    .hint-code-block pre { margin: 0; }
+    .hint-code-block code {
+      font-family: 'Cascadia Code','Consolas',monospace; font-size: 11.5px; color: var(--sub1);
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ══════════ TOP NAV BAR ══════════ -->
+  <nav class="topbar pywebview-drag-region">
+    <div class="topbar-brand">
+      <span class="bug">🪲</span> Jugnu
+    </div>
+
+    <div class="tab-nav">
+      <button class="tab-btn active" id="btn-system" onclick="switchTab('system')">
+        <span class="icon">📡</span> System Vitals
+      </button>
+      <button class="tab-btn" id="btn-cp" onclick="switchTab('cp')">
+        <span class="icon">⚔️</span> CP Sessions
+      </button>
+    </div>
+
+    <div class="topbar-right">
+      <div class="jugnu-state-badge">
+        <div class="state-dot" id="state-dot"></div>
+        <span id="state-label">Running</span>
+      </div>
+      <div class="window-controls">
+        <button class="win-btn minimize" onclick="if(window.pywebview) window.pywebview.api.minimize()" title="Minimize">🗕</button>
+        <button class="win-btn close" onclick="if(window.pywebview) window.pywebview.api.dismiss()" title="Close">✕</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ══════════ TAB 1: SYSTEM VITALS ══════════ -->
+  <div class="tab-page active" id="tab-system">
+    <div class="scroll-area">
+      <div class="system-content" id="system-content">
+        <div class="loading-spinner"><div class="spinner-ring"></div>Loading system data…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ TAB 2: CP SESSIONS ══════════ -->
+  <div class="tab-page" id="tab-cp">
+
+    <!-- Stats bar -->
+    <div class="cp-stats-bar">
+      <div class="stat-grid" id="cp-stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="loading-spinner"><div class="spinner-ring"></div></div>
+      </div>
+    </div>
+
+    <!-- Two-column main -->
+    <div class="cp-main">
+      <aside class="cp-left">
+        <div class="cp-search-wrap">
+          <input id="search-box" class="search-box" type="text" placeholder="Search problems…" autocomplete="off">
+        </div>
+        <div id="problem-list" class="problem-list">
+          <div class="loading-spinner" style="padding:20px"><div class="spinner-ring"></div></div>
+        </div>
+      </aside>
+
+      <div class="cp-right">
+        <div class="detail-header">
+          <div id="detail-title" class="detail-title">Overview</div>
+          <div id="detail-badges" class="detail-badges"></div>
+        </div>
+        <div id="detail-content" class="detail-content">
+          <div class="loading-spinner"><div class="spinner-ring"></div>Loading…</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+//  GLOBALS
+// ─────────────────────────────────────────────────────────────────────────────
+var _stats       = null;
+var _allProblems = [];
+var _activeSlug  = null;
+var _searchQ     = '';
+var _donutChart  = null;
+var _currentTab  = 'system';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TAB SWITCH
+// ─────────────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  _currentTab = name;
+  ['system','cp'].forEach(function(t) {
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+    document.getElementById('btn-' + t).classList.toggle('active', t === name);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+function pfClass(p) {
+  return {leetcode:'pf-leetcode',codeforces:'pf-codeforces',
+          codechef:'pf-codechef',atcoder:'pf-atcoder'}[p] || 'pf-unknown';
+}
+function pfLabel(p) { return p ? p.slice(0,2).toUpperCase() : '??'; }
+function trunc(s,n) { return s && s.length>n ? s.slice(0,n)+'…' : (s||''); }
+function safeDate(ts) {
+  if (!ts) return '';
+  var d = new Date(ts.replace ? ts.replace(' ','T') : ts);
+  return isNaN(d) ? ts : d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
+}
+function lvlClass(t) {
+  return {direction_hint:'lvl-direction',approach_hint:'lvl-approach',
+          concrete_hint:'lvl-concrete'}[t] || 'lvl-default';
+}
+function lvlLabel(t) {
+  var known = {direction_hint:'Direction',approach_hint:'Approach',
+          concrete_hint:'Concrete'};
+  return known[t] || (t ? t.replace(/_/g,' ').toUpperCase() : 'Hint');
+}
+function fbIcon(fb) {
+  // DB stores 1=helpful, 0=not_helpful, null=no feedback
+  // Also handle legacy string values defensively
+  if (fb === 1   || fb === 'helpful')     return '👍';
+  if (fb === 0   || fb === 'not_helpful') return '👎';
+  return '';
+}
+function safeMD(text) {
+  if (!text) return '';
+  try { return window.marked.parse(text); } catch(e) { return text; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TAB 1 — SYSTEM VITALS
+// ─────────────────────────────────────────────────────────────────────────────
+function renderSystem() {
+  var s    = _stats || {};
+  var ema  = s.ema_scores    || [];
+  var edges= s.markov_edges  || [];
+  var el   = document.getElementById('system-content');
+
+  // ── Focus EMA bars ──────────────────────────────────────────────
+  var maxEma = ema.length ? ema[0].score : 1;
+  var emaHtml = '<div class="card" style="margin-bottom:0">' +
+    '<div class="card-title">🎯 Focus Score (EMA) <span style="font-size:10px;font-weight:400;color:var(--overlay0);text-transform:none;letter-spacing:0">— Exponential moving average across active apps</span></div>' +
+    (ema.length
+      ? '<div class="ema-list">' + ema.slice(0,10).map(function(e) {
+          var pct = maxEma>0 ? (e.score/maxEma*100) : 0;
+          return '<div class="ema-row">' +
+            '<div class="ema-app" title="'+e.app+'">'+e.app+'</div>' +
+            '<div class="ema-bar-bg"><div class="ema-bar-fill" style="width:'+pct+'%"></div></div>' +
+            '<div class="ema-score">'+e.score.toFixed(2)+'</div>' +
+            '</div>';
+        }).join('') + '</div>'
+      : '<div class="empty-state" style="padding:24px"><div class="empty-icon">📊</div><div class="empty-sub">No focus data yet. Use apps and Jugnu will begin tracking.</div></div>'
+    ) + '</div>';
+
+  // ── App transitions (Markov) ─────────────────────────────────────
+  var markovHtml = '<div class="card" style="margin-bottom:0">' +
+    '<div class="card-title">🔀 App Switching Patterns <span style="font-size:10px;font-weight:400;color:var(--overlay0);text-transform:none;letter-spacing:0">— Most frequent transitions</span></div>' +
+    (edges.length
+      ? '<table class="markov-table"><thead><tr><th>From</th><th>→</th><th>To</th><th>Count</th></tr></thead><tbody>' +
+        edges.slice(0,12).map(function(e) {
+          return '<tr><td>'+trunc(e.source,22)+'</td><td style="color:var(--overlay0)">→</td><td>'+trunc(e.target,22)+'</td>' +
+            '<td><span class="markov-weight">'+e.weight+'</span></td></tr>';
+        }).join('') + '</tbody></table>'
+      : '<div class="empty-state" style="padding:24px"><div class="empty-icon">🔀</div><div class="empty-sub">No transition data yet.</div></div>'
+    ) + '</div>';
+
+  // ── Jugnu control panel ──────────────────────────────────────────
+  var states = [
+    {id:'sleeping',  icon:'😴', label:'Sleeping'},
+    {id:'watching',  icon:'👀', label:'Watching'},
+    {id:'thinking',  icon:'🤔', label:'Thinking'},
+    {id:'hint_ready',icon:'💡', label:'Hint Ready'},
+    {id:'flow',      icon:'🌊', label:'Flow'},
+    {id:'nudge',     icon:'🔔', label:'Nudge'},
+  ];
+  var ctrlHtml = '<div class="card" style="margin-bottom:0">' +
+    '<div class="card-title">🪲 Jugnu Bug — State Override <span style="font-size:10px;font-weight:400;color:var(--overlay0);text-transform:none;letter-spacing:0">— Manually set mascot state for testing</span></div>' +
+    '<div class="control-grid">' +
+    states.map(function(s) {
+      return '<button class="ctrl-btn" id="ctrl-'+s.id+'" onclick="setJugnuState(\''+s.id+'\')">' +
+        '<span class="ctrl-icon">'+s.icon+'</span>' + s.label + '</button>';
+    }).join('') +
+    '</div></div>';
+
+  el.innerHTML = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">' + emaHtml + markovHtml + '</div>' + ctrlHtml;
+}
+
+var _currentJugnuState = null;
+function setJugnuState(state) {
+  _currentJugnuState = state;
+  // Update button highlights
+  ['sleeping','watching','thinking','hint_ready','flow','nudge'].forEach(function(s) {
+    var b = document.getElementById('ctrl-'+s);
+    if (b) b.classList.toggle('active', s === state);
+  });
+  document.getElementById('state-label').textContent = state.replace('_',' ');
+  // Tell Python (it will call evaluate_js on the bug window)
+  // This is a debug override — only works if pywebview is connected
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.set_bug_state) {
+    window.pywebview.api.set_bug_state(state);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TAB 2 — CP SESSIONS
+// ─────────────────────────────────────────────────────────────────────────────
+function renderCPStats() {
+  var hist   = (_stats && _stats.cp_history) || [];
+  var solved = hist.filter(function(p){ return p.is_solved; }).length;
+  var total  = hist.length;
+  var rate   = total ? Math.round(solved/total*100) : 0;
+  var mostStuck = hist.reduce(function(mx,p){ return (!mx||p.stuck_count>mx.stuck_count)?p:mx; }, null);
+
+  document.getElementById('cp-stat-grid').innerHTML =
+    statCard('Solved', solved, 'green', 'out of '+total+' attempted') +
+    statCard('Attempted', total, 'blue', 'all time') +
+    statCard('Solve Rate', rate+'%', 'amber', 'percentage solved') +
+    statCard('Most Stuck', mostStuck ? trunc(mostStuck.slug,12) : '—', 'red',
+      mostStuck ? mostStuck.stuck_count+' hints needed' : 'no data yet');
+}
+
+function statCard(label, value, color, sub) {
+  return '<div class="stat-card">' +
+    '<div class="stat-label">'+label+'</div>' +
+    '<div class="stat-value '+color+'" style="font-size:'+(String(value).length>5?'18px':'26px')+'">'+value+'</div>' +
+    '<div class="stat-sub">'+sub+'</div>' +
+    '</div>';
+}
+
+function renderProblemList() {
+  var problems = filterProblems();
+  var el = document.getElementById('problem-list');
+
+  if (!problems.length) {
+    el.innerHTML = '<div class="empty-state" style="padding:20px">' +
+      '<div class="empty-icon">📭</div>' +
+      '<div class="empty-sub">No problems found.</div></div>';
+    return;
+  }
+
+  el.innerHTML = problems.map(function(p) {
+    var active = _activeSlug===p.slug ? ' active' : '';
+    return '<div class="problem-item'+active+'" data-slug="'+p.slug+'" data-pf="'+(p.platform||'')+'">' +
+      '<span class="pf-badge '+pfClass(p.platform)+'">'+pfLabel(p.platform)+'</span>' +
+      '<span class="problem-slug" title="'+p.slug+'">'+trunc(p.slug,22)+'</span>' +
+      '<span class="solved-dot '+(p.is_solved?'solved':'unsolved')+'" title="'+(p.is_solved?'Solved':'Unsolved')+'"></span>' +
+      '</div>';
+  }).join('');
+
+  el.querySelectorAll('.problem-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+      _activeSlug = this.getAttribute('data-slug');
+      var pf = this.getAttribute('data-pf');
+      renderProblemList();
+      showProblemDetail(_activeSlug, pf);
+    });
+  });
+}
+
+function filterProblems() {
+  if (!_searchQ) return _allProblems;
+  var q = _searchQ.toLowerCase();
+  return _allProblems.filter(function(p) {
+    return (p.slug||'').toLowerCase().includes(q) || (p.platform||'').toLowerCase().includes(q);
+  });
+}
+
+document.getElementById('search-box').addEventListener('input', function() {
+  _searchQ = this.value.trim();
+  renderProblemList();
+});
+
+// ── Overview (no problem selected) ──────────────────────────────────────────
+function showCPOverview() {
+  _activeSlug = null;
+  renderProblemList();
+
+  document.getElementById('detail-title').textContent = 'Overview';
+  document.getElementById('detail-badges').innerHTML  = '';
+
+  var hmap  = (_stats && _stats.strategy_heatmap) || {};
+  var hist  = (_stats && _stats.cp_history) || [];
+  var entries = Object.entries(hmap);
+
+  var donutHtml = '<div class="card" style="margin-bottom:0">' +
+    '<div class="card-title">🧩 Strategy Heatmap</div>';
+  if (entries.length) {
+    donutHtml += '<div class="chart-wrap"><canvas id="donut-chart"></canvas></div>';
+  } else {
+    donutHtml += '<div class="empty-state" style="padding:24px"><div class="empty-icon">🗺️</div>' +
+      '<div class="empty-sub">Solve more problems to see your approach distribution.</div></div>';
+  }
+  donutHtml += '</div>';
+
+  var recentHtml = '<div class="card" style="margin-bottom:0">' +
+    '<div class="card-title">📋 Recent Problems</div>' +
+    (hist.length
+      ? '<div class="ema-list">' + hist.slice(0,8).map(function(p) {
+          return '<div class="ema-row">' +
+            '<span class="pf-badge '+pfClass(p.platform)+'" style="font-size:9px">'+pfLabel(p.platform)+'</span>' +
+            '<div class="ema-app" title="'+p.slug+'">'+trunc(p.slug,20)+'</div>' +
+            '<div class="solved-dot '+(p.is_solved?'solved':'unsolved')+'" style="margin-left:auto"></div>' +
+            '</div>';
+        }).join('') + '</div>'
+      : '<div class="empty-sub" style="padding:12px;color:var(--overlay0)">No problems tracked yet.</div>'
+    ) + '</div>';
+
+  document.getElementById('detail-content').innerHTML =
+    '<div class="cp-overview">' + donutHtml + recentHtml + '</div>';
+
+  if (_donutChart) { _donutChart.destroy(); _donutChart = null; }
+  if (entries.length) {
+    var ctx = document.getElementById('donut-chart');
+    if (ctx) {
+      var palette = ['#89b4fa','#cba6f7','#f5c2e7','#f38ba8','#fab387','#f9e2af','#a6e3a1','#94e2d5'];
+      _donutChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: entries.map(function(e){ return e[0]; }),
+          datasets: [{
+            data:            entries.map(function(e){ return e[1]; }),
+            backgroundColor: entries.map(function(_,i){ return palette[i%palette.length]; }),
+            borderColor: 'var(--mantle)', borderWidth: 2,
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position:'right', labels: {
+            color:'var(--sub1)', font:{size:11}, boxWidth:12, padding:8
+          }}}
+        }
+      });
+    }
+  }
+}
+
+// ── Problem detail ─────────────────────────────────────────────────────────
+function showProblemDetail(slug, platform) {
+  document.getElementById('detail-title').textContent = slug;
+
+  var meta = null;
+  if (_stats && _stats.cp_history) {
+    _stats.cp_history.forEach(function(p){ if(p.slug===slug) meta=p; });
+  }
+
+  var badges = '';
+  if (meta) {
+    badges += '<span class="meta-pill '+(meta.is_solved?'solved':'unsolved')+'">'+
+      (meta.is_solved?'✓ Solved':'✗ Unsolved')+'</span>';
+    if (meta.stuck_count>0)
+      badges += '<span class="meta-pill warn">'+meta.stuck_count+' hints</span>';
+    if (meta.detected_approach && meta.detected_approach!=='NONE')
+      badges += '<span class="meta-pill info">'+meta.detected_approach+'</span>';
+  }
+  document.getElementById('detail-badges').innerHTML = badges;
+
+  document.getElementById('detail-content').innerHTML =
+    '<div class="loading-spinner"><div class="spinner-ring"></div>Fetching hint log…</div>';
+
+  if (window.pywebview && window.pywebview.api) {
+    window.pywebview.api.get_problem_hints(slug).then(function(raw) {
+      var hints = [];
+      try { hints = JSON.parse(raw); } catch(e) {}
+      renderHintLog(slug, hints);
+    }).catch(function(){ renderHintLog(slug, []); });
+  } else {
+    renderHintLog(slug, []);
+  }
+}
+
+function renderHintLog(slug, hints) {
+  // Update the hint count badge with the real fetched count
+  var badge = document.getElementById('hint-count-badge');
+  if (badge) {
+    if (hints && hints.length > 0) {
+      badge.textContent = hints.length + (hints.length === 1 ? ' hint' : ' hints');
+    } else {
+      badge.parentNode && badge.parentNode.removeChild(badge);
+    }
+  }
+
+  if (!hints || !hints.length) {
+    document.getElementById('detail-content').innerHTML =
+      '<div class="empty-state"><div class="empty-icon">📝</div>' +
+      '<div class="empty-title">No hints yet</div>' +
+      '<div class="empty-sub">Hints for "'+slug+'" will appear here as you work on it.</div></div>';
+    return;
+  }
+
+  var label = '<div class="hints-label">'+hints.length+' hint'+(hints.length!==1?'s':'')+' — oldest first</div>';
+  var cards  = hints.map(function(h, i) {
+    return '<div class="hint-card">' +
+      '<div class="hint-card-hdr">' +
+        '<span class="hint-level '+lvlClass(h.hint_type)+'">'+lvlLabel(h.hint_type)+'</span>' +
+        '<span class="hint-num">#'+(i+1)+'</span>' +
+        (fbIcon(h.user_feedback) ? '<span class="hint-fb">'+fbIcon(h.user_feedback)+'</span>' : '') +
+        (safeDate(h.timestamp)   ? '<span class="hint-ts">'+safeDate(h.timestamp)+'</span>' : '') +
+      '</div>' +
+      '<div class="hint-card-body">'+safeMD(h.hint_text)+'</div>' +
+      (h.code_snapshot && h.code_snapshot.trim() ? 
+        "<div class='hint-code-toggle' onclick='this.nextElementSibling.style.display = this.nextElementSibling.style.display === \"none\" ? \"block\" : \"none\"; this.innerText = this.nextElementSibling.style.display === \"none\" ? \"Show Code Snapshot\" : \"Hide Code Snapshot\"'>Show Code Snapshot</div>" +
+        '<div class="hint-code-block" style="display:none;"><pre><code>' + h.code_snapshot.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</code></pre></div>' 
+      : '') +
+      '</div>';
+  }).join('');
+
+  document.getElementById('detail-content').innerHTML = label + cards;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DATA LOADING
+// ─────────────────────────────────────────────────────────────────────────────
+function loadData() {
+  var api = window.pywebview && window.pywebview.api;
+  var fetch = api
+    ? window.pywebview.api.get_dashboard_stats().then(function(raw){
+        try { return JSON.parse(raw); } catch(e) { return {}; }
+      })
+    : Promise.resolve({});
+
+  fetch.then(function(stats) {
+    _stats       = stats || {};
+    _allProblems = (_stats.cp_history || []).slice();
+
+    // Render both tabs
+    renderSystem();
+    renderCPStats();
+    renderProblemList();
+    showCPOverview();
+  }).catch(function() {
+    _stats = {};
+    renderSystem();
+    renderCPStats();
+    renderProblemList();
+    showCPOverview();
+  });
+}
+
+// Save window geometry on close/resize
+var _geoTimer = null;
+function saveGeo() {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_geometry) {
+    window.pywebview.api.save_geometry(
+      window.screenX, window.screenY, window.outerWidth, window.outerHeight
+    );
+  }
+}
+window.addEventListener('beforeunload', saveGeo);
+window.addEventListener('resize', function() {
+  clearTimeout(_geoTimer); _geoTimer = setTimeout(saveGeo, 800);
+});
+
+// Boot
+window.addEventListener('pywebviewready', loadData);
+if (typeof window.pywebview === 'undefined') setTimeout(loadData, 100);
+</script>
+</body>
+</html>

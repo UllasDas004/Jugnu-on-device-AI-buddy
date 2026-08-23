@@ -3,6 +3,7 @@
 #include "../db/db_handler.h"
 #include "server/ipc_server.h"
 #include "monitor/screen_reader.h"
+#include "monitor/cp_state_manager.h"
 #include <iostream>
 #include <psapi.h> // for getWindowTextA
 #include <unordered_set>
@@ -13,6 +14,7 @@ namespace Jugnu
 {
     HWINEVENTHOOK WinMonitor::hook = nullptr;
     std::atomic<bool> WinMonitor::isRunning{false};
+    std::atomic<bool> WinMonitor::g_isJugnuUIFocused{false};
     HANDLE WinMonitor::hStuckThread = NULL;
     std::string WinMonitor::currentForegroundProcess = "";
     std::string WinMonitor::lastMeaningfulApp = "";
@@ -83,6 +85,23 @@ namespace Jugnu
         std::string processName = GetProcessName(hwnd);
         std::string windowTitle = GetWindowTextString(hwnd);
 
+        // ── Jugnu UI Focus Gate ──────────────────────────────────────────
+        // python.exe with a "jugnu" window title = one of our own UI windows.
+        // Pause all timers globally without touching any timer state.
+        if (processName == "python.exe" || processName == "pythonw.exe")
+        {
+            if (windowTitle.rfind("jugnu", 0) == 0)
+            {
+                g_isJugnuUIFocused = true;
+                if(hDeepWorkEvent) SetEvent(hDeepWorkEvent); // keep StuckTimerThread awake
+                std::cout << "\033[90m[WinMonitor]\033[0m Jugnu UI focused (" << windowTitle << ") — timers paused.\n";
+            }
+            return; // Never send SWITCH for any python.exe
+        }
+        // Clear the flag the moment any non-python app takes focus
+        g_isJugnuUIFocused = false;
+        // ────────────────────────────────────────────────────────────────
+
         // Save current foreground process for the Stuck Timer thread
         currentForegroundProcess = processName;
 
@@ -129,12 +148,14 @@ namespace Jugnu
         {
             // Non-work app → put both threads to sleep
             if(hDeepWorkEvent) ResetEvent(hDeepWorkEvent);
+            Jugnu::CPStateManager::OnStandbyEntered();
             std::cout << "\033[90m[Jugnu]\033[0m \'" << processName << "\' is outside the focus zone - background threads entering standby.\n";
             return;
         }
 
         // Deep Work app → wake up both threads
         if(hDeepWorkEvent) SetEvent(hDeepWorkEvent);
+        Jugnu::CPStateManager::OnStandbyExited();
         std::cout << "\033[1;32m[Jugnu]\033[0m Focus zone active: \'" << processName << "\' - monitoring threads are live.\n";
 
         // FIX ST-1: Don't let terminals overwrite the work context.
@@ -175,6 +196,8 @@ namespace Jugnu
         hDeepWorkEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
         std::cout << "\033[1;36m[WinMonitor]\033[0m Installing EVENT_SYSTEM_FOREGROUND hook...\n";
+
+        Jugnu::CPStateManager::Init();
         
         // Grab the initial window state in case the user started Jugnu inside an integrated terminal!
         HWND hwnd = GetForegroundWindow();
@@ -232,6 +255,8 @@ namespace Jugnu
             CloseHandle(hDeepWorkEvent);
             hDeepWorkEvent = NULL;
         }
+
+        Jugnu::CPStateManager::Cleanup();
     }
 
     bool WinMonitor::IsUserIdle()
@@ -290,7 +315,7 @@ namespace Jugnu
             if (idleTime > 180000)
             {
                 // Hit 3 minutes! Fire the stuck notification (only once per idle session).
-                if (!hasTriggered)
+                if (!hasTriggered && !g_isJugnuUIFocused)
                 {
                     std::cout << "\n\033[1;31m[StuckTimer]\033[0m No activity for 3 minutes. Sending focus nudge to Python...\n";
                     const std::string& idleApp = lastMeaningfulApp.empty() ? currentForegroundProcess : lastMeaningfulApp;

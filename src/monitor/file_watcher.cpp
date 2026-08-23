@@ -97,10 +97,17 @@ namespace Jugnu
 
                         std::string absolutePath = watchPath + "\\" + filename;
 
-                        // Ignore temporary files, metadata, and environment folders
-                        if( filename.find(".git") == std::string::npos &&
+                        DWORD attr = GetFileAttributesA(absolutePath.c_str());
+                        bool isDir = (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
+
+                        // Ignore directories, temporary files, metadata, and Jugnu's own files
+                        if( !isDir &&
+                            filename.find(".git") == std::string::npos &&
                             filename.find(".venv") == std::string::npos &&
                             filename.find("build\\") == std::string::npos &&
+                            filename.find("inference\\") == std::string::npos &&
+                            filename.find("src\\") == std::string::npos &&
+                            filename.find(".json") == std::string::npos &&
                             filename.find(".tmp") == std::string::npos &&
                             filename.find(".db") == std::string::npos &&
                             filename.find(".pyc") == std::string::npos &&

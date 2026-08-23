@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jugnu</title>
+  <style>
+    /* ── Black window shell (transparent=True is WebView2-unreliable) ──────── */
+    html, body {
+      margin: 0; padding: 0;
+      width: 100%; height: 100%;
+      background: #000000;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      -webkit-app-region: no-drag; /* prevent OS drag hijack */
+    }
+
+    /* ── Mascot container ──────────────────────────────────────────────── */
+    #mascot-container {
+      width: 100px;
+      height: 100px;
+      position: relative;
+      cursor: pointer;
+      user-select: none;
+      will-change: transform;
+      animation: float 4s ease-in-out infinite;
+
+      --body-color: #E67E22;
+      --head-color: #D35400;
+      --wing-color: #f8fafc;
+      --wing-color-alt: #cbd5e1;
+    }
+
+    #mascot-container.skin-night {
+      --body-color: #4c3b73;
+      --head-color: #2f2350;
+      --wing-color: #dbe3ff;
+      --wing-color-alt: #8b93c9;
+    }
+
+    /* Fade to 30% when idle, back on hover */
+    #mascot-container {
+      transition: opacity 0.8s ease;
+    }
+    #mascot-container.idle-fade {
+      opacity: 0.3;
+    }
+
+    svg { width: 100%; height: 100%; overflow: visible; }
+
+    /* ── GPU-only animated elements ────────────────────────────────────── */
+    .glow-stop, .abdomen, .antenna-tip {
+      transition: stop-color 0.5s ease, fill 0.5s ease;
+    }
+    .body-shape, .head-shape, .antenna-line {
+      transition: fill 0.5s ease, stroke 0.5s ease;
+    }
+    .wing-main { transition: stroke 0.5s ease; }
+    .wing-vein  { transition: fill  0.5s ease; }
+
+    .mascot-root {
+      transform-box: fill-box;
+      transform-origin: 50% 50%;
+      will-change: transform;
+    }
+    #mascot-container.poke .mascot-root {
+      animation: poke-bounce 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) 1;
+    }
+    @keyframes poke-bounce {
+      0%   { transform: scale(1,   1);    }
+      30%  { transform: scale(0.85,1.15); }
+      55%  { transform: scale(1.12,0.9);  }
+      80%  { transform: scale(0.96,1.04); }
+      100% { transform: scale(1,   1);    }
+    }
+
+    .ambient-glow {
+      transform-box: fill-box;
+      transform-origin: 50% 50%;
+      will-change: transform, opacity;
+      animation: ambient-pulse 6s ease-in-out infinite;
+    }
+    .ground-shadow {
+      transform-box: fill-box;
+      transform-origin: 50% 50%;
+      will-change: transform, opacity;
+      animation: ground-shadow 4s ease-in-out infinite;
+    }
+    .wing {
+      transform-box: fill-box;
+      will-change: transform;
+      transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .wing-left  { transform-origin: 100% 50%; transform: rotate(-55deg); }
+    .wing-right { transform-origin:   0% 50%; transform: rotate(55deg);  }
+
+    .antenna-left, .antenna-right {
+      transform-box: fill-box;
+      will-change: transform;
+    }
+    .antenna-left  { transform-origin: 100% 100%; animation: antenna-sway-left  3.4s ease-in-out infinite; }
+    .antenna-right { transform-origin:   0% 100%; animation: antenna-sway-right 3.9s ease-in-out infinite; }
+
+    .particles {
+      opacity: 0; transform-origin: 50% 50%;
+      will-change: transform, opacity; transition: opacity 0.3s;
+    }
+    .thinking .particles { opacity: 1; animation: orbit 2s linear infinite; }
+
+    .particles-flow { opacity: 0; will-change: opacity; transition: opacity 0.6s ease; }
+    .flow .particles-flow { opacity: 1; }
+    .spark {
+      transform-box: fill-box; transform-origin: 50% 50%;
+      will-change: transform, opacity; animation: spark-drift 7s ease-in-out infinite;
+    }
+    .spark:nth-child(1) { animation-delay: 0s;   animation-duration: 7s;   }
+    .spark:nth-child(2) { animation-delay: 1.6s; animation-duration: 8.2s; }
+    .spark:nth-child(3) { animation-delay: 3.1s; animation-duration: 6.4s; }
+    .spark:nth-child(4) { animation-delay: 4.5s; animation-duration: 9s;   }
+    @keyframes spark-drift {
+      0%   { transform: translateY(0)    scale(0.6); opacity: 0;    }
+      15%  {                                         opacity: 0.75; }
+      50%  { transform: translateY(-26px) scale(1);  opacity: 0.55; }
+      85%  {                                         opacity: 0;    }
+      100% { transform: translateY(-46px) scale(0.6); opacity: 0;   }
+    }
+
+    .glow-orb { transform-origin: 50% 50%; will-change: transform, opacity; }
+
+    /* ── Eye expression system (opacity cross-fade) ─────────────────────── */
+    .eyes-sleeping,.eyes-watching,.eyes-thinking,.eyes-hint,.eyes-flow,.eyes-nudge {
+      opacity: 0; pointer-events: none; transition: opacity 0.35s ease;
+    }
+    .sleeping   .eyes-sleeping,
+    .watching   .eyes-watching,
+    .thinking   .eyes-thinking,
+    .hint_ready .eyes-hint,
+    .flow       .eyes-flow,
+    .nudge      .eyes-nudge { opacity: 1; }
+
+    .eyes-watching,.eyes-thinking,.eyes-hint,.eyes-nudge {
+      transform-box: fill-box; transform-origin: 50% 50%;
+      will-change: transform;
+      animation: auto-blink 5s ease-in-out infinite;
+    }
+
+    /* ── State definitions ──────────────────────────────────────────────── */
+    #mascot-container.sleeping { --color: #fdeea6; }
+    .sleeping .glow-orb  { animation: pulse 6s ease-in-out infinite; opacity: 0.4; }
+    .sleeping .wing-left { transform: rotate(-55deg); }
+    .sleeping .wing-right{ transform: rotate(55deg);  }
+
+    #mascot-container.watching { --color: #4ade80; }
+    .watching .glow-orb   { animation: heartbeat 2s ease-in-out infinite; opacity: 0.6; }
+    .watching .wing-left  { animation: flutter-left  4s ease-in-out infinite; }
+    .watching .wing-right { animation: flutter-right 4s ease-in-out infinite; }
+
+    #mascot-container.thinking { --color: #fbbf24; animation: float 1.5s ease-in-out infinite; }
+    .thinking .glow-orb   { animation: pulse 0.6s ease-in-out infinite alternate; opacity: 0.8; }
+    .thinking .wing-left  { animation: flutter-left  0.12s linear infinite; }
+    .thinking .wing-right { animation: flutter-right 0.12s linear infinite; }
+    .thinking .ground-shadow { animation: ground-shadow 1.5s ease-in-out infinite; }
+
+    #mascot-container.hint_ready { --color: #d946ef; animation: bounce 1s cubic-bezier(0.28,0.84,0.42,1); }
+    .hint_ready .glow-orb   { animation: flash 1s ease-out forwards; }
+    .hint_ready .wing-left  { animation: flutter-left  0.2s linear 5; }
+    .hint_ready .wing-right { animation: flutter-right 0.2s linear 5; }
+    .hint_ready .ground-shadow { animation: ground-shadow-bounce 1s cubic-bezier(0.28,0.84,0.42,1) 1; }
+
+    #mascot-container.flow { --color: #bae6fd; animation: float 8s ease-in-out infinite; }
+    .flow .glow-orb   { animation: pulse 10s ease-in-out infinite; opacity: 0.5; }
+    .flow .wing-left  { transform: rotate(-50deg); }
+    .flow .wing-right { transform: rotate(50deg);  }
+    .flow .ground-shadow { animation: ground-shadow 8s ease-in-out infinite; }
+
+    #mascot-container.nudge { --color: #ef4444; animation: wiggle 0.5s ease-in-out infinite; }
+    .nudge .glow-orb   { animation: pulse 0.3s ease-in-out infinite alternate; opacity: 0.9; }
+    .nudge .wing-left  { animation: flutter-left  0.06s linear infinite; }
+    .nudge .wing-right { animation: flutter-right 0.06s linear infinite; }
+    .nudge .ground-shadow { animation: ground-shadow-pulse-fast 0.5s ease-in-out infinite; }
+
+    /* ── Keyframes (GPU: transform + opacity only) ──────────────────────── */
+    @keyframes float     { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
+    @keyframes pulse     { 0%,100%{transform:scale(0.92)}   50%{transform:scale(1.08)} }
+    @keyframes ambient-pulse { 0%,100%{transform:scale(0.95);opacity:0.12} 50%{transform:scale(1.15);opacity:0.2} }
+    @keyframes heartbeat { 0%,100%{transform:scale(0.9)} 15%{transform:scale(1.1)} 30%{transform:scale(0.9)} 45%{transform:scale(1.1)} }
+    @keyframes flash     { 0%{transform:scale(0.5);opacity:0} 30%{transform:scale(1.4);opacity:1} 100%{transform:scale(1);opacity:0.8} }
+    @keyframes auto-blink{ 0%,92%,100%{transform:scaleY(1)} 95%{transform:scaleY(0.1)} }
+    @keyframes antenna-sway-left  { 0%,100%{transform:rotate(0deg)}  50%{transform:rotate(4deg)}  }
+    @keyframes antenna-sway-right { 0%,100%{transform:rotate(0deg)}  50%{transform:rotate(-4deg)} }
+    @keyframes ground-shadow { 0%,100%{transform:translateY(0) scale(1);opacity:0.28} 50%{transform:translateY(8px) scale(0.68);opacity:0.14} }
+    @keyframes ground-shadow-bounce { 0%,100%{transform:translateY(0) scale(1);opacity:0.28} 40%{transform:translateY(20px) scale(0.5);opacity:0.1} 60%{transform:translateY(8px) scale(0.8);opacity:0.2} }
+    @keyframes ground-shadow-pulse-fast { 0%,100%{transform:scale(1);opacity:0.28} 50%{transform:scale(0.85);opacity:0.18} }
+    @keyframes flutter-left  { 0%,100%{transform:rotate(-10deg)} 50%{transform:rotate(-65deg)} }
+    @keyframes flutter-right { 0%,100%{transform:rotate(10deg)}  50%{transform:rotate(65deg)}  }
+    @keyframes orbit  { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+    @keyframes wiggle { 0%,100%{transform:rotate(0deg)} 25%{transform:rotate(-8deg) translateX(-4px)} 75%{transform:rotate(8deg) translateX(4px)} }
+    @keyframes bounce { 0%,100%{transform:translateY(0)} 40%{transform:translateY(-20px)} 60%{transform:translateY(-8px)} }
+  </style>
+</head>
+<body>
+
+  <div id="mascot-container" class="sleeping skin-day">
+    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+          <stop class="glow-stop" offset="0%"   stop-color="var(--color)" stop-opacity="1"  />
+          <stop class="glow-stop" offset="50%"  stop-color="var(--color)" stop-opacity="0.5"/>
+          <stop class="glow-stop" offset="100%" stop-color="var(--color)" stop-opacity="0"  />
+        </radialGradient>
+        <linearGradient id="wingGradLeft" x1="100%" y1="50%" x2="0%" y2="50%">
+          <stop class="wing-stop-a" offset="0%"   stop-color="var(--wing-color)"     stop-opacity="0.95"/>
+          <stop class="wing-stop-b" offset="100%" stop-color="var(--wing-color-alt)" stop-opacity="0.3" />
+        </linearGradient>
+        <linearGradient id="wingGradRight" x1="0%" y1="50%" x2="100%" y2="50%">
+          <stop class="wing-stop-a" offset="0%"   stop-color="var(--wing-color)"     stop-opacity="0.95"/>
+          <stop class="wing-stop-b" offset="100%" stop-color="var(--wing-color-alt)" stop-opacity="0.3" />
+        </linearGradient>
+      </defs>
+
+      <ellipse class="ground-shadow" cx="50" cy="92" rx="24" ry="5" fill="#000000"/>
+      <circle  class="ambient-glow" cx="50" cy="60" r="55" fill="url(#glow)" opacity="0.15"/>
+
+      <g class="mascot-root">
+        <circle class="glow-orb" cx="50" cy="65" r="35" fill="url(#glow)"/>
+
+        <g class="particles">
+          <circle cx="20" cy="50" r="2"   class="abdomen" fill="var(--color)"/>
+          <circle cx="80" cy="40" r="1.5" class="abdomen" fill="var(--color)"/>
+          <circle cx="50" cy="20" r="2"   class="abdomen" fill="var(--color)"/>
+        </g>
+
+        <g class="particles-flow">
+          <circle class="spark" cx="34" cy="72" r="1.5" fill="var(--color)"/>
+          <circle class="spark" cx="66" cy="68" r="1.2" fill="var(--color)"/>
+          <circle class="spark" cx="50" cy="78" r="1.8" fill="var(--color)"/>
+          <circle class="spark" cx="60" cy="74" r="1"   fill="var(--color)"/>
+        </g>
+
+        <g opacity="0.9">
+          <g class="wing wing-left">
+            <ellipse class="wing-main" cx="33.5" cy="40" rx="7.5" ry="18" fill="url(#wingGradLeft)"  stroke="#cbd5e1" stroke-width="0.5"/>
+            <ellipse class="wing-vein" cx="35"   cy="40" rx="3.2" ry="14" fill="var(--wing-color-alt)" opacity="0.5"/>
+          </g>
+          <g class="wing wing-right">
+            <ellipse class="wing-main" cx="66.5" cy="40" rx="7.5" ry="18" fill="url(#wingGradRight)" stroke="#cbd5e1" stroke-width="0.5"/>
+            <ellipse class="wing-vein" cx="65"   cy="40" rx="3.2" ry="14" fill="var(--wing-color-alt)" opacity="0.5"/>
+          </g>
+        </g>
+
+        <ellipse class="body-shape" cx="50" cy="48" rx="10" ry="14" fill="var(--body-color)"/>
+        <ellipse cx="46" cy="43" rx="2.5" ry="4" fill="#ffffff" opacity="0.22"/>
+
+        <ellipse class="abdomen" cx="50" cy="62" rx="12" ry="14" fill="var(--color)"/>
+        <ellipse cx="45" cy="55" rx="3.5" ry="5" fill="#ffffff" opacity="0.28"/>
+
+        <circle class="head-shape" cx="50" cy="32" r="8.5" fill="var(--head-color)"/>
+        <ellipse cx="46.5" cy="29" rx="3" ry="2.2" fill="#ffffff" opacity="0.35"/>
+
+        <g class="antenna-left">
+          <path  class="antenna-line" d="M 47 25 Q 41 15 36 18" stroke="var(--head-color)" stroke-width="2" fill="none" stroke-linecap="round"/>
+          <circle class="antenna-tip" cx="36" cy="18" r="1.8" fill="var(--color)"/>
+        </g>
+        <g class="antenna-right">
+          <path  class="antenna-line" d="M 53 25 Q 59 15 64 18" stroke="var(--head-color)" stroke-width="2" fill="none" stroke-linecap="round"/>
+          <circle class="antenna-tip" cx="64" cy="18" r="1.8" fill="var(--color)"/>
+        </g>
+
+        <ellipse cx="42" cy="35" rx="2.2" ry="1.2" fill="#f43f5e" opacity="0.4"/>
+        <ellipse cx="58" cy="35" rx="2.2" ry="1.2" fill="#f43f5e" opacity="0.4"/>
+
+        <g class="eyes-sleeping" stroke="#5d4037" stroke-width="1.8" fill="none" stroke-linecap="round">
+          <path d="M 42 31 Q 45 35 48 31"/>
+          <path d="M 52 31 Q 55 35 58 31"/>
+        </g>
+        <g class="eyes-watching">
+          <ellipse cx="44.5" cy="30.5" rx="3.5" ry="4.5" fill="#ffffff"/>
+          <ellipse cx="55.5" cy="30.5" rx="3.5" ry="4.5" fill="#ffffff"/>
+          <ellipse cx="45"   cy="31"   rx="2.2" ry="3"   fill="#1e293b"/>
+          <ellipse cx="55"   cy="31"   rx="2.2" ry="3"   fill="#1e293b"/>
+          <circle  cx="43.8" cy="29"   r="1"              fill="#ffffff"/>
+          <circle  cx="53.8" cy="29"   r="1"              fill="#ffffff"/>
+          <circle  cx="46"   cy="32.2" r="0.5"            fill="#ffffff"/>
+          <circle  cx="56"   cy="32.2" r="0.5"            fill="#ffffff"/>
+        </g>
+        <g class="eyes-thinking">
+          <ellipse cx="44.5" cy="30.5" rx="3.5" ry="4.5" fill="#ffffff"/>
+          <ellipse cx="55.5" cy="30.5" rx="3.5" ry="4.5" fill="#ffffff"/>
+          <ellipse cx="46"   cy="29.2" rx="2.2" ry="2.8" fill="#1e293b"/>
+          <ellipse cx="57"   cy="29.2" rx="2.2" ry="2.8" fill="#1e293b"/>
+          <circle  cx="45"   cy="28"   r="0.9"            fill="#ffffff"/>
+          <circle  cx="56"   cy="28"   r="0.9"            fill="#ffffff"/>
+        </g>
+        <g class="eyes-hint">
+          <ellipse cx="44.5" cy="30.5" rx="3.8" ry="4.8" fill="#ffffff"/>
+          <ellipse cx="55.5" cy="30.5" rx="3.8" ry="4.8" fill="#ffffff"/>
+          <ellipse cx="44.5" cy="30.5" rx="2.5" ry="3.2" fill="#1e293b"/>
+          <ellipse cx="55.5" cy="30.5" rx="2.5" ry="3.2" fill="#1e293b"/>
+          <path d="M 44.5 28.5 L 45.2 29.8 L 46.5 30 L 45.5 31 L 45.8 32.3 L 44.5 31.5 L 43.2 32.3 L 43.5 31 L 42.5 30 L 43.8 29.8 Z" fill="#ffffff"/>
+          <path d="M 55.5 28.5 L 56.2 29.8 L 57.5 30 L 56.5 31 L 56.8 32.3 L 55.5 31.5 L 54.2 32.3 L 54.5 31 L 53.5 30 L 54.8 29.8 Z" fill="#ffffff"/>
+        </g>
+        <g class="eyes-flow" stroke="#5d4037" stroke-width="1.8" fill="none" stroke-linecap="round">
+          <path d="M 42 32 Q 45 27 48 32"/>
+          <path d="M 52 32 Q 55 27 58 32"/>
+        </g>
+        <g class="eyes-nudge">
+          <circle cx="44" cy="30.5" r="4.2" fill="#ffffff"/>
+          <circle cx="56" cy="30.5" r="4.2" fill="#ffffff"/>
+          <circle cx="44" cy="30.5" r="1.8" fill="#1e293b"/>
+          <circle cx="56" cy="30.5" r="1.8" fill="#1e293b"/>
+          <circle cx="43" cy="29.2" r="0.7" fill="#ffffff"/>
+          <circle cx="55" cy="29.2" r="0.7" fill="#ffffff"/>
+        </g>
+      </g>
+    </svg>
+  </div>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────────────────
+    var STATE_CLASSES = ['sleeping','watching','thinking','hint_ready','flow','nudge'];
+    var pokeTimer     = null;
+    var idleTimer     = null;
+    var _api          = null;    // set when pywebviewready fires
+
+    // ── Public API (called by Python via evaluate_js) ──────────────────────
+    // Pure renderer — no timers here. All state-lifetime logic is owned by
+    // the Python backend so individual features can control their own duration.
+    window.setState = function(stateName) {
+      var el = document.getElementById('mascot-container');
+      if (!el) return;
+      STATE_CLASSES.forEach(function(c){ el.classList.remove(c); });
+      el.classList.add(stateName);
+    };
+
+    function pokeMascot() {
+      var el = document.getElementById('mascot-container');
+      if (!el) return;
+      el.classList.remove('poke');
+      void el.offsetWidth; // force reflow to restart animation
+      el.classList.add('poke');
+      clearTimeout(pokeTimer);
+      pokeTimer = setTimeout(function(){ el.classList.remove('poke'); }, 450);
+    }
+
+    // ── Idle fade logic (60s timer, single timeout — no loop) ─────────────
+    function resetIdleFade() {
+      var el = document.getElementById('mascot-container');
+      if (!el) return;
+      el.classList.remove('idle-fade');
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(function(){
+        el.classList.add('idle-fade');
+      }, 60000);
+    }
+    document.addEventListener('mousemove', resetIdleFade);
+    resetIdleFade(); // start the 60s clock on load
+
+    // ── Drag + Click logic ─────────────────────────────────────────────────
+    // Drag: mousemove → pywebview.api.move_window(x, y)
+    // Click: mouseup with <4px travel → pywebview.api.toggle_dashboard()
+    var dragState = {
+      active:     false,
+      startMouseX: 0,
+      startMouseY: 0,
+      startWinX:   0,
+      startWinY:   0,
+      lastX:       0,
+      lastY:       0,
+      hasMoved:    false,
+    };
+
+    document.getElementById('mascot-container').addEventListener('mousedown', function(e) {
+      if (e.button !== 0) return;
+      dragState.active     = true;
+      dragState.hasMoved   = false;
+      dragState.startMouseX = e.screenX;
+      dragState.startMouseY = e.screenY;
+      dragState.startWinX   = window.screenX;
+      dragState.startWinY   = window.screenY;
+      dragState.lastX       = window.screenX;
+      dragState.lastY       = window.screenY;
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', function(e) {
+      if (!dragState.active) return;
+      var dx = e.screenX - dragState.startMouseX;
+      var dy = e.screenY - dragState.startMouseY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+        dragState.hasMoved = true;
+      }
+      if (dragState.hasMoved && _api) {
+        dragState.lastX = dragState.startWinX + dx;
+        dragState.lastY = dragState.startWinY + dy;
+        _api.move_window(dragState.lastX, dragState.lastY);
+      }
+    });
+
+    document.addEventListener('mouseup', function(e) {
+      if (!dragState.active || e.button !== 0) return;
+      dragState.active = false;
+      if (dragState.hasMoved) {
+        // Save final position
+        if (_api) _api.save_position(dragState.lastX, dragState.lastY);
+      } else {
+        // It was a click — poke animation + toggle dashboard
+        pokeMascot();
+        if (_api) _api.toggle_dashboard();
+      }
+    });
+
+    // ── PyWebView bridge ───────────────────────────────────────────────────
+    window.addEventListener('pywebviewready', function() {
+      _api = window.pywebview.api;
+      resetIdleFade();
+    });
+  </script>
+</body>
+</html>

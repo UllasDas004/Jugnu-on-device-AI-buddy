@@ -31,6 +31,11 @@ namespace Jugnu
         // Python's FlushWorker reads this every 60s, cleans with Gemma, and vectorizes.
         // This bypasses the IPC pipe - large OCR blobs never travel over named Pipes.
         static bool BufferOCR(const std::string& appName, const std::string& windowTitle, const std::string& rawText);
+
+        // Writes UIA extracted text directly to knowledge_docs, bypassing ocr_buffer.
+        // Performs an upsert based on window_title to prevent row spam.
+        // Returns the row_id of the inserted/updated row, or -1 on failure.
+        static long long SaveToKnowledgeDocs(const std::string& appName, const std::string& windowTitle,const std::string& source,const std::string& tags, const std::string& content, bool& isNew); // source if url for browser, file path for IDE
         
         private:
         // Sqlite DB Connection Handle

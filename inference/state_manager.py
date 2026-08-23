@@ -143,7 +143,7 @@ class StateManager:
                 uia_text = _format_uia_payload(cached)
             else:
                 # Absolute last resort: episodic memories
-                row = conn.execute("SELECT text_content FROM episodic_memories WHERE app_name = ? AND source_type = 'browser' ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
+                row = conn.execute("SELECT text_content FROM episodic_memories WHERE app_name = ? AND file_path IS NULL ORDER BY timestamp DESC LIMIT 1", (app,)).fetchone()
                 if row and row[0]:
                     uia_text = _format_uia_payload(row[0])
             conn.close()
